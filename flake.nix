@@ -37,6 +37,8 @@
             rustfmt
             rustc
             clippy
+
+            gnuplot
           ];
         };
       }
