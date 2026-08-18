@@ -1,17 +1,6 @@
-[package]
-name = "prime-field-layer"
-version = "0.1.0"
-edition = "2024"
-
-[dependencies]
-
-[dev-dependencies]
-criterion = "0.5"
-proptest = "1"
-
-[[bench]]
-name = "field"
-harness = false
+[workspace]
+members = ["prime-field-layer"]
+resolver = "3"
 
 [profile.release]
 debug = true

@@ -18,11 +18,7 @@
       {
         packages = rec {
           app = pkgs.rustPlatform.buildRustPackage {
-            pname =
-              if builtins.pathExists ./Cargo.toml then
-                (builtins.fromTOML (builtins.readFile ./Cargo.toml)).package.name
-              else
-                "app";
+            pname = "emvp-experiments";
             version = "0.1.0";
             src = ./.;
             cargoLock.lockFile = ./Cargo.lock;
