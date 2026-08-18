@@ -1,61 +1,33 @@
 use prime_field_layer::PrimeField;
 
-#[test]
-fn accepts_representative_primes() {
-    let primes = [
-        2,
-        3,
-        5,
-        17,
-        257,
-        65_537,
-        998_244_353,
-        2_147_483_647,
-        4_294_967_291,
-    ];
-
-    for modulus in primes {
-        let field = PrimeField::new(modulus)
-            .unwrap_or_else(|error| panic!("rejected prime {modulus}: {error}"));
-        assert_eq!(field.modulus(), modulus);
-    }
+fn accepts<const MODULUS: u32>() {
+    let field = PrimeField::<MODULUS>::new();
+    assert_eq!(field.modulus(), MODULUS);
 }
 
 #[test]
-fn rejects_non_primes_including_pseudoprimes() {
-    let non_primes = [
-        0,
-        1,
-        4,
-        6,
-        9,
-        15,
-        341,
-        561,
-        1_105,
-        1_729,
-        2_465,
-        2_821,
-        6_601,
-        3_215_031_751,
-        4_294_967_293,
-        u32::MAX,
-    ];
+fn accepts_representative_primes() {
+    accepts::<2>();
+    accepts::<3>();
+    accepts::<5>();
+    accepts::<17>();
+    accepts::<257>();
+    accepts::<65_537>();
+    accepts::<998_244_353>();
+    accepts::<2_147_483_647>();
+    accepts::<4_294_967_291>();
+}
 
-    for modulus in non_primes {
-        assert!(
-            PrimeField::new(modulus).is_err(),
-            "accepted composite modulus {modulus}"
-        );
-    }
+fn check_two_adicity<const MODULUS: u32>(expected: u32) {
+    let field = PrimeField::<MODULUS>::new();
+    assert_eq!(field.two_adicity(), expected, "modulus {MODULUS}");
 }
 
 #[test]
 fn reports_two_adicity() {
-    let cases = [(2, 0), (3, 1), (17, 4), (65_537, 16), (998_244_353, 23)];
-
-    for (modulus, expected) in cases {
-        let field = PrimeField::new(modulus).unwrap();
-        assert_eq!(field.two_adicity(), expected, "modulus {modulus}");
-    }
+    check_two_adicity::<2>(0);
+    check_two_adicity::<3>(1);
+    check_two_adicity::<17>(4);
+    check_two_adicity::<65_537>(16);
+    check_two_adicity::<998_244_353>(23);
 }

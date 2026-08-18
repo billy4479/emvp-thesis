@@ -1,19 +1,20 @@
+use std::mem::size_of;
+
 use prime_field_layer::{FieldElement, PrimeField};
 
 #[test]
 fn construction_reduces_to_a_canonical_residue() {
-    let field = PrimeField::new(17).unwrap();
+    let field = PrimeField::<17>::new();
 
     let element = FieldElement::new(&field, 20);
-
     assert_eq!(element.value(), 3);
-    assert_eq!(element.field(), &field);
+    assert_eq!(element.field(), field);
     assert_eq!(field.element(35).value(), 1);
 }
 
 #[test]
-fn arithmetic_delegates_to_the_field() {
-    let field = PrimeField::new(17).unwrap();
+fn arithmetic_uses_the_static_field() {
+    let field = PrimeField::<17>::new();
     let lhs = field.element(15);
     let rhs = field.element(5);
 
@@ -28,10 +29,19 @@ fn arithmetic_delegates_to_the_field() {
 }
 
 #[test]
-#[should_panic(expected = "cannot operate on elements from different fields")]
-fn arithmetic_rejects_different_fields() {
-    let field_17 = PrimeField::new(17).unwrap();
-    let field_19 = PrimeField::new(19).unwrap();
+fn assignment_operators_use_montgomery_arithmetic() {
+    let field = PrimeField::<998_244_353>::new();
+    let mut value = field.element(123_456_789);
 
-    let _ = field_17.element(1) + field_19.element(1);
+    value += field.element(17);
+    value *= field.element(31);
+    value -= field.element(9);
+
+    let expected = field.sub(field.mul(field.add(123_456_789, 17), 31), 9);
+    assert_eq!(value.value(), expected);
+}
+
+#[test]
+fn element_has_no_runtime_field_pointer() {
+    assert_eq!(size_of::<FieldElement<998_244_353>>(), size_of::<u32>());
 }

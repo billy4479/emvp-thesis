@@ -1,9 +1,11 @@
 use std::hint::black_box;
 
-use criterion::{BatchSize, BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
+use criterion::{
+    BatchSize, BenchmarkGroup, BenchmarkId, Criterion, Throughput, criterion_group, criterion_main,
+    measurement::WallTime,
+};
 use prime_field_layer::PrimeField;
 
-const MODULI: [u32; 2] = [65_537, 4_294_967_291];
 const BULK_LENGTHS: [usize; 3] = [256, 4_096, 65_536];
 
 fn values(length: usize, modulus: u32, offset: u64) -> Vec<u32> {
@@ -12,105 +14,150 @@ fn values(length: usize, modulus: u32, offset: u64) -> Vec<u32> {
         .collect()
 }
 
+fn bench_construction<const MODULUS: u32>(group: &mut BenchmarkGroup<'_, WallTime>) {
+    group.bench_function(BenchmarkId::from_parameter(MODULUS), |b| {
+        b.iter(|| black_box(PrimeField::<MODULUS>::new()));
+    });
+}
+
 fn construction(c: &mut Criterion) {
     let mut group = c.benchmark_group("construction");
-    for modulus in [65_537, 998_244_353, 4_294_967_291] {
-        group.bench_with_input(
-            BenchmarkId::from_parameter(modulus),
-            &modulus,
-            |b, &modulus| {
-                b.iter(|| PrimeField::new(black_box(modulus)).unwrap());
-            },
-        );
-    }
+    bench_construction::<65_537>(&mut group);
+    bench_construction::<998_244_353>(&mut group);
+    bench_construction::<4_294_967_291>(&mut group);
     group.finish();
+}
+
+fn bench_scalar<const MODULUS: u32>(group: &mut BenchmarkGroup<'_, WallTime>) {
+    let field = PrimeField::<MODULUS>::new();
+    let lhs = MODULUS - 2;
+    let rhs = MODULUS - 1;
+
+    group.bench_function(BenchmarkId::new("add", MODULUS), |b| {
+        b.iter(|| field.add(black_box(lhs), black_box(rhs)));
+    });
+    group.bench_function(BenchmarkId::new("mul", MODULUS), |b| {
+        b.iter(|| field.mul(black_box(lhs), black_box(rhs)));
+    });
+    group.bench_function(BenchmarkId::new("element_mul", MODULUS), |b| {
+        let lhs = field.element(lhs as u64);
+        let rhs = field.element(rhs as u64);
+        b.iter(|| black_box(lhs) * black_box(rhs));
+    });
+    group.bench_function(BenchmarkId::new("square", MODULUS), |b| {
+        b.iter(|| field.square(black_box(lhs)));
+    });
+    group.bench_function(BenchmarkId::new("pow_u32", MODULUS), |b| {
+        b.iter(|| field.pow(black_box(lhs), black_box(u32::MAX as u64)));
+    });
+    group.bench_function(BenchmarkId::new("inv", MODULUS), |b| {
+        b.iter(|| field.inv(black_box(lhs)).unwrap());
+    });
 }
 
 fn scalar(c: &mut Criterion) {
     let mut group = c.benchmark_group("scalar");
-    for modulus in MODULI {
-        let field = PrimeField::new(modulus).unwrap();
-        let lhs = modulus - 2;
-        let rhs = modulus - 1;
+    bench_scalar::<65_537>(&mut group);
+    bench_scalar::<4_294_967_291>(&mut group);
+    group.finish();
+}
 
-        group.bench_with_input(BenchmarkId::new("add", modulus), &modulus, |b, _| {
-            b.iter(|| field.add(black_box(lhs), black_box(rhs)));
+fn bench_bulk<const MODULUS: u32>(group: &mut BenchmarkGroup<'_, WallTime>) {
+    let field = PrimeField::<MODULUS>::new();
+    for length in BULK_LENGTHS {
+        group.throughput(Throughput::Elements(length as u64));
+        let lhs = values(length, MODULUS, 12_345);
+        let rhs = values(length, MODULUS, 97);
+        let lhs_elements: Vec<_> = lhs
+            .iter()
+            .map(|&value| field.element(value as u64))
+            .collect();
+        let rhs_elements: Vec<_> = rhs
+            .iter()
+            .map(|&value| field.element(value as u64))
+            .collect();
+        let parameter = format!("p={MODULUS}/n={length}");
+
+        group.bench_function(BenchmarkId::new("add_assign", &parameter), |b| {
+            b.iter_batched_ref(
+                || lhs.clone(),
+                |output| {
+                    field
+                        .add_assign(black_box(output), black_box(&rhs))
+                        .unwrap()
+                },
+                BatchSize::SmallInput,
+            );
         });
-        group.bench_with_input(BenchmarkId::new("mul", modulus), &modulus, |b, _| {
-            b.iter(|| field.mul(black_box(lhs), black_box(rhs)));
+        group.bench_function(BenchmarkId::new("mul_assign", &parameter), |b| {
+            b.iter_batched_ref(
+                || lhs.clone(),
+                |output| {
+                    field
+                        .mul_assign(black_box(output), black_box(&rhs))
+                        .unwrap()
+                },
+                BatchSize::SmallInput,
+            );
         });
-        group.bench_with_input(BenchmarkId::new("square", modulus), &modulus, |b, _| {
-            b.iter(|| field.square(black_box(lhs)));
+        group.bench_function(BenchmarkId::new("montgomery_mul_assign", &parameter), |b| {
+            b.iter_batched_ref(
+                || lhs_elements.clone(),
+                |output| {
+                    field
+                        .mul_elements_assign(black_box(output), black_box(&rhs_elements))
+                        .unwrap()
+                },
+                BatchSize::SmallInput,
+            );
         });
-        group.bench_with_input(BenchmarkId::new("pow_u32", modulus), &modulus, |b, _| {
-            b.iter(|| field.pow(black_box(lhs), black_box(u32::MAX as u64)));
+        group.bench_function(
+            BenchmarkId::new("montgomery_scalar_mul_assign", &parameter),
+            |b| {
+                let scalar = field.element((MODULUS - 1) as u64);
+                b.iter_batched_ref(
+                    || lhs_elements.clone(),
+                    |output| field.scalar_mul_elements_assign(black_box(output), black_box(scalar)),
+                    BatchSize::SmallInput,
+                );
+            },
+        );
+        group.bench_function(BenchmarkId::new("scalar_mul_assign", &parameter), |b| {
+            b.iter_batched_ref(
+                || lhs.clone(),
+                |output| field.scalar_mul_assign(black_box(output), black_box(MODULUS - 1)),
+                BatchSize::SmallInput,
+            );
         });
-        group.bench_with_input(BenchmarkId::new("inv", modulus), &modulus, |b, _| {
-            b.iter(|| field.inv(black_box(lhs)).unwrap());
+        group.bench_function(BenchmarkId::new("dot", &parameter), |b| {
+            b.iter(|| field.dot(black_box(&lhs), black_box(&rhs)).unwrap());
         });
     }
-    group.finish();
 }
 
 fn bulk(c: &mut Criterion) {
     let mut group = c.benchmark_group("bulk");
+    bench_bulk::<65_537>(&mut group);
+    bench_bulk::<4_294_967_291>(&mut group);
+    group.finish();
+}
 
-    for modulus in MODULI {
-        let field = PrimeField::new(modulus).unwrap();
-        for length in BULK_LENGTHS {
-            group.throughput(Throughput::Elements(length as u64));
-            let lhs = values(length, modulus, 12_345);
-            let rhs = values(length, modulus, 97);
-            let parameter = format!("p={modulus}/n={length}");
-
-            group.bench_with_input(
-                BenchmarkId::new("add_assign", &parameter),
-                &length,
-                |b, _| {
-                    b.iter_batched_ref(
-                        || lhs.clone(),
-                        |output| {
-                            field
-                                .add_assign(black_box(output), black_box(&rhs))
-                                .unwrap()
-                        },
-                        BatchSize::SmallInput,
-                    );
-                },
+fn batch_inversion(c: &mut Criterion) {
+    let mut group = c.benchmark_group("batch_inversion");
+    let field = PrimeField::<998_244_353>::new();
+    for length in [16, 256, 4_096] {
+        group.throughput(Throughput::Elements(length as u64));
+        let input = values(length, field.modulus(), 1);
+        group.bench_with_input(BenchmarkId::new("batch", length), &length, |b, _| {
+            b.iter_batched_ref(
+                || input.clone(),
+                |values| field.batch_inv_assign(black_box(values)).unwrap(),
+                BatchSize::SmallInput,
             );
-            group.bench_with_input(
-                BenchmarkId::new("mul_assign", &parameter),
-                &length,
-                |b, _| {
-                    b.iter_batched_ref(
-                        || lhs.clone(),
-                        |output| {
-                            field
-                                .mul_assign(black_box(output), black_box(&rhs))
-                                .unwrap()
-                        },
-                        BatchSize::SmallInput,
-                    );
-                },
-            );
-            group.bench_with_input(
-                BenchmarkId::new("scalar_mul_assign", &parameter),
-                &length,
-                |b, _| {
-                    b.iter_batched_ref(
-                        || lhs.clone(),
-                        |output| field.scalar_mul_assign(black_box(output), black_box(modulus - 1)),
-                        BatchSize::SmallInput,
-                    );
-                },
-            );
-            group.bench_with_input(BenchmarkId::new("dot", &parameter), &length, |b, _| {
-                b.iter(|| field.dot(black_box(&lhs), black_box(&rhs)).unwrap());
-            });
-        }
+        });
     }
     group.finish();
 }
 
-criterion_group!(benches, construction, scalar, bulk);
+criterion_group!(benches, construction, scalar, bulk, batch_inversion);
 criterion_main!(benches);
