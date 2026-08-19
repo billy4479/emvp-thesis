@@ -3,6 +3,66 @@ name = "prime-field-layer"
 version = "0.1.0"
 edition = "2024"
 
+[lints.rust]
+# The optimized backends use documented inline assembly and AVX2 intrinsics.
+unsafe_code = "allow"
+
+[lints.clippy]
+pedantic = { level = "deny", priority = -1 }
+nursery = { level = "deny", priority = -1 }
+
+unwrap_used = "deny"
+expect_used = "deny"
+indexing_slicing = "allow"
+arithmetic_side_effects = "allow"
+unreachable = "deny"
+unimplemented = "deny"
+unchecked_time_subtraction = "deny"
+todo = "deny"
+string_slice = "deny"
+panic_in_result_fn = "deny"
+panic = "deny"
+exit = "deny"
+as_conversions = "allow"
+
+# These are deliberate in small arithmetic kernels where cross-crate inlining
+# and explicit machine-word representations matter.
+inline_always = "allow"
+cast_possible_truncation = "allow"
+cast_lossless = "allow"
+
+let_underscore_future = "warn"
+let_underscore_must_use = "warn"
+unused_result_ok = "warn"
+map_err_ignore = "warn"
+assertions_on_result_states = "warn"
+
+await_holding_lock = "warn"
+await_holding_refcell_ref = "warn"
+large_futures = "warn"
+
+mem_forget = "warn"
+undocumented_unsafe_blocks = "warn"
+multiple_unsafe_ops_per_block = "allow"
+unnecessary_safety_doc = "warn"
+unnecessary_safety_comment = "warn"
+
+float_cmp = "warn"
+float_cmp_const = "warn"
+lossy_float_literal = "warn"
+cast_sign_loss = "warn"
+invalid_upcast_comparisons = "warn"
+
+rc_mutex = "warn"
+debug_assert_with_mut_call = "warn"
+iter_not_returning_iterator = "warn"
+expl_impl_clone_on_copy = "warn"
+infallible_try_from = "warn"
+dbg_macro = "warn"
+
+allow_attributes = "warn"
+allow_attributes_without_reason = "warn"
+
 [dependencies]
 
 [dev-dependencies]
@@ -11,4 +71,8 @@ proptest = "1"
 
 [[bench]]
 name = "field"
+harness = false
+
+[[bench]]
+name = "ntt"
 harness = false

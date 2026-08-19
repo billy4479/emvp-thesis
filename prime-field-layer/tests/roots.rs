@@ -1,4 +1,9 @@
-use prime_field_layer::PrimeField;
+#![expect(
+    clippy::unwrap_used,
+    reason = "supported test lengths must have roots of unity"
+)]
+
+use prime_field_layer::{FieldError, PrimeField};
 
 fn check_roots<const MODULUS: u32>(max_length: usize) {
     let field = PrimeField::<MODULUS>::new();
@@ -28,8 +33,9 @@ fn rejects_non_power_of_two_and_unsupported_lengths() {
     let field = PrimeField::<65_537>::new();
 
     for length in [0, 3, 6, 65_535, 131_072] {
-        assert!(
-            field.root_of_unity(length).is_err(),
+        assert_eq!(
+            field.root_of_unity(length),
+            Err(FieldError::UnsupportedTransformLength(length)),
             "accepted transform length {length}"
         );
     }

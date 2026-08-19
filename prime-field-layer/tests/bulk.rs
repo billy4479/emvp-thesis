@@ -1,4 +1,9 @@
-use prime_field_layer::PrimeField;
+#![expect(
+    clippy::unwrap_used,
+    reason = "test inputs establish that these operations must succeed"
+)]
+
+use prime_field_layer::{FieldError, PrimeField};
 
 const LENGTHS: [usize; 18] = [
     0, 1, 2, 3, 4, 7, 8, 15, 16, 17, 31, 32, 33, 63, 64, 65, 127, 129,
@@ -6,10 +11,10 @@ const LENGTHS: [usize; 18] = [
 
 fn inputs(length: usize, modulus: u32) -> (Vec<u32>, Vec<u32>) {
     let lhs = (0..length)
-        .map(|index| ((index as u64 * 1_103_515_245 + 12_345) % modulus as u64) as u32)
+        .map(|index| ((index as u64 * 1_103_515_245 + 12_345) % u64::from(modulus)) as u32)
         .collect();
     let rhs = (0..length)
-        .map(|index| ((index as u64 * 2_654_435_761 + 97) % modulus as u64) as u32)
+        .map(|index| ((index as u64 * 2_654_435_761 + 97) % u64::from(modulus)) as u32)
         .collect();
     (lhs, rhs)
 }
@@ -112,11 +117,11 @@ fn check_montgomery_bulk<const MODULUS: u32>() {
         let (lhs, rhs) = inputs(length, MODULUS);
         let lhs: Vec<_> = lhs
             .iter()
-            .map(|&value| field.element(value as u64))
+            .map(|&value| field.element(u64::from(value)))
             .collect();
         let rhs: Vec<_> = rhs
             .iter()
-            .map(|&value| field.element(value as u64))
+            .map(|&value| field.element(u64::from(value)))
             .collect();
 
         let mut actual = lhs.clone();
@@ -125,7 +130,7 @@ fn check_montgomery_bulk<const MODULUS: u32>() {
         assert_eq!(actual, expected);
 
         let mut actual = lhs.clone();
-        let scalar = field.element((MODULUS - 1) as u64);
+        let scalar = field.element(u64::from(MODULUS - 1));
         field.scalar_mul_elements_assign(&mut actual, scalar);
         let expected: Vec<_> = lhs.iter().map(|&value| value * scalar).collect();
         assert_eq!(actual, expected);
@@ -143,10 +148,10 @@ fn check_montgomery_boundaries<const MODULUS: u32>() {
     let field = PrimeField::<MODULUS>::new();
     let boundaries = [0, 1, MODULUS / 2, MODULUS - 2, MODULUS - 1];
     let lhs: Vec<_> = (0..67)
-        .map(|index| field.element(boundaries[index % boundaries.len()] as u64))
+        .map(|index| field.element(u64::from(boundaries[index % boundaries.len()])))
         .collect();
     let rhs: Vec<_> = (0..67)
-        .map(|index| field.element(boundaries[(index * 3 + 1) % boundaries.len()] as u64))
+        .map(|index| field.element(u64::from(boundaries[(index * 3 + 1) % boundaries.len()])))
         .collect();
     let expected: Vec<_> = lhs.iter().zip(&rhs).map(|(&lhs, &rhs)| lhs * rhs).collect();
     let mut actual = lhs;
@@ -165,8 +170,8 @@ fn montgomery_simd_handles_boundary_values_and_tails() {
 
 fn check_batch_inverse<const MODULUS: u32>() {
     let field = PrimeField::<MODULUS>::new();
-    let mut values: Vec<_> = (1..128)
-        .map(|value| value as u64 % MODULUS as u64)
+    let mut values: Vec<_> = (1_u64..128)
+        .map(|value| value % u64::from(MODULUS))
         .map(|value| value.max(1) as u32)
         .collect();
     let expected: Vec<_> = values
@@ -190,8 +195,17 @@ fn binary_kernels_reject_mismatched_lengths() {
     let field = PrimeField::<65_537>::new();
     let rhs = [1, 2, 3];
 
-    assert!(field.add_assign(&mut [1, 2], &rhs).is_err());
-    assert!(field.sub_assign(&mut [1, 2], &rhs).is_err());
-    assert!(field.mul_assign(&mut [1, 2], &rhs).is_err());
-    assert!(field.dot(&[1, 2], &rhs).is_err());
+    assert_eq!(
+        field.add_assign(&mut [1, 2], &rhs),
+        Err(FieldError::LengthMismatch)
+    );
+    assert_eq!(
+        field.sub_assign(&mut [1, 2], &rhs),
+        Err(FieldError::LengthMismatch)
+    );
+    assert_eq!(
+        field.mul_assign(&mut [1, 2], &rhs),
+        Err(FieldError::LengthMismatch)
+    );
+    field.dot(&[1, 2], &rhs).unwrap_err();
 }

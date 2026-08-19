@@ -1,11 +1,16 @@
 use std::fmt;
 
+use crate::constant_time::{add_with_carry_shr_32, reduce_once_u64};
+
 /// Errors caused by invalid field parameters or operands.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum FieldError {
     DivisionByZero,
     LengthMismatch,
-    InvalidTransformLength(usize),
+    UnsupportedTransformLength(usize),
+    PlanTooSmall { required: usize, available: usize },
+    ConvolutionLengthOverflow,
+    Avx2Unavailable,
 }
 
 impl fmt::Display for FieldError {
@@ -13,11 +18,23 @@ impl fmt::Display for FieldError {
         match self {
             Self::DivisionByZero => formatter.write_str("zero has no multiplicative inverse"),
             Self::LengthMismatch => formatter.write_str("slice lengths do not match"),
-            Self::InvalidTransformLength(length) => {
+            Self::UnsupportedTransformLength(length) => {
                 write!(
                     formatter,
                     "the field does not support transform length {length}"
                 )
+            }
+            Self::PlanTooSmall {
+                required,
+                available,
+            } => write!(
+                formatter,
+                "convolution requires transform length {required}, but the plan length is {available}"
+            ),
+            Self::ConvolutionLengthOverflow => formatter
+                .write_str("convolution result or required transform length does not fit in usize"),
+            Self::Avx2Unavailable => {
+                formatter.write_str("AVX2 NTT butterflies are unavailable for this plan")
             }
         }
     }
@@ -146,12 +163,12 @@ impl<const MODULUS: u32> PrimeField<MODULUS> {
             return MODULUS - 1;
         }
 
-        let mut non_residue = 2;
-        while Self::modular_pow(non_residue as u64, (MODULUS - 1) / 2, MODULUS as u64) == 1 {
+        let mut non_residue = 2u64;
+        while Self::modular_pow(non_residue, (MODULUS - 1) / 2, MODULUS as u64) == 1 {
             non_residue += 1;
         }
         Self::modular_pow(
-            non_residue as u64,
+            non_residue,
             (MODULUS - 1) >> (MODULUS - 1).trailing_zeros(),
             MODULUS as u64,
         ) as u32
@@ -161,6 +178,7 @@ impl<const MODULUS: u32> PrimeField<MODULUS> {
     ///
     /// Compilation fails when `MODULUS` is not prime.
     #[inline(always)]
+    #[must_use]
     pub const fn new() -> Self {
         let () = Self::VALID_MODULUS;
         Self { _private: () }
@@ -170,53 +188,61 @@ impl<const MODULUS: u32> PrimeField<MODULUS> {
         Self { _private: () }
     }
 
+    #[must_use]
     pub const fn modulus(&self) -> u32 {
         MODULUS
     }
 
     /// Returns the exponent of two in the factorization of `MODULUS - 1`.
+    #[must_use]
     pub const fn two_adicity(&self) -> u32 {
         (MODULUS - 1).trailing_zeros()
     }
 
     /// Reduces an arbitrary 64-bit integer to a canonical residue.
     #[inline(always)]
-    pub fn reduce_u64(&self, value: u64) -> u32 {
+    #[must_use]
+    pub const fn reduce_u64(&self, value: u64) -> u32 {
         (value % Self::MODULUS_U64) as u32
     }
 
     #[inline(always)]
-    fn reduce_u128(&self, value: u128) -> u32 {
-        let high = self.reduce_u64((value >> 64) as u64) as u64;
-        let low = self.reduce_u64(value as u64) as u64;
-        self.reduce_u64(high * Self::MONTGOMERY_R2 as u64 + low)
+    fn reduce_u128(self, value: u128) -> u32 {
+        let high = u64::from(self.reduce_u64((value >> 64) as u64));
+        let low = u64::from(self.reduce_u64(value as u64));
+        self.reduce_u64(high * u64::from(Self::MONTGOMERY_R2) + low)
     }
 
     #[inline(always)]
+    #[must_use]
     pub fn add(&self, lhs: u32, rhs: u32) -> u32 {
-        let (sum, carry) = lhs.overflowing_add(rhs);
-        let (reduced, borrow) = sum.overflowing_sub(MODULUS);
-        if carry || !borrow { reduced } else { sum }
+        reduce_once_u64(u64::from(lhs) + u64::from(rhs), Self::MODULUS_U64) as u32
     }
 
     #[inline(always)]
+    #[must_use]
     pub fn sub(&self, lhs: u32, rhs: u32) -> u32 {
-        let (difference, underflow) = lhs.overflowing_sub(rhs);
-        difference.wrapping_add(MODULUS & 0u32.wrapping_sub(underflow as u32))
+        reduce_once_u64(
+            u64::from(lhs) + Self::MODULUS_U64 - u64::from(rhs),
+            Self::MODULUS_U64,
+        ) as u32
     }
 
     #[inline(always)]
+    #[must_use]
     pub fn neg(&self, value: u32) -> u32 {
         let negated = MODULUS - value;
-        negated & 0u32.wrapping_sub((value != 0) as u32)
+        negated & 0u32.wrapping_sub(u32::from(value != 0))
     }
 
     #[inline(always)]
+    #[must_use]
     pub fn mul(&self, lhs: u32, rhs: u32) -> u32 {
-        (lhs as u64 * rhs as u64 % Self::MODULUS_U64) as u32
+        (u64::from(lhs) * u64::from(rhs) % Self::MODULUS_U64) as u32
     }
 
     #[inline(always)]
+    #[must_use]
     pub fn square(&self, value: u32) -> u32 {
         self.mul(value, value)
     }
@@ -227,23 +253,21 @@ impl<const MODULUS: u32> PrimeField<MODULUS> {
             return lhs & rhs;
         }
 
-        let product = lhs as u64 * rhs as u64;
+        let product = u64::from(lhs) * u64::from(rhs);
         let adjustment = (product as u32).wrapping_mul(Self::MONTGOMERY_NEG_INV);
-        let (sum, overflow) = product.overflowing_add(adjustment as u64 * Self::MODULUS_U64);
-        let reduced = (sum >> 32) + ((overflow as u64) << 32);
+        let reduced = add_with_carry_shr_32(product, u64::from(adjustment) * Self::MODULUS_U64);
 
-        if reduced >= Self::MODULUS_U64 {
-            (reduced - Self::MODULUS_U64) as u32
-        } else {
-            reduced as u32
-        }
+        reduce_once_u64(reduced, Self::MODULUS_U64) as u32
     }
 
     #[inline(always)]
     pub(crate) fn to_montgomery(value: u32) -> u32 {
         if MODULUS == 2 {
-            return value;
+            return value & 1;
         }
+        // REDC accepts this full-width u32 directly: R2 < p and value < R,
+        // so value * R2 < R * p. Canonicalization before conversion is not
+        // required.
         Self::montgomery_mul(value, Self::MONTGOMERY_R2)
     }
 
@@ -273,19 +297,29 @@ impl<const MODULUS: u32> PrimeField<MODULUS> {
         result
     }
 
+    #[must_use]
     pub fn pow(&self, base: u32, exponent: u64) -> u32 {
         let base = Self::to_montgomery(base);
         Self::from_montgomery(Self::pow_montgomery(base, exponent))
     }
 
+    /// Returns the multiplicative inverse of `value`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FieldError::DivisionByZero`] when `value` is zero.
     pub fn inv(&self, value: u32) -> Result<u32, FieldError> {
         if value == 0 {
             return Err(FieldError::DivisionByZero);
         }
-        Ok(self.pow(value, (MODULUS - 2) as u64))
+        Ok(self.pow(value, u64::from(MODULUS - 2)))
     }
 
     /// Adds `rhs` element-wise into `lhs` without allocating.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FieldError::LengthMismatch`] when the slices have different lengths.
     pub fn add_assign(&self, lhs: &mut [u32], rhs: &[u32]) -> Result<(), FieldError> {
         if lhs.len() != rhs.len() {
             return Err(FieldError::LengthMismatch);
@@ -298,6 +332,10 @@ impl<const MODULUS: u32> PrimeField<MODULUS> {
     }
 
     /// Subtracts `rhs` element-wise from `lhs` without allocating.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FieldError::LengthMismatch`] when the slices have different lengths.
     pub fn sub_assign(&self, lhs: &mut [u32], rhs: &[u32]) -> Result<(), FieldError> {
         if lhs.len() != rhs.len() {
             return Err(FieldError::LengthMismatch);
@@ -310,6 +348,10 @@ impl<const MODULUS: u32> PrimeField<MODULUS> {
     }
 
     /// Multiplies `lhs` element-wise by `rhs` without allocating.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FieldError::LengthMismatch`] when the slices have different lengths.
     pub fn mul_assign(&self, lhs: &mut [u32], rhs: &[u32]) -> Result<(), FieldError> {
         if lhs.len() != rhs.len() {
             return Err(FieldError::LengthMismatch);
@@ -328,37 +370,38 @@ impl<const MODULUS: u32> PrimeField<MODULUS> {
     }
 
     pub fn scalar_mul_assign(&self, values: &mut [u32], scalar: u32) {
-        let shoup = ((scalar as u64) << 32) / Self::MODULUS_U64;
+        let shoup = (u64::from(scalar) << 32) / Self::MODULUS_U64;
         for value in values {
-            let product = *value as u64 * scalar as u64;
-            let quotient = (*value as u64 * shoup) >> 32;
+            let product = u64::from(*value) * u64::from(scalar);
+            let quotient = (u64::from(*value) * shoup) >> 32;
             let remainder = product - quotient * Self::MODULUS_U64;
-            *value = if remainder >= Self::MODULUS_U64 {
-                (remainder - Self::MODULUS_U64) as u32
-            } else {
-                remainder as u32
-            };
+            *value = reduce_once_u64(remainder, Self::MODULUS_U64) as u32;
         }
     }
 
+    /// Computes the dot product of two slices.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FieldError::LengthMismatch`] when the slices have different lengths.
     pub fn dot(&self, lhs: &[u32], rhs: &[u32]) -> Result<u32, FieldError> {
         if lhs.len() != rhs.len() {
             return Err(FieldError::LengthMismatch);
         }
 
-        let max_product = (MODULUS - 1) as u64 * (MODULUS - 1) as u64;
-        if lhs.len() as u128 * max_product as u128 <= u64::MAX as u128 {
+        let max_product = u64::from(MODULUS - 1) * u64::from(MODULUS - 1);
+        if lhs.len() as u128 * u128::from(max_product) <= u128::from(u64::MAX) {
             let mut sums = [0u64; 4];
             for (lhs, rhs) in lhs.chunks_exact(4).zip(rhs.chunks_exact(4)) {
-                sums[0] += lhs[0] as u64 * rhs[0] as u64;
-                sums[1] += lhs[1] as u64 * rhs[1] as u64;
-                sums[2] += lhs[2] as u64 * rhs[2] as u64;
-                sums[3] += lhs[3] as u64 * rhs[3] as u64;
+                sums[0] += u64::from(lhs[0]) * u64::from(rhs[0]);
+                sums[1] += u64::from(lhs[1]) * u64::from(rhs[1]);
+                sums[2] += u64::from(lhs[2]) * u64::from(rhs[2]);
+                sums[3] += u64::from(lhs[3]) * u64::from(rhs[3]);
             }
 
             let remainder_start = lhs.len() / 4 * 4;
             for (&lhs, &rhs) in lhs[remainder_start..].iter().zip(&rhs[remainder_start..]) {
-                sums[0] += lhs as u64 * rhs as u64;
+                sums[0] += u64::from(lhs) * u64::from(rhs);
             }
             return Ok(self.reduce_u64(sums.into_iter().sum()));
         }
@@ -368,26 +411,26 @@ impl<const MODULUS: u32> PrimeField<MODULUS> {
         for (lhs, rhs) in lhs.chunks_exact(4).zip(rhs.chunks_exact(4)) {
             let mut lane = 0;
             while lane < 4 {
-                let product = lhs[lane] as u64 * rhs[lane] as u64;
+                let product = u64::from(lhs[lane]) * u64::from(rhs[lane]);
                 let (sum, carry) = low[lane].overflowing_add(product);
                 low[lane] = sum;
-                high[lane] += carry as u64;
+                high[lane] += u64::from(carry);
                 lane += 1;
             }
         }
 
         let remainder_start = lhs.len() / 4 * 4;
         for (&lhs, &rhs) in lhs[remainder_start..].iter().zip(&rhs[remainder_start..]) {
-            let product = lhs as u64 * rhs as u64;
+            let product = u64::from(lhs) * u64::from(rhs);
             let (sum, carry) = low[0].overflowing_add(product);
             low[0] = sum;
-            high[0] += carry as u64;
+            high[0] += u64::from(carry);
         }
 
         let mut sum = 0u128;
         let mut lane = 0;
         while lane < 4 {
-            sum += (high[lane] as u128) << 64 | low[lane] as u128;
+            sum += u128::from(high[lane]) << 64 | u128::from(low[lane]);
             lane += 1;
         }
         Ok(self.reduce_u128(sum))
@@ -395,6 +438,10 @@ impl<const MODULUS: u32> PrimeField<MODULUS> {
 
     /// Inverts all values using one exponentiation and approximately three
     /// multiplications per value.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FieldError::DivisionByZero`] when any value is zero.
     pub fn batch_inv_assign(&self, values: &mut [u32]) -> Result<(), FieldError> {
         if values.contains(&0) {
             return Err(FieldError::DivisionByZero);
@@ -410,7 +457,7 @@ impl<const MODULUS: u32> PrimeField<MODULUS> {
             prefixes.push(product);
         }
 
-        let mut inverse = Self::pow_montgomery(product, (MODULUS - 2) as u64);
+        let mut inverse = Self::pow_montgomery(product, u64::from(MODULUS - 2));
         for index in (0..values.len()).rev() {
             let previous = if index == 0 {
                 Self::MONTGOMERY_ONE
@@ -428,9 +475,14 @@ impl<const MODULUS: u32> PrimeField<MODULUS> {
     ///
     /// Supported lengths are powers of two dividing `MODULUS - 1`; length one
     /// has root one.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FieldError::UnsupportedTransformLength`] when `length` is not
+    /// a supported power of two.
     pub fn root_of_unity(&self, length: usize) -> Result<u32, FieldError> {
         if !length.is_power_of_two() || length.trailing_zeros() > self.two_adicity() {
-            return Err(FieldError::InvalidTransformLength(length));
+            return Err(FieldError::UnsupportedTransformLength(length));
         }
 
         let mut root = Self::TWO_ADIC_ROOT;

@@ -1,7 +1,13 @@
-use prime_field_layer::PrimeField;
+#![expect(
+    clippy::unreachable,
+    clippy::unwrap_used,
+    reason = "generated cases use a closed modulus set and valid nonzero operands"
+)]
+
+use prime_field_layer::{FieldError, PrimeField};
 use proptest::prelude::*;
 
-fn oracle_pow(mut base: u32, mut exponent: u64, modulus: u32) -> u32 {
+const fn oracle_pow(mut base: u32, mut exponent: u64, modulus: u32) -> u32 {
     let mut result = 1 % modulus;
     while exponent != 0 {
         if exponent & 1 == 1 {
@@ -20,7 +26,7 @@ fn boundary_values(modulus: u32) -> Vec<u32> {
     values
 }
 
-fn check_pair<const MODULUS: u32>(field: &PrimeField<MODULUS>, lhs: u32, rhs: u32) {
+fn check_pair<const MODULUS: u32>(field: PrimeField<MODULUS>, lhs: u32, rhs: u32) {
     let modulus = MODULUS as u64;
     assert_eq!(
         field.add(lhs, rhs),
@@ -43,7 +49,7 @@ fn check_boundaries<const MODULUS: u32>() {
         assert_eq!(field.neg(lhs), if lhs == 0 { 0 } else { MODULUS - lhs });
         assert_eq!(field.square(lhs), field.mul(lhs, lhs));
         for &rhs in &values {
-            check_pair(&field, lhs, rhs);
+            check_pair(field, lhs, rhs);
         }
     }
 }
@@ -63,7 +69,7 @@ fn check_exhaustive<const MODULUS: u32>() {
     let field = PrimeField::<MODULUS>::new();
     for lhs in 0..MODULUS {
         for rhs in 0..MODULUS {
-            check_pair(&field, lhs, rhs);
+            check_pair(field, lhs, rhs);
         }
     }
 }
@@ -125,7 +131,7 @@ fn exponentiation_matches_oracle() {
 
 fn check_all_inverses<const MODULUS: u32>() {
     let field = PrimeField::<MODULUS>::new();
-    assert!(field.inv(0).is_err());
+    assert_eq!(field.inv(0), Err(FieldError::DivisionByZero));
     for value in 1..MODULUS {
         let inverse = field.inv(value).unwrap();
         assert!(inverse < MODULUS);

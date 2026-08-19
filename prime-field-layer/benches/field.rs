@@ -1,3 +1,8 @@
+#![expect(
+    clippy::unwrap_used,
+    reason = "benchmark inputs are fixed to valid field operations"
+)]
+
 use std::hint::black_box;
 
 use criterion::{
@@ -10,7 +15,7 @@ const BULK_LENGTHS: [usize; 3] = [256, 4_096, 65_536];
 
 fn values(length: usize, modulus: u32, offset: u64) -> Vec<u32> {
     (0..length)
-        .map(|index| ((index as u64 * 2_654_435_761 + offset) % modulus as u64) as u32)
+        .map(|index| ((index as u64 * 2_654_435_761 + offset) % u64::from(modulus)) as u32)
         .collect()
 }
 
@@ -40,15 +45,15 @@ fn bench_scalar<const MODULUS: u32>(group: &mut BenchmarkGroup<'_, WallTime>) {
         b.iter(|| field.mul(black_box(lhs), black_box(rhs)));
     });
     group.bench_function(BenchmarkId::new("element_mul", MODULUS), |b| {
-        let lhs = field.element(lhs as u64);
-        let rhs = field.element(rhs as u64);
+        let lhs = field.element(u64::from(lhs));
+        let rhs = field.element(u64::from(rhs));
         b.iter(|| black_box(lhs) * black_box(rhs));
     });
     group.bench_function(BenchmarkId::new("square", MODULUS), |b| {
         b.iter(|| field.square(black_box(lhs)));
     });
     group.bench_function(BenchmarkId::new("pow_u32", MODULUS), |b| {
-        b.iter(|| field.pow(black_box(lhs), black_box(u32::MAX as u64)));
+        b.iter(|| field.pow(black_box(lhs), black_box(u64::from(u32::MAX))));
     });
     group.bench_function(BenchmarkId::new("inv", MODULUS), |b| {
         b.iter(|| field.inv(black_box(lhs)).unwrap());
@@ -70,11 +75,11 @@ fn bench_bulk<const MODULUS: u32>(group: &mut BenchmarkGroup<'_, WallTime>) {
         let rhs = values(length, MODULUS, 97);
         let lhs_elements: Vec<_> = lhs
             .iter()
-            .map(|&value| field.element(value as u64))
+            .map(|&value| field.element(u64::from(value)))
             .collect();
         let rhs_elements: Vec<_> = rhs
             .iter()
-            .map(|&value| field.element(value as u64))
+            .map(|&value| field.element(u64::from(value)))
             .collect();
         let parameter = format!("p={MODULUS}/n={length}");
 
@@ -84,7 +89,7 @@ fn bench_bulk<const MODULUS: u32>(group: &mut BenchmarkGroup<'_, WallTime>) {
                 |output| {
                     field
                         .add_assign(black_box(output), black_box(&rhs))
-                        .unwrap()
+                        .unwrap();
                 },
                 BatchSize::SmallInput,
             );
@@ -95,7 +100,7 @@ fn bench_bulk<const MODULUS: u32>(group: &mut BenchmarkGroup<'_, WallTime>) {
                 |output| {
                     field
                         .mul_assign(black_box(output), black_box(&rhs))
-                        .unwrap()
+                        .unwrap();
                 },
                 BatchSize::SmallInput,
             );
@@ -106,7 +111,7 @@ fn bench_bulk<const MODULUS: u32>(group: &mut BenchmarkGroup<'_, WallTime>) {
                 |output| {
                     field
                         .mul_elements_assign(black_box(output), black_box(&rhs_elements))
-                        .unwrap()
+                        .unwrap();
                 },
                 BatchSize::SmallInput,
             );
@@ -114,7 +119,7 @@ fn bench_bulk<const MODULUS: u32>(group: &mut BenchmarkGroup<'_, WallTime>) {
         group.bench_function(
             BenchmarkId::new("montgomery_scalar_mul_assign", &parameter),
             |b| {
-                let scalar = field.element((MODULUS - 1) as u64);
+                let scalar = field.element(u64::from(MODULUS - 1));
                 b.iter_batched_ref(
                     || lhs_elements.clone(),
                     |output| field.scalar_mul_elements_assign(black_box(output), black_box(scalar)),
