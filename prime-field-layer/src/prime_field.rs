@@ -449,6 +449,12 @@ impl<const MODULUS: u32> PrimeField<MODULUS> {
         if values.is_empty() {
             return Ok(());
         }
+        if MODULUS == 2 {
+            // MONTGOMERY_ONE is zero for this modulus, so the Montgomery
+            // seeding below cannot represent the identity.
+            values.fill(1);
+            return Ok(());
+        }
 
         let mut prefixes = Vec::with_capacity(values.len());
         let mut product = Self::MONTGOMERY_ONE;

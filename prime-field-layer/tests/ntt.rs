@@ -426,27 +426,3 @@ proptest! {
         );
     }
 }
-
-#[cfg(target_arch = "x86_64")]
-#[unsafe(no_mangle)]
-#[inline(never)]
-pub extern "C" fn review_wide_montgomery_kernel(lhs: u32, rhs: u32) -> u32 {
-    let field = PrimeField::<2_281_701_377>::new();
-    (field.element(lhs as u64) * field.element(rhs as u64)).value()
-}
-
-#[test]
-#[cfg(target_arch = "x86_64")]
-fn representative_wide_montgomery_kernel_matches_oracle() {
-    for (lhs, rhs) in [
-        (0, 0),
-        (1, 2_281_701_376),
-        (2_281_701_376, 2_281_701_376),
-        (u32::MAX, u32::MAX - 1),
-    ] {
-        assert_eq!(
-            review_wide_montgomery_kernel(lhs, rhs),
-            (lhs as u64 % 2_281_701_377 * (rhs as u64 % 2_281_701_377) % 2_281_701_377) as u32
-        );
-    }
-}

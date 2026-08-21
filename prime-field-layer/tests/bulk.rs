@@ -185,6 +185,7 @@ fn check_batch_inverse<const MODULUS: u32>() {
 
 #[test]
 fn batch_inverse_matches_scalar_inversion() {
+    check_batch_inverse::<2>();
     check_batch_inverse::<17>();
     check_batch_inverse::<65_537>();
     check_batch_inverse::<998_244_353>();

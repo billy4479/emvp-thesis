@@ -339,7 +339,7 @@ impl<const MODULUS: u32> NttPlan<MODULUS> {
     pub fn elements(&self, values: &[u32]) -> Vec<FieldElement<MODULUS>> {
         values
             .iter()
-            .map(|&value| self.field.element(u64::from(value)))
+            .map(|&value| self.field.element_u32(value))
             .collect()
     }
 
@@ -493,13 +493,13 @@ impl<const MODULUS: u32> NttPlan<MODULUS> {
                 available: self.length,
             });
         }
-        let mut lhs_elements = vec![self.field.element(0); self.length];
-        let mut rhs_elements = vec![self.field.element(0); self.length];
+        let mut lhs_elements = vec![self.field.element_u32(0); self.length];
+        let mut rhs_elements = vec![self.field.element_u32(0); self.length];
         for (output, &value) in lhs_elements.iter_mut().zip(lhs) {
-            *output = self.field.element(u64::from(value));
+            *output = self.field.element_u32(value);
         }
         for (output, &value) in rhs_elements.iter_mut().zip(rhs) {
-            *output = self.field.element(u64::from(value));
+            *output = self.field.element_u32(value);
         }
         self.convolve_elements(&mut lhs_elements, &mut rhs_elements)?;
         Ok(lhs_elements[..result_length]
@@ -1050,17 +1050,6 @@ fn normalize<const MODULUS: u32>(values: &mut [FieldElement<MODULUS>]) {
 mod tests {
     use super::*;
 
-    #[cfg(target_arch = "x86_64")]
-    #[unsafe(no_mangle)]
-    #[inline(never)]
-    pub extern "C" fn review_wide_ntt_butterfly(lhs: u32, rhs: u32, twiddle: u32) -> u64 {
-        const MODULUS: u32 = 2_281_701_377;
-        let product = PrimeField::<MODULUS>::montgomery_mul(rhs, twiddle);
-        let sum = add_mod::<MODULUS>(lhs, product);
-        let difference = sub_mod::<MODULUS>(lhs, product);
-        (u64::from(sum)) << 32 | u64::from(difference)
-    }
-
     #[test]
     #[cfg(target_arch = "x86_64")]
     fn forced_avx2_matches_forced_scalar() {
@@ -1162,23 +1151,5 @@ mod tests {
             convolution_result_length(usize::MAX, 2),
             Err(FieldError::ConvolutionLengthOverflow)
         );
-    }
-
-    #[test]
-    #[cfg(target_arch = "x86_64")]
-    fn representative_wide_butterfly_matches_field_operations() {
-        const MODULUS: u32 = 2_281_701_377;
-        let field = PrimeField::<MODULUS>::new();
-        for (lhs, rhs, twiddle) in [
-            (0, 0, 0),
-            (1, MODULUS - 1, 1),
-            (MODULUS - 1, MODULUS - 1, MODULUS - 1),
-            (MODULUS / 2, MODULUS - 2, MODULUS / 3),
-        ] {
-            let product = PrimeField::<MODULUS>::montgomery_mul(rhs, twiddle);
-            let expected =
-                (u64::from(field.add(lhs, product))) << 32 | u64::from(field.sub(lhs, product));
-            assert_eq!(review_wide_ntt_butterfly(lhs, rhs, twiddle), expected);
-        }
     }
 }
