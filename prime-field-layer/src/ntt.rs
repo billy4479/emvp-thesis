@@ -563,17 +563,15 @@ impl<const MODULUS: u32> NttPlan<MODULUS> {
     fn forward_shoup_lazy(&self, values: &mut [FieldElement<MODULUS>]) {
         let two_p = MODULUS * 2;
         for stage in &self.stages {
-            for (block, twiddle) in stage.forward.iter().enumerate() {
+            for (block, &twiddle) in stage.forward.iter().enumerate() {
                 let start = block * 2 * stage.distance;
-                for index in start..start + stage.distance {
-                    let lhs = values[index].montgomery();
-                    let product = shoup_mul_lazy_for::<MODULUS>(
-                        values[index + stage.distance].montgomery(),
-                        *twiddle,
-                    );
-                    values[index].set_montgomery(reduce_once(lhs + product, two_p));
-                    values[index + stage.distance]
-                        .set_montgomery(reduce_once(lhs + two_p - product, two_p));
+                let (lhs_values, rhs_values) =
+                    values[start..start + 2 * stage.distance].split_at_mut(stage.distance);
+                for (lhs_value, rhs_value) in lhs_values.iter_mut().zip(rhs_values) {
+                    let lhs = lhs_value.montgomery();
+                    let product = shoup_mul_lazy_for::<MODULUS>(rhs_value.montgomery(), twiddle);
+                    lhs_value.set_montgomery(reduce_once(lhs + product, two_p));
+                    rhs_value.set_montgomery(reduce_once(lhs + two_p - product, two_p));
                 }
             }
         }
@@ -583,15 +581,16 @@ impl<const MODULUS: u32> NttPlan<MODULUS> {
     fn inverse_shoup_lazy(&self, values: &mut [FieldElement<MODULUS>]) {
         let two_p = MODULUS * 2;
         for stage in self.stages.iter().rev() {
-            for (block, twiddle) in stage.inverse.iter().enumerate() {
+            for (block, &twiddle) in stage.inverse.iter().enumerate() {
                 let start = block * 2 * stage.distance;
-                for index in start..start + stage.distance {
-                    let lhs = values[index].montgomery();
-                    let rhs = values[index + stage.distance].montgomery();
-                    values[index].set_montgomery(reduce_once(lhs + rhs, two_p));
+                let (lhs_values, rhs_values) =
+                    values[start..start + 2 * stage.distance].split_at_mut(stage.distance);
+                for (lhs_value, rhs_value) in lhs_values.iter_mut().zip(rhs_values) {
+                    let lhs = lhs_value.montgomery();
+                    let rhs = rhs_value.montgomery();
+                    lhs_value.set_montgomery(reduce_once(lhs + rhs, two_p));
                     let difference = reduce_once(lhs + two_p - rhs, two_p);
-                    values[index + stage.distance]
-                        .set_montgomery(shoup_mul_lazy_for::<MODULUS>(difference, *twiddle));
+                    rhs_value.set_montgomery(shoup_mul_lazy_for::<MODULUS>(difference, twiddle));
                 }
             }
         }
@@ -600,19 +599,18 @@ impl<const MODULUS: u32> NttPlan<MODULUS> {
 
     fn forward_shoup(&self, values: &mut [FieldElement<MODULUS>]) {
         for stage in &self.stages {
-            for (block, twiddle) in stage.forward.iter().enumerate() {
+            for (block, &twiddle) in stage.forward.iter().enumerate() {
                 let start = block * 2 * stage.distance;
-                for index in start..start + stage.distance {
-                    let lhs = values[index].montgomery();
+                let (lhs_values, rhs_values) =
+                    values[start..start + 2 * stage.distance].split_at_mut(stage.distance);
+                for (lhs_value, rhs_value) in lhs_values.iter_mut().zip(rhs_values) {
+                    let lhs = lhs_value.montgomery();
                     let product = reduce_once(
-                        shoup_mul_lazy_for::<MODULUS>(
-                            values[index + stage.distance].montgomery(),
-                            *twiddle,
-                        ),
+                        shoup_mul_lazy_for::<MODULUS>(rhs_value.montgomery(), twiddle),
                         MODULUS,
                     );
-                    values[index].set_montgomery(add_mod::<MODULUS>(lhs, product));
-                    values[index + stage.distance].set_montgomery(sub_mod::<MODULUS>(lhs, product));
+                    lhs_value.set_montgomery(add_mod::<MODULUS>(lhs, product));
+                    rhs_value.set_montgomery(sub_mod::<MODULUS>(lhs, product));
                 }
             }
         }
@@ -620,15 +618,17 @@ impl<const MODULUS: u32> NttPlan<MODULUS> {
 
     fn inverse_shoup(&self, values: &mut [FieldElement<MODULUS>]) {
         for stage in self.stages.iter().rev() {
-            for (block, twiddle) in stage.inverse.iter().enumerate() {
+            for (block, &twiddle) in stage.inverse.iter().enumerate() {
                 let start = block * 2 * stage.distance;
-                for index in start..start + stage.distance {
-                    let lhs = values[index].montgomery();
-                    let rhs = values[index + stage.distance].montgomery();
-                    values[index].set_montgomery(add_mod::<MODULUS>(lhs, rhs));
-                    values[index + stage.distance].set_montgomery(shoup_mul::<MODULUS>(
+                let (lhs_values, rhs_values) =
+                    values[start..start + 2 * stage.distance].split_at_mut(stage.distance);
+                for (lhs_value, rhs_value) in lhs_values.iter_mut().zip(rhs_values) {
+                    let lhs = lhs_value.montgomery();
+                    let rhs = rhs_value.montgomery();
+                    lhs_value.set_montgomery(add_mod::<MODULUS>(lhs, rhs));
+                    rhs_value.set_montgomery(shoup_mul::<MODULUS>(
                         sub_mod::<MODULUS>(lhs, rhs),
-                        *twiddle,
+                        twiddle,
                     ));
                 }
             }
@@ -639,18 +639,16 @@ impl<const MODULUS: u32> NttPlan<MODULUS> {
         for stage in &self.stages {
             for (block, twiddle) in stage.forward.iter().enumerate() {
                 let start = block * 2 * stage.distance;
-                for index in start..start + stage.distance {
-                    // SAFETY: construction partitions every stage into in-bounds blocks.
-                    unsafe {
-                        let lhs = (*values.as_ptr().add(index)).montgomery();
-                        let rhs = (*values.as_ptr().add(index + stage.distance)).montgomery();
-                        let product =
-                            PrimeField::<MODULUS>::montgomery_mul(rhs, twiddle.montgomery);
-                        (*values.as_mut_ptr().add(index))
-                            .set_montgomery(add_mod::<MODULUS>(lhs, product));
-                        (*values.as_mut_ptr().add(index + stage.distance))
-                            .set_montgomery(sub_mod::<MODULUS>(lhs, product));
-                    }
+                let (lhs_values, rhs_values) =
+                    values[start..start + 2 * stage.distance].split_at_mut(stage.distance);
+                for (lhs_value, rhs_value) in lhs_values.iter_mut().zip(rhs_values) {
+                    let lhs = lhs_value.montgomery();
+                    let product = PrimeField::<MODULUS>::montgomery_mul(
+                        rhs_value.montgomery(),
+                        twiddle.montgomery,
+                    );
+                    lhs_value.set_montgomery(add_mod::<MODULUS>(lhs, product));
+                    rhs_value.set_montgomery(sub_mod::<MODULUS>(lhs, product));
                 }
             }
         }
@@ -660,24 +658,25 @@ impl<const MODULUS: u32> NttPlan<MODULUS> {
         for stage in self.stages.iter().rev() {
             for (block, twiddle) in stage.inverse.iter().enumerate() {
                 let start = block * 2 * stage.distance;
-                for index in start..start + stage.distance {
-                    // SAFETY: construction partitions every stage into in-bounds blocks.
-                    unsafe {
-                        let lhs = (*values.as_ptr().add(index)).montgomery();
-                        let rhs = (*values.as_ptr().add(index + stage.distance)).montgomery();
-                        (*values.as_mut_ptr().add(index))
-                            .set_montgomery(add_mod::<MODULUS>(lhs, rhs));
-                        (*values.as_mut_ptr().add(index + stage.distance)).set_montgomery(
-                            PrimeField::<MODULUS>::montgomery_mul(
-                                sub_mod::<MODULUS>(lhs, rhs),
-                                twiddle.montgomery,
-                            ),
-                        );
-                    }
+                let (lhs_values, rhs_values) =
+                    values[start..start + 2 * stage.distance].split_at_mut(stage.distance);
+                for (lhs_value, rhs_value) in lhs_values.iter_mut().zip(rhs_values) {
+                    let lhs = lhs_value.montgomery();
+                    let rhs = rhs_value.montgomery();
+                    lhs_value.set_montgomery(add_mod::<MODULUS>(lhs, rhs));
+                    rhs_value.set_montgomery(PrimeField::<MODULUS>::montgomery_mul(
+                        sub_mod::<MODULUS>(lhs, rhs),
+                        twiddle.montgomery,
+                    ));
                 }
             }
         }
     }
+}
+
+#[inline(always)]
+pub(super) const fn stage_twiddle_index(blocks: usize, block: usize) -> usize {
+    blocks - 1 + block
 }
 
 /// A reusable fixed-size convolution plan modulo `x^N + 1`.

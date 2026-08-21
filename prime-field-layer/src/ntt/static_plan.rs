@@ -1,11 +1,8 @@
 use super::{
     BackendPreference, NttBackend, NttPerformanceWarning, Twiddle, add_mod, normalize,
-    select_backend, shoup_mul, shoup_mul_lazy_for, sub_mod,
+    select_backend, shoup_mul, shoup_mul_lazy_for, stage_twiddle_index, sub_mod,
 };
 use crate::{FieldElement, FieldError, PrimeField, constant_time::reduce_once_u64};
-
-#[cfg(target_arch = "x86_64")]
-mod llvm_avx2;
 
 /// An NTT plan whose modulus and transform length are compile-time parameters.
 ///
@@ -142,7 +139,7 @@ impl<const MODULUS: u32, const N: usize> StaticNttPlan<MODULUS, N> {
                 #[cfg(target_arch = "x86_64")]
                 // SAFETY: construction selects this backend only after AVX2 detection.
                 unsafe {
-                    llvm_avx2::forward(values, &Self::FORWARD_TWIDDLES);
+                    super::avx2::forward_static(values, &Self::FORWARD_TWIDDLES);
                 }
                 #[cfg(not(target_arch = "x86_64"))]
                 unreachable!()
@@ -165,7 +162,7 @@ impl<const MODULUS: u32, const N: usize> StaticNttPlan<MODULUS, N> {
                 #[cfg(target_arch = "x86_64")]
                 // SAFETY: construction selects this backend only after AVX2 detection.
                 unsafe {
-                    llvm_avx2::inverse(values, &Self::INVERSE_TWIDDLES);
+                    super::avx2::inverse_static(values, &Self::INVERSE_TWIDDLES);
                 }
                 #[cfg(not(target_arch = "x86_64"))]
                 unreachable!()
@@ -248,22 +245,16 @@ impl<const MODULUS: u32, const N: usize> StaticNttPlan<MODULUS, N> {
         while distance < N {
             let blocks = N / (2 * distance);
             for block in 0..blocks {
-                // SAFETY: stage_twiddle_index is in `0..N - 1` for every stage.
-                let twiddle = unsafe {
-                    *Self::INVERSE_TWIDDLES.get_unchecked(stage_twiddle_index(blocks, block))
-                };
+                let twiddle = Self::INVERSE_TWIDDLES[stage_twiddle_index(blocks, block)];
                 let start = block * 2 * distance;
-                for index in start..start + distance {
-                    // SAFETY: both halves are within this statically sized block.
-                    unsafe {
-                        let lhs = (*values.as_ptr().add(index)).montgomery();
-                        let rhs = (*values.as_ptr().add(index + distance)).montgomery();
-                        (*values.as_mut_ptr().add(index))
-                            .set_montgomery(reduce_once(lhs + rhs, two_p));
-                        let difference = reduce_once(lhs + two_p - rhs, two_p);
-                        (*values.as_mut_ptr().add(index + distance))
-                            .set_montgomery(shoup_mul_lazy_for::<MODULUS>(difference, twiddle));
-                    }
+                let (lhs_values, rhs_values) =
+                    values[start..start + 2 * distance].split_at_mut(distance);
+                for (lhs_value, rhs_value) in lhs_values.iter_mut().zip(rhs_values) {
+                    let lhs = lhs_value.montgomery();
+                    let rhs = rhs_value.montgomery();
+                    lhs_value.set_montgomery(reduce_once(lhs + rhs, two_p));
+                    let difference = reduce_once(lhs + two_p - rhs, two_p);
+                    rhs_value.set_montgomery(shoup_mul_lazy_for::<MODULUS>(difference, twiddle));
                 }
             }
             distance *= 2;
@@ -277,22 +268,15 @@ impl<const MODULUS: u32, const N: usize> StaticNttPlan<MODULUS, N> {
         while distance != 0 {
             let blocks = N / (2 * distance);
             for block in 0..blocks {
-                // SAFETY: stage_twiddle_index is in `0..N - 1` for every stage.
-                let twiddle = unsafe {
-                    *Self::FORWARD_TWIDDLES.get_unchecked(stage_twiddle_index(blocks, block))
-                };
+                let twiddle = Self::FORWARD_TWIDDLES[stage_twiddle_index(blocks, block)];
                 let start = block * 2 * distance;
-                for index in start..start + distance {
-                    // SAFETY: both halves are within this statically sized block.
-                    unsafe {
-                        let lhs = (*values.as_ptr().add(index)).montgomery();
-                        let rhs = (*values.as_ptr().add(index + distance)).montgomery();
-                        let product = shoup_mul::<MODULUS>(rhs, twiddle);
-                        let sum = add_mod::<MODULUS>(lhs, product);
-                        let difference = sub_mod::<MODULUS>(lhs, product);
-                        (*values.as_mut_ptr().add(index)).set_montgomery(sum);
-                        (*values.as_mut_ptr().add(index + distance)).set_montgomery(difference);
-                    }
+                let (lhs_values, rhs_values) =
+                    values[start..start + 2 * distance].split_at_mut(distance);
+                for (lhs_value, rhs_value) in lhs_values.iter_mut().zip(rhs_values) {
+                    let lhs = lhs_value.montgomery();
+                    let product = shoup_mul::<MODULUS>(rhs_value.montgomery(), twiddle);
+                    lhs_value.set_montgomery(add_mod::<MODULUS>(lhs, product));
+                    rhs_value.set_montgomery(sub_mod::<MODULUS>(lhs, product));
                 }
             }
             distance /= 2;
@@ -305,25 +289,18 @@ impl<const MODULUS: u32, const N: usize> StaticNttPlan<MODULUS, N> {
         while distance < N {
             let blocks = N / (2 * distance);
             for block in 0..blocks {
-                // SAFETY: stage_twiddle_index is in `0..N - 1` for every stage.
-                let twiddle = unsafe {
-                    *Self::INVERSE_TWIDDLES.get_unchecked(stage_twiddle_index(blocks, block))
-                };
+                let twiddle = Self::INVERSE_TWIDDLES[stage_twiddle_index(blocks, block)];
                 let start = block * 2 * distance;
-                for index in start..start + distance {
-                    // SAFETY: both halves are within this statically sized block.
-                    unsafe {
-                        let lhs = (*values.as_ptr().add(index)).montgomery();
-                        let rhs = (*values.as_ptr().add(index + distance)).montgomery();
-                        let sum = add_mod::<MODULUS>(lhs, rhs);
-                        let difference = sub_mod::<MODULUS>(lhs, rhs);
-                        (*values.as_mut_ptr().add(index)).set_montgomery(sum);
-                        (*values.as_mut_ptr().add(index + distance)).set_montgomery(shoup_mul::<
-                            MODULUS,
-                        >(
-                            difference, twiddle,
-                        ));
-                    }
+                let (lhs_values, rhs_values) =
+                    values[start..start + 2 * distance].split_at_mut(distance);
+                for (lhs_value, rhs_value) in lhs_values.iter_mut().zip(rhs_values) {
+                    let lhs = lhs_value.montgomery();
+                    let rhs = rhs_value.montgomery();
+                    lhs_value.set_montgomery(add_mod::<MODULUS>(lhs, rhs));
+                    rhs_value.set_montgomery(shoup_mul::<MODULUS>(
+                        sub_mod::<MODULUS>(lhs, rhs),
+                        twiddle,
+                    ));
                 }
             }
             distance *= 2;
@@ -336,23 +313,18 @@ impl<const MODULUS: u32, const N: usize> StaticNttPlan<MODULUS, N> {
         while distance != 0 {
             let blocks = N / (2 * distance);
             for block in 0..blocks {
-                // SAFETY: stage_twiddle_index is in `0..N - 1` for every stage.
-                let twiddle = unsafe {
-                    *Self::FORWARD_TWIDDLES.get_unchecked(stage_twiddle_index(blocks, block))
-                };
+                let twiddle = Self::FORWARD_TWIDDLES[stage_twiddle_index(blocks, block)];
                 let start = block * 2 * distance;
-                for index in start..start + distance {
-                    // SAFETY: both halves are within this statically sized block.
-                    unsafe {
-                        let lhs = (*values.as_ptr().add(index)).montgomery();
-                        let rhs = (*values.as_ptr().add(index + distance)).montgomery();
-                        let product =
-                            PrimeField::<MODULUS>::montgomery_mul(rhs, twiddle.montgomery);
-                        let sum = add_mod::<MODULUS>(lhs, product);
-                        let difference = sub_mod::<MODULUS>(lhs, product);
-                        (*values.as_mut_ptr().add(index)).set_montgomery(sum);
-                        (*values.as_mut_ptr().add(index + distance)).set_montgomery(difference);
-                    }
+                let (lhs_values, rhs_values) =
+                    values[start..start + 2 * distance].split_at_mut(distance);
+                for (lhs_value, rhs_value) in lhs_values.iter_mut().zip(rhs_values) {
+                    let lhs = lhs_value.montgomery();
+                    let product = PrimeField::<MODULUS>::montgomery_mul(
+                        rhs_value.montgomery(),
+                        twiddle.montgomery,
+                    );
+                    lhs_value.set_montgomery(add_mod::<MODULUS>(lhs, product));
+                    rhs_value.set_montgomery(sub_mod::<MODULUS>(lhs, product));
                 }
             }
             distance /= 2;
@@ -365,34 +337,23 @@ impl<const MODULUS: u32, const N: usize> StaticNttPlan<MODULUS, N> {
         while distance < N {
             let blocks = N / (2 * distance);
             for block in 0..blocks {
-                // SAFETY: stage_twiddle_index is in `0..N - 1` for every stage.
-                let twiddle = unsafe {
-                    *Self::INVERSE_TWIDDLES.get_unchecked(stage_twiddle_index(blocks, block))
-                };
+                let twiddle = Self::INVERSE_TWIDDLES[stage_twiddle_index(blocks, block)];
                 let start = block * 2 * distance;
-                for index in start..start + distance {
-                    // SAFETY: both halves are within this statically sized block.
-                    unsafe {
-                        let lhs = (*values.as_ptr().add(index)).montgomery();
-                        let rhs = (*values.as_ptr().add(index + distance)).montgomery();
-                        (*values.as_mut_ptr().add(index))
-                            .set_montgomery(add_mod::<MODULUS>(lhs, rhs));
-                        let product = PrimeField::<MODULUS>::montgomery_mul(
-                            sub_mod::<MODULUS>(lhs, rhs),
-                            twiddle.montgomery,
-                        );
-                        (*values.as_mut_ptr().add(index + distance)).set_montgomery(product);
-                    }
+                let (lhs_values, rhs_values) =
+                    values[start..start + 2 * distance].split_at_mut(distance);
+                for (lhs_value, rhs_value) in lhs_values.iter_mut().zip(rhs_values) {
+                    let lhs = lhs_value.montgomery();
+                    let rhs = rhs_value.montgomery();
+                    lhs_value.set_montgomery(add_mod::<MODULUS>(lhs, rhs));
+                    rhs_value.set_montgomery(PrimeField::<MODULUS>::montgomery_mul(
+                        sub_mod::<MODULUS>(lhs, rhs),
+                        twiddle.montgomery,
+                    ));
                 }
             }
             distance *= 2;
         }
     }
-}
-
-#[inline(always)]
-const fn stage_twiddle_index(blocks: usize, block: usize) -> usize {
-    blocks - 1 + block
 }
 
 #[inline(always)]
