@@ -2,14 +2,6 @@ use std::ops::{Add, AddAssign, Mul, MulAssign, Neg, Sub, SubAssign};
 
 use crate::{FieldError, PrimeField};
 
-#[cfg(target_arch = "x86_64")]
-use std::arch::x86_64::{
-    __m256i, _mm256_add_epi64, _mm256_and_si256, _mm256_andnot_si256, _mm256_cmpgt_epi64,
-    _mm256_loadu_si256, _mm256_mul_epu32, _mm256_mullo_epi32, _mm256_or_si256, _mm256_set1_epi32,
-    _mm256_set1_epi64x, _mm256_slli_epi64, _mm256_srli_epi64, _mm256_storeu_si256,
-    _mm256_sub_epi64, _mm256_xor_si256,
-};
-
 /// A field element stored as a four-byte Montgomery residue.
 ///
 /// For a canonical value `a`, the private word represents `a * 2^32 mod
@@ -199,14 +191,14 @@ impl<const MODULUS: u32> PrimeField<MODULUS> {
     /// Multiplies `lhs` element-wise by `rhs` in Montgomery representation.
     ///
     /// This is the bulk operation used for NTT pointwise products. It takes
-    /// `O(n)` time and allocates nothing. On x86-64, slices of at least
-    /// eight elements use runtime-detected AVX2 in eight-element groups when
-    /// `MODULUS != 2`; unsupported targets, shorter slices, modulus two, and any
-    /// tail use the scalar Montgomery kernel. Dispatch depends on public target,
-    /// modulus, and length, while arithmetic kernels are designed without
-    /// coefficient-dependent branches; this is not a formal constant-time
-    /// audit. A length mismatch returns [`FieldError::LengthMismatch`] before
-    /// mutating `lhs`.
+    /// O(n) time and allocates nothing. On x86-64, slices of at least
+    /// eight elements use a runtime-detected AVX2 auto-vectorized Montgomery
+    /// kernel when `MODULUS != 2`; unsupported targets, shorter slices, and
+    /// modulus two use the scalar Montgomery kernel. Dispatch depends on public
+    /// target, modulus, and length, while arithmetic kernels are designed
+    /// without coefficient-dependent branches; this is not a formal
+    /// constant-time audit. A length mismatch returns
+    /// [`FieldError::LengthMismatch`] before mutating `lhs`.
     ///
     /// # Errors
     ///
@@ -252,11 +244,11 @@ impl<const MODULUS: u32> PrimeField<MODULUS> {
     /// Multiplies every element in `values` by `scalar` in place.
     ///
     /// This takes `O(n)` time and allocates nothing while retaining Montgomery
-    /// representation. On x86-64, slices of at least eight elements use
-    /// runtime-detected AVX2 in eight-element groups when `MODULUS != 2`; other
-    /// cases and any tail are scalar. The implementation is designed without
-    /// coefficient-dependent branches in the arithmetic kernels, but it has
-    /// not been formally audited as a constant-time implementation.
+    /// representation. On x86-64, slices of at least eight elements use a
+    /// runtime-detected AVX2 auto-vectorized Montgomery kernel when
+    /// `MODULUS != 2`; other cases are scalar. The implementation is designed
+    /// without coefficient-dependent branches in the arithmetic kernels, but it
+    /// has not been formally audited as a constant-time implementation.
     pub fn scalar_mul_elements_assign(
         &self,
         values: &mut [FieldElement<MODULUS>],
@@ -275,90 +267,62 @@ impl<const MODULUS: u32> PrimeField<MODULUS> {
     }
 }
 
-#[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx2")]
-unsafe fn montgomery_mul_avx2<const MODULUS: u32>(lhs: __m256i, rhs: __m256i) -> __m256i {
-    let modulus_32 = _mm256_set1_epi32(MODULUS.cast_signed());
-    let modulus_64 = _mm256_set1_epi64x(i64::from(MODULUS));
-    let neg_inv = _mm256_set1_epi32(PrimeField::<MODULUS>::MONTGOMERY_NEG_INV.cast_signed());
-    let sign_bit = _mm256_set1_epi64x(i64::MIN);
-    let carry_bit = _mm256_set1_epi64x(1i64 << 32);
-    let all = _mm256_set1_epi64x(-1);
-
-    let products_even = _mm256_mul_epu32(lhs, rhs);
-    let products_odd = _mm256_mul_epu32(_mm256_srli_epi64(lhs, 32), _mm256_srli_epi64(rhs, 32));
-    let adjustments = _mm256_mullo_epi32(_mm256_mullo_epi32(lhs, rhs), neg_inv);
-    let adjustments_even = _mm256_mul_epu32(adjustments, modulus_32);
-    let adjustments_odd = _mm256_mul_epu32(_mm256_srli_epi64(adjustments, 32), modulus_32);
-
-    let reduce = |products: __m256i, adjustments: __m256i| {
-        let sums = _mm256_add_epi64(products, adjustments);
-        let carries = _mm256_cmpgt_epi64(
-            _mm256_xor_si256(products, sign_bit),
-            _mm256_xor_si256(sums, sign_bit),
-        );
-        let reduced = _mm256_or_si256(
-            _mm256_srli_epi64(sums, 32),
-            _mm256_and_si256(carries, carry_bit),
-        );
-        let below_modulus = _mm256_cmpgt_epi64(modulus_64, reduced);
-        _mm256_sub_epi64(
-            reduced,
-            _mm256_andnot_si256(below_modulus, _mm256_and_si256(all, modulus_64)),
-        )
-    };
-
-    let even = reduce(products_even, adjustments_even);
-    let odd = reduce(products_odd, adjustments_odd);
-    _mm256_or_si256(even, _mm256_slli_epi64(odd, 32))
+/// Branchless scalar Montgomery multiplication without inline assembly.
+///
+/// The inline-assembly helpers in `constant_time` are opaque to LLVM and
+/// prevent loop vectorization, so this kernel expresses the same REDC with
+/// portable wrapping arithmetic. Comparisons materialize masks instead of
+/// branches, mirroring the `add`/`sbb` and `sub`/`cmov` sequences of the
+/// assembly version while letting LLVM schedule vector code. Callers ensure
+/// `MODULUS != 2`. This is a code-generation safeguard, not a claim of a
+/// formally verified side-channel implementation.
+#[inline(always)]
+fn montgomery_mul_vectorized<const MODULUS: u32>(lhs: u32, rhs: u32) -> u32 {
+    let product = u64::from(lhs) * u64::from(rhs);
+    let adjustment = (product as u32).wrapping_mul(PrimeField::<MODULUS>::MONTGOMERY_NEG_INV);
+    let sum = product.wrapping_add(u64::from(adjustment) * u64::from(MODULUS));
+    // A wrapped sum means the true sum exceeded 64 bits; the carry belongs in
+    // bit 32 of the shifted result, matching `add_with_carry_shr_32`.
+    let carry = u64::from(sum < product) << 32;
+    let reduced = (sum >> 32) | carry;
+    reduced.wrapping_sub(u64::from(reduced >= u64::from(MODULUS)) * u64::from(MODULUS)) as u32
 }
 
+/// Multiplies `lhs` element-wise by `rhs` with LLVM-vectorized AVX2 code.
+///
+/// The loop body is branchless portable Rust; marking only this entry point
+/// `avx2` lets LLVM emit `vpmuludq`/`vpmulld` Montgomery reduction without
+/// handwritten intrinsics. No `unsafe` operations occur beyond entering the
+/// `target_feature` context.
+///
+/// # Safety
+///
+/// AVX2 must be supported by the target CPU.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
 unsafe fn mul_elements_assign_avx2<const MODULUS: u32>(
     lhs: &mut [FieldElement<MODULUS>],
     rhs: &[FieldElement<MODULUS>],
 ) {
-    let vectorized = lhs.len() / 8 * 8;
-    let mut index = 0;
-    while index < vectorized {
-        // SAFETY: each load and store covers eight elements inside the slices.
-        unsafe {
-            let lhs_vector = _mm256_loadu_si256(lhs.as_ptr().add(index).cast());
-            let rhs_vector = _mm256_loadu_si256(rhs.as_ptr().add(index).cast());
-            let result = montgomery_mul_avx2::<MODULUS>(lhs_vector, rhs_vector);
-            _mm256_storeu_si256(lhs.as_mut_ptr().add(index).cast(), result);
-        }
-        index += 8;
-    }
-
-    for (lhs, rhs) in lhs[vectorized..].iter_mut().zip(&rhs[vectorized..]) {
-        lhs.montgomery = PrimeField::<MODULUS>::montgomery_mul(lhs.montgomery, rhs.montgomery);
+    for (lhs, rhs) in lhs.iter_mut().zip(rhs) {
+        lhs.montgomery = montgomery_mul_vectorized::<MODULUS>(lhs.montgomery, rhs.montgomery);
     }
 }
 
+/// Multiplies every element by `scalar` with LLVM-vectorized AVX2 code.
+///
+/// # Safety
+///
+/// AVX2 must be supported by the target CPU.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
 unsafe fn scalar_mul_elements_assign_avx2<const MODULUS: u32>(
     values: &mut [FieldElement<MODULUS>],
     scalar: FieldElement<MODULUS>,
 ) {
-    let scalar_vector = _mm256_set1_epi32(scalar.montgomery.cast_signed());
-    let vectorized = values.len() / 8 * 8;
-    let mut index = 0;
-    while index < vectorized {
-        // SAFETY: each load and store covers eight elements inside the slice.
-        unsafe {
-            let values_vector = _mm256_loadu_si256(values.as_ptr().add(index).cast());
-            let result = montgomery_mul_avx2::<MODULUS>(values_vector, scalar_vector);
-            _mm256_storeu_si256(values.as_mut_ptr().add(index).cast(), result);
-        }
-        index += 8;
-    }
-
-    for value in &mut values[vectorized..] {
+    for value in values {
         value.montgomery =
-            PrimeField::<MODULUS>::montgomery_mul(value.montgomery, scalar.montgomery);
+            montgomery_mul_vectorized::<MODULUS>(value.montgomery, scalar.montgomery);
     }
 }
 
