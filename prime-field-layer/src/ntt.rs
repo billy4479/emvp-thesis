@@ -52,6 +52,22 @@
 //! # Ok::<(), prime_field_layer::FieldError>(())
 //! ```
 //!
+//! # Compile-time transform length
+//!
+//! [`StaticNttPlan`] evaluates roots, twiddles, and stage layout at compile time.
+//! Its array API makes transform-size mismatches compile-time type errors:
+//!
+//! ```
+//! use prime_field_layer::StaticNttPlan;
+//!
+//! let plan = StaticNttPlan::<17, 8>::new()?;
+//! let mut values = plan.elements(&[1, 2, 3, 4, 5, 6, 7, 8]);
+//! plan.forward(&mut values);
+//! plan.inverse(&mut values);
+//! assert_eq!(values.map(|value| value.value()), [1, 2, 3, 4, 5, 6, 7, 8]);
+//! # Ok::<(), prime_field_layer::FieldError>(())
+//! ```
+//!
 //! The arithmetic kernels are designed without coefficient-dependent control
 //! flow. Dispatch, allocation, errors, and loop counts depend on public modulus,
 //! platform, and slice lengths. This is a code-level timing precaution, not a
@@ -67,6 +83,9 @@ use crate::{FieldElement, FieldError, PrimeField, constant_time::reduce_once_u64
 
 #[cfg(target_arch = "x86_64")]
 mod avx2;
+mod static_plan;
+
+pub use static_plan::StaticNttPlan;
 
 /// Arithmetic and instruction-set implementation selected for an [`NttPlan`].
 ///
@@ -90,17 +109,11 @@ pub enum NttBackend {
     /// This general fallback supports wide `u32` primes but does not use the
     /// Shoup or AVX2 transform kernels.
     ScalarMontgomery,
-    /// Eight-lane AVX2 Shoup butterflies with lazy residues in `[0, 2p)`.
+    /// LLVM-vectorized AVX2 Shoup butterflies with lazy residues in `[0, 2p)`.
     ///
     /// Available only on x86-64 after runtime AVX2 detection, for
     /// `p < 2^30`. Public transform outputs are normalized to `[0, p)`.
     Avx2ShoupLazy,
-    /// Scalar lazy Shoup transforms with AVX2 pointwise multiplication and
-    /// inverse normalization.
-    ///
-    /// Automatic dispatch uses this hybrid for supported short and medium
-    /// transforms on AVX2-capable x86-64 CPUs.
-    ScalarShoupLazyWithAvx2,
 }
 
 /// A typed explanation for scalar-only fallback or explicit scalar selection.
@@ -178,7 +191,7 @@ pub struct NttPlan<const MODULUS: u32> {
 }
 
 impl<const MODULUS: u32> NttPlan<MODULUS> {
-    /// Constructs a plan using automatic scalar, hybrid, or AVX2 dispatch.
+    /// Constructs a plan using automatic scalar or AVX2 dispatch.
     ///
     /// `length` must be a nonzero power of two dividing `MODULUS - 1`. Setup
     /// takes `O(length + log MODULUS)` field operations and uses `O(length)`
@@ -186,9 +199,9 @@ impl<const MODULUS: u32> NttPlan<MODULUS> {
     /// constructor for normal use, then reuse the plan across operations.
     ///
     /// On x86-64 with runtime AVX2 support and `MODULUS < 2^30`,
-    /// automatic dispatch uses hybrid scalar transforms from length 16 through
-    /// 8192 and AVX2 transforms from length 16384. Other targets and modulus
-    /// tiers select the applicable scalar backend. Use [`Self::new_scalar`] for
+    /// automatic dispatch uses compiler-vectorized AVX2 transforms from length
+    /// 16. Other targets and modulus tiers select the applicable scalar backend.
+    /// Use [`Self::new_scalar`] for
     /// portable benchmarking or [`Self::new_avx2`] to require AVX2 butterflies.
     ///
     /// # Errors
@@ -308,9 +321,7 @@ impl<const MODULUS: u32> NttPlan<MODULUS> {
 
     /// Returns a diagnostic for scalar selection or fallback, if applicable.
     ///
-    /// This `O(1)` accessor allocates nothing. `None` can also describe the
-    /// hybrid backend, where transforms are scalar but bulk multiplication and
-    /// inverse normalization use AVX2.
+    /// This `O(1)` accessor allocates nothing.
     #[must_use]
     pub const fn performance_warning(&self) -> Option<NttPerformanceWarning> {
         self.warning
@@ -353,7 +364,7 @@ impl<const MODULUS: u32> NttPlan<MODULUS> {
     pub fn forward(&self, values: &mut [FieldElement<MODULUS>]) -> Result<(), FieldError> {
         self.check_length(values.len())?;
         match self.backend {
-            NttBackend::ScalarShoupLazy | NttBackend::ScalarShoupLazyWithAvx2 => {
+            NttBackend::ScalarShoupLazy => {
                 self.forward_shoup_lazy(values);
             }
             NttBackend::ScalarShoup => self.forward_shoup(values),
@@ -391,7 +402,7 @@ impl<const MODULUS: u32> NttPlan<MODULUS> {
     pub fn inverse(&self, values: &mut [FieldElement<MODULUS>]) -> Result<(), FieldError> {
         self.check_length(values.len())?;
         match self.backend {
-            NttBackend::ScalarShoupLazy | NttBackend::ScalarShoupLazyWithAvx2 => {
+            NttBackend::ScalarShoupLazy => {
                 self.inverse_shoup_lazy(values);
             }
             NttBackend::ScalarShoup => self.inverse_shoup(values),
@@ -406,10 +417,7 @@ impl<const MODULUS: u32> NttPlan<MODULUS> {
                 unreachable!()
             }
         }
-        if matches!(
-            self.backend,
-            NttBackend::Avx2ShoupLazy | NttBackend::ScalarShoupLazyWithAvx2
-        ) {
+        if matches!(self.backend, NttBackend::Avx2ShoupLazy) {
             self.field
                 .scalar_mul_elements_assign(values, self.inverse_length);
         } else {
@@ -426,7 +434,7 @@ impl<const MODULUS: u32> NttPlan<MODULUS> {
     /// Montgomery representation. Apply [`Self::inverse`] to obtain a cyclic
     /// convolution. Prefer [`Self::cyclic_convolution`] for a one-call product.
     ///
-    /// This takes `O(N)` time and allocates nothing. AVX2 and hybrid plans call
+    /// This takes `O(N)` time and allocates nothing. AVX2 plans call
     /// [`PrimeField::mul_elements_assign`], which dispatches AVX2 at runtime;
     /// other plans use scalar multiplication.
     ///
@@ -441,10 +449,7 @@ impl<const MODULUS: u32> NttPlan<MODULUS> {
     ) -> Result<(), FieldError> {
         self.check_length(lhs.len())?;
         self.check_length(rhs.len())?;
-        if matches!(
-            self.backend,
-            NttBackend::Avx2ShoupLazy | NttBackend::ScalarShoupLazyWithAvx2
-        ) {
+        if matches!(self.backend, NttBackend::Avx2ShoupLazy) {
             self.field.mul_elements_assign(lhs, rhs)
         } else {
             for (lhs, &rhs) in lhs.iter_mut().zip(rhs) {
@@ -635,13 +640,17 @@ impl<const MODULUS: u32> NttPlan<MODULUS> {
             for (block, twiddle) in stage.forward.iter().enumerate() {
                 let start = block * 2 * stage.distance;
                 for index in start..start + stage.distance {
-                    let lhs = values[index].montgomery();
-                    let product = PrimeField::<MODULUS>::montgomery_mul(
-                        values[index + stage.distance].montgomery(),
-                        twiddle.montgomery,
-                    );
-                    values[index].set_montgomery(add_mod::<MODULUS>(lhs, product));
-                    values[index + stage.distance].set_montgomery(sub_mod::<MODULUS>(lhs, product));
+                    // SAFETY: construction partitions every stage into in-bounds blocks.
+                    unsafe {
+                        let lhs = (*values.as_ptr().add(index)).montgomery();
+                        let rhs = (*values.as_ptr().add(index + stage.distance)).montgomery();
+                        let product =
+                            PrimeField::<MODULUS>::montgomery_mul(rhs, twiddle.montgomery);
+                        (*values.as_mut_ptr().add(index))
+                            .set_montgomery(add_mod::<MODULUS>(lhs, product));
+                        (*values.as_mut_ptr().add(index + stage.distance))
+                            .set_montgomery(sub_mod::<MODULUS>(lhs, product));
+                    }
                 }
             }
         }
@@ -652,15 +661,19 @@ impl<const MODULUS: u32> NttPlan<MODULUS> {
             for (block, twiddle) in stage.inverse.iter().enumerate() {
                 let start = block * 2 * stage.distance;
                 for index in start..start + stage.distance {
-                    let lhs = values[index].montgomery();
-                    let rhs = values[index + stage.distance].montgomery();
-                    values[index].set_montgomery(add_mod::<MODULUS>(lhs, rhs));
-                    values[index + stage.distance].set_montgomery(
-                        PrimeField::<MODULUS>::montgomery_mul(
-                            sub_mod::<MODULUS>(lhs, rhs),
-                            twiddle.montgomery,
-                        ),
-                    );
+                    // SAFETY: construction partitions every stage into in-bounds blocks.
+                    unsafe {
+                        let lhs = (*values.as_ptr().add(index)).montgomery();
+                        let rhs = (*values.as_ptr().add(index + stage.distance)).montgomery();
+                        (*values.as_mut_ptr().add(index))
+                            .set_montgomery(add_mod::<MODULUS>(lhs, rhs));
+                        (*values.as_mut_ptr().add(index + stage.distance)).set_montgomery(
+                            PrimeField::<MODULUS>::montgomery_mul(
+                                sub_mod::<MODULUS>(lhs, rhs),
+                                twiddle.montgomery,
+                            ),
+                        );
+                    }
                 }
             }
         }
@@ -909,13 +922,8 @@ fn select_backend<const MODULUS: u32>(
                 Err(FieldError::Avx2Unavailable)
             };
         }
-        if std::arch::is_x86_feature_detected!("avx2") {
-            if length >= 16_384 {
-                return Ok((NttBackend::Avx2ShoupLazy, None));
-            }
-            if length >= 16 {
-                return Ok((NttBackend::ScalarShoupLazyWithAvx2, None));
-            }
+        if std::arch::is_x86_feature_detected!("avx2") && length >= 16 {
+            return Ok((NttBackend::Avx2ShoupLazy, None));
         }
     }
     #[cfg(not(target_arch = "x86_64"))]

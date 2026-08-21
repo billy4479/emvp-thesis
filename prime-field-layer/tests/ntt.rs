@@ -5,7 +5,7 @@
 
 use prime_field_layer::{
     FieldError, NegacyclicPlan, NttBackend, NttPerformanceWarning, NttPlan, PrimeField,
-    linear_convolution,
+    StaticNttPlan, linear_convolution,
 };
 use proptest::prelude::*;
 
@@ -102,6 +102,58 @@ fn check_round_trip<const MODULUS: u32>(length: usize) {
             .collect::<Vec<_>>(),
         input
     );
+}
+
+fn check_static_matches_dynamic<const MODULUS: u32, const N: usize>() {
+    let dynamic = NttPlan::<MODULUS>::new(N).unwrap();
+    let static_plan = StaticNttPlan::<MODULUS, N>::new().unwrap();
+    let input: [u32; N] =
+        std::array::from_fn(|index| ((index as u64 * 2_654_435_761 + 97) % MODULUS as u64) as u32);
+    let mut dynamic_values = dynamic.elements(&input);
+    let mut static_values = static_plan.elements(&input);
+    dynamic.forward(&mut dynamic_values).unwrap();
+    static_plan.forward(&mut static_values);
+    assert_eq!(static_values.as_slice(), dynamic_values);
+    dynamic.inverse(&mut dynamic_values).unwrap();
+    static_plan.inverse(&mut static_values);
+    assert_eq!(static_values.as_slice(), dynamic_values);
+    assert_eq!(
+        static_values.map(prime_field_layer::FieldElement::value),
+        input
+    );
+}
+
+#[test]
+fn compile_time_size_plans_match_dynamic_plans() {
+    check_static_matches_dynamic::<17, 1>();
+    check_static_matches_dynamic::<17, 8>();
+    check_static_matches_dynamic::<65_537, 256>();
+    check_static_matches_dynamic::<998_244_353, 1_024>();
+    check_static_matches_dynamic::<2_013_265_921, 256>();
+    check_static_matches_dynamic::<2_281_701_377, 256>();
+}
+
+#[test]
+fn compile_time_size_pointwise_product_matches_dynamic_plan() {
+    const MODULUS: u32 = 998_244_353;
+    const N: usize = 256;
+    let dynamic = NttPlan::<MODULUS>::new(N).unwrap();
+    let static_plan = StaticNttPlan::<MODULUS, N>::new().unwrap();
+    let lhs = std::array::from_fn(|index| index as u32 * 31 + 7);
+    let rhs = std::array::from_fn(|index| index as u32 * 17 + 11);
+    let mut dynamic_lhs = dynamic.elements(&lhs);
+    let mut dynamic_rhs = dynamic.elements(&rhs);
+    let mut static_lhs = static_plan.elements(&lhs);
+    let mut static_rhs = static_plan.elements(&rhs);
+    dynamic.forward(&mut dynamic_lhs).unwrap();
+    dynamic.forward(&mut dynamic_rhs).unwrap();
+    static_plan.forward(&mut static_lhs);
+    static_plan.forward(&mut static_rhs);
+    dynamic
+        .pointwise_mul_assign(&mut dynamic_lhs, &dynamic_rhs)
+        .unwrap();
+    static_plan.pointwise_mul_assign(&mut static_lhs, &static_rhs);
+    assert_eq!(static_lhs.as_slice(), dynamic_lhs);
 }
 
 #[test]
@@ -309,12 +361,14 @@ fn diagnostics_report_the_actual_modulus_tier() {
     let short_auto = NttPlan::<998_244_353>::new(256).unwrap();
     #[cfg(target_arch = "x86_64")]
     {
-        assert_eq!(short_auto.backend(), NttBackend::ScalarShoupLazyWithAvx2);
-        assert_eq!(short_auto.performance_warning(), None);
         if std::arch::is_x86_feature_detected!("avx2") {
+            assert_eq!(short_auto.backend(), NttBackend::Avx2ShoupLazy);
+            assert_eq!(short_auto.performance_warning(), None);
+        } else {
+            assert_eq!(short_auto.backend(), NttBackend::ScalarShoupLazy);
             assert_eq!(
-                NttPlan::<998_244_353>::new(16_384).unwrap().backend(),
-                NttBackend::Avx2ShoupLazy
+                short_auto.performance_warning(),
+                Some(NttPerformanceWarning::Avx2Unavailable)
             );
         }
     }
