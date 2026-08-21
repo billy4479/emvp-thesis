@@ -1,8 +1,8 @@
 use super::{
-    BackendPreference, NttBackend, NttPerformanceWarning, Twiddle, add_mod, normalize,
-    select_backend, shoup_mul, shoup_mul_lazy_for, stage_twiddle_index, sub_mod,
+    BackendPreference, NttBackend, NttPerformanceWarning, Twiddle, add_mod, halve_interval,
+    normalize, select_backend, shoup_mul, shoup_mul_lazy_for, stage_twiddle_index, sub_mod,
 };
-use crate::{FieldElement, FieldError, PrimeField, constant_time::reduce_once_u64};
+use crate::{FieldElement, FieldError, PrimeField};
 
 /// An NTT plan whose modulus and transform length are compile-time parameters.
 ///
@@ -223,13 +223,12 @@ impl<const MODULUS: u32, const N: usize> StaticNttPlan<MODULUS, N> {
                 for index in start..start + distance {
                     // SAFETY: both halves are within this statically sized block.
                     unsafe {
-                        let lhs = (*values.as_ptr().add(index)).montgomery();
+                        let lhs = halve_interval((*values.as_ptr().add(index)).montgomery(), two_p);
                         let rhs = (*values.as_ptr().add(index + distance)).montgomery();
                         let product = shoup_mul_lazy_for::<MODULUS>(rhs, twiddle);
-                        (*values.as_mut_ptr().add(index))
-                            .set_montgomery(reduce_once(lhs + product, two_p));
+                        (*values.as_mut_ptr().add(index)).set_montgomery(lhs + product);
                         (*values.as_mut_ptr().add(index + distance))
-                            .set_montgomery(reduce_once(lhs + two_p - product, two_p));
+                            .set_montgomery(lhs + two_p - product);
                     }
                 }
             }
@@ -252,8 +251,8 @@ impl<const MODULUS: u32, const N: usize> StaticNttPlan<MODULUS, N> {
                 for (lhs_value, rhs_value) in lhs_values.iter_mut().zip(rhs_values) {
                     let lhs = lhs_value.montgomery();
                     let rhs = rhs_value.montgomery();
-                    lhs_value.set_montgomery(reduce_once(lhs + rhs, two_p));
-                    let difference = reduce_once(lhs + two_p - rhs, two_p);
+                    let difference = lhs + two_p - rhs;
+                    lhs_value.set_montgomery(halve_interval(lhs + rhs, two_p));
                     rhs_value.set_montgomery(shoup_mul_lazy_for::<MODULUS>(difference, twiddle));
                 }
             }
@@ -354,11 +353,6 @@ impl<const MODULUS: u32, const N: usize> StaticNttPlan<MODULUS, N> {
             distance *= 2;
         }
     }
-}
-
-#[inline(always)]
-fn reduce_once(value: u32, modulus: u32) -> u32 {
-    reduce_once_u64(value as u64, modulus as u64) as u32
 }
 
 const fn pow_mod(base: u32, mut exponent: u64, modulus: u32) -> u32 {

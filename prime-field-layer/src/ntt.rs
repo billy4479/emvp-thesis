@@ -94,11 +94,13 @@ pub use static_plan::StaticNttPlan;
 /// all variants implement the same field transform.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum NttBackend {
-    /// Scalar Shoup butterflies with lazy residues in `[0, 2p)` within stages.
+    /// Scalar lazy Harvey Shoup butterflies with one correction per butterfly.
     ///
-    /// Used for `p < 2^30` when scalar transforms are requested or AVX2 is not
-    /// selected. Public transform outputs are normalized to Montgomery residues
-    /// in `[0, p)`.
+    /// Forward stages keep residues in `[0, 4p)` and inverse stages in
+    /// `[0, 2p)`, so each butterfly needs a single conditional halving and the
+    /// lazy products absorb unreduced inputs. Used for `p < 2^30` when scalar
+    /// transforms are requested or AVX2 is not selected. Public transform
+    /// outputs are normalized to Montgomery residues in `[0, p)`.
     ScalarShoupLazy,
     /// Scalar Shoup butterflies reduced to `[0, p)` after each butterfly.
     ///
@@ -109,7 +111,9 @@ pub enum NttBackend {
     /// This general fallback supports wide `u32` primes but does not use the
     /// Shoup or AVX2 transform kernels.
     ScalarMontgomery,
-    /// LLVM-vectorized AVX2 Shoup butterflies with lazy residues in `[0, 2p)`.
+    /// LLVM-vectorized AVX2 lazy Harvey Shoup butterflies, one correction per
+    /// butterfly, with the same `[0, 4p)` forward and `[0, 2p)` inverse lazy
+    /// intervals as [`NttBackend::ScalarShoupLazy`].
     ///
     /// Available only on x86-64 after runtime AVX2 detection, for
     /// `p < 2^30`. Public transform outputs are normalized to `[0, p)`.
@@ -558,8 +562,18 @@ impl<const MODULUS: u32> NttPlan<MODULUS> {
         }
     }
 
-    // For p < 2^30, x < 2p and Shoup's quotient error is at most one,
-    // hence x*w-q*p < 2p. Butterfly sums stay below 4p < 2^32.
+    // For p < 2^30, forward stages keep lazy residues in [0, 4p) under
+    // Harvey's Cooley-Tukey butterfly (J. Symbolic Comput. 60 (2014),
+    // section 4, Algorithm 4). For inputs X, Y in [0, 4p) and twiddle w:
+    //   X  <- X - 2p when X >= 2p   (the single correction; X now in [0, 2p))
+    //   t  = lazy Shoup product of Y (in [0, 2p) by the wide-input bound on
+    //                                  `shoup_mul_lazy_for`, valid since
+    //                                  Y < 4p <= 2^32)
+    //   X' = X + t                    in [0, 4p)
+    //   Y' = X + 2p - t               in (0, 4p)
+    // The outputs are again in [0, 4p), so the interval is stable across all
+    // stages. The scheme needs 4p <= 2^32, i.e. p <= 2^30, which is exactly
+    // the tier gate selecting this backend; `normalize` restores [0, p).
     fn forward_shoup_lazy(&self, values: &mut [FieldElement<MODULUS>]) {
         let two_p = MODULUS * 2;
         for stage in &self.stages {
@@ -568,16 +582,29 @@ impl<const MODULUS: u32> NttPlan<MODULUS> {
                 let (lhs_values, rhs_values) =
                     values[start..start + 2 * stage.distance].split_at_mut(stage.distance);
                 for (lhs_value, rhs_value) in lhs_values.iter_mut().zip(rhs_values) {
-                    let lhs = lhs_value.montgomery();
+                    let lhs = halve_interval(lhs_value.montgomery(), two_p);
                     let product = shoup_mul_lazy_for::<MODULUS>(rhs_value.montgomery(), twiddle);
-                    lhs_value.set_montgomery(reduce_once(lhs + product, two_p));
-                    rhs_value.set_montgomery(reduce_once(lhs + two_p - product, two_p));
+                    lhs_value.set_montgomery(lhs + product);
+                    rhs_value.set_montgomery(lhs + two_p - product);
                 }
             }
         }
         normalize(values);
     }
 
+    // Inverse stages keep lazy residues in [0, 2p) under Harvey's
+    // Gentleman-Sande butterfly (J. Symbolic Comput. 60 (2014), section 3,
+    // Algorithm 3). For inputs X, Y in [0, 2p) and twiddle w:
+    //   S  = X + Y                     in [0, 4p)
+    //   S' <- S - 2p when S >= 2p      (the single correction; S' in [0, 2p))
+    //   D  = X + 2p - Y                in (0, 4p), no comparison: the planted
+    //                                   +2p keeps the signed difference in the
+    //                                   unsigned interval
+    //   Y' = lazy Shoup product of D   in [0, 2p) by the wide-input bound on
+    //                                   `shoup_mul_lazy_for`, valid since
+    //                                   D < 4p <= 2^32
+    // The outputs are again in [0, 2p), so the interval is stable across all
+    // stages, and `normalize` restores [0, p).
     fn inverse_shoup_lazy(&self, values: &mut [FieldElement<MODULUS>]) {
         let two_p = MODULUS * 2;
         for stage in self.stages.iter().rev() {
@@ -588,8 +615,8 @@ impl<const MODULUS: u32> NttPlan<MODULUS> {
                 for (lhs_value, rhs_value) in lhs_values.iter_mut().zip(rhs_values) {
                     let lhs = lhs_value.montgomery();
                     let rhs = rhs_value.montgomery();
-                    lhs_value.set_montgomery(reduce_once(lhs + rhs, two_p));
-                    let difference = reduce_once(lhs + two_p - rhs, two_p);
+                    let difference = lhs + two_p - rhs;
+                    lhs_value.set_montgomery(halve_interval(lhs + rhs, two_p));
                     rhs_value.set_montgomery(shoup_mul_lazy_for::<MODULUS>(difference, twiddle));
                 }
             }
@@ -1016,10 +1043,41 @@ fn shoup_mul<const MODULUS: u32>(value: u32, twiddle: Twiddle) -> u32 {
     reduce_once(shoup_mul_lazy_for::<MODULUS>(value, twiddle), MODULUS)
 }
 
+/// Lazy Shoup product of any `u32` word with a twiddle constant.
+///
+/// This is the wide-input form of Shoup's multiplication (Harvey, J. Symbolic
+/// Comput. 60 (2014), section 3; also Bradbury et al., ePrint 2021/1396,
+/// Theorem 2, for the 32-bit SIMD lanes used here). For a twiddle `w` in
+/// `[0, p)` with precomputed `w' = floor(w * 2^32 / p)`, the quotient
+/// `q = (z * w') >> 32` and product `t = z * w - q * p` satisfy
+/// `0 <= t < 2p` for every input `z` in `[0, 2^32)`, not only reduced inputs:
+/// from `w' <= w * 2^32 / p < w' + 1` follows `q <= z * w / p`, hence `t >= 0`,
+/// and `q > z * w / p - z / 2^32 - 1`, hence
+/// `t < (z / 2^32 + 1) * p < 2p`. Intermediates stay below `2^62`, and
+/// `t < 2p < 2^31` fits a `u32` lane.
+///
+/// This bound is what lets the lazy butterflies feed unreduced lazy words
+/// straight into the multiplication: a difference planted with a `+2p` offset
+/// stays below `4p <= 2^32` for `p < 2^30`, and the quotient estimate in the
+/// high half of the product absorbs the planted offset without any
+/// conditional correction of the product.
 #[inline(always)]
 fn shoup_mul_lazy_for<const MODULUS: u32>(value: u32, twiddle: Twiddle) -> u32 {
     let quotient = (u64::from(value) * u64::from(twiddle.shoup)) >> 32;
     (u64::from(value) * u64::from(twiddle.canonical) - quotient * u64::from(MODULUS)) as u32
+}
+
+/// Halves the lazy interval `[0, 4p)` to `[0, 2p)` with one branchless minimum.
+///
+/// For `value` in `[0, 4p)` the wrapping difference `value - two_p` lies below
+/// `value` exactly when no borrow occurs, i.e. when `value >= two_p`; when
+/// `value < two_p` it wraps far above `value`. The `u32::min` selection
+/// therefore returns `value - two_p` on `[2p, 4p)` and `value` unchanged on
+/// `[0, 2p)`, with no coefficient-dependent branch. Vector code lowers it to a
+/// single `vpminud` beside the subtraction.
+#[inline(always)]
+fn halve_interval(value: u32, two_p: u32) -> u32 {
+    value.min(value.wrapping_sub(two_p))
 }
 
 #[inline(always)]
@@ -1040,9 +1098,16 @@ fn sub_mod<const MODULUS: u32>(lhs: u32, rhs: u32) -> u32 {
     ) as u32
 }
 
+/// Restores canonical `[0, p)` Montgomery words from lazy stage residues.
+///
+/// Forward lazy stages emit values in `[0, 4p)` and inverse lazy stages values
+/// in `[0, 2p)`; halving by `2p` (a no-op for the inverse interval) followed
+/// by one `p` correction covers both.
 fn normalize<const MODULUS: u32>(values: &mut [FieldElement<MODULUS>]) {
+    let two_p = MODULUS * 2;
     for value in values {
-        value.set_montgomery(reduce_once(value.montgomery(), MODULUS));
+        let halved = halve_interval(value.montgomery(), two_p);
+        value.set_montgomery(reduce_once(halved, MODULUS));
     }
 }
 
@@ -1081,7 +1146,20 @@ mod tests {
         }
         let scalar = NttPlan::<MODULUS>::new_scalar(256).unwrap();
         let avx2 = NttPlan::<MODULUS>::new_avx2(256).unwrap();
-        let boundaries = [0, 1, MODULUS - 1, MODULUS, 2 * MODULUS - 2, 2 * MODULUS - 1];
+        // Every endpoint of the [0, 4p) forward lazy interval, plus the
+        // interior boundaries at p and 3p.
+        let boundaries = [
+            0,
+            1,
+            MODULUS - 1,
+            MODULUS,
+            2 * MODULUS - 2,
+            2 * MODULUS - 1,
+            2 * MODULUS,
+            3 * MODULUS - 1,
+            4 * MODULUS - 2,
+            4 * MODULUS - 1,
+        ];
         let mut state = 0xd1b5_4a32_d192_ed03u64;
         let mut scalar_values = vec![scalar.field.element(0); 256];
         for (index, value) in scalar_values.iter_mut().enumerate() {
@@ -1090,7 +1168,7 @@ mod tests {
             let raw = if index < boundaries.len() {
                 boundaries[index]
             } else {
-                (state % u64::from(2 * MODULUS)) as u32
+                (state % u64::from(4 * MODULUS)) as u32
             };
             value.set_montgomery(raw);
         }
@@ -1099,6 +1177,39 @@ mod tests {
         avx2.forward(&mut avx2_values).unwrap();
         assert_eq!(avx2_values, scalar_values);
         assert!(avx2_values.iter().all(|value| value.montgomery() < MODULUS));
+        scalar.inverse(&mut scalar_values).unwrap();
+        avx2.inverse(&mut avx2_values).unwrap();
+        assert_eq!(avx2_values, scalar_values);
+        assert!(avx2_values.iter().all(|value| value.montgomery() < MODULUS));
+    }
+
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn avx2_lazy_inverse_boundaries_match_scalar_and_normalize_output() {
+        const MODULUS: u32 = 998_244_353;
+
+        if !std::arch::is_x86_feature_detected!("avx2") {
+            return;
+        }
+        let scalar = NttPlan::<MODULUS>::new_scalar(256).unwrap();
+        let avx2 = NttPlan::<MODULUS>::new_avx2(256).unwrap();
+        // Endpoints of the [0, 2p) inverse lazy interval, seeded directly
+        // into the inverse transform without a prior forward pass.
+        let boundaries = [0, 1, MODULUS - 1, MODULUS, 2 * MODULUS - 2, 2 * MODULUS - 1];
+        let mut state = 0x9e37_79b9_7f4a_7c15u64;
+        let mut scalar_values = vec![scalar.field.element(0); 256];
+        for (index, value) in scalar_values.iter_mut().enumerate() {
+            state ^= state << 7;
+            state ^= state >> 9;
+            state ^= state << 8;
+            let raw = if index < boundaries.len() {
+                boundaries[index]
+            } else {
+                (state % u64::from(2 * MODULUS)) as u32
+            };
+            value.set_montgomery(raw);
+        }
+        let mut avx2_values = scalar_values.clone();
         scalar.inverse(&mut scalar_values).unwrap();
         avx2.inverse(&mut avx2_values).unwrap();
         assert_eq!(avx2_values, scalar_values);

@@ -1,4 +1,4 @@
-use super::{Stage, Twiddle, stage_twiddle_index};
+use super::{Stage, Twiddle, halve_interval, stage_twiddle_index};
 use crate::FieldElement;
 
 #[target_feature(enable = "avx2")]
@@ -13,13 +13,12 @@ pub(super) unsafe fn forward<const MODULUS: u32>(
             for index in start..start + stage.distance {
                 // SAFETY: construction partitions every stage into in-bounds blocks.
                 unsafe {
-                    let lhs = (*values.as_ptr().add(index)).montgomery();
+                    let lhs = halve_interval((*values.as_ptr().add(index)).montgomery(), two_p);
                     let rhs = (*values.as_ptr().add(index + stage.distance)).montgomery();
                     let product = shoup_mul_lazy::<MODULUS>(rhs, twiddle);
-                    (*values.as_mut_ptr().add(index))
-                        .set_montgomery(reduce_once(lhs + product, two_p));
+                    (*values.as_mut_ptr().add(index)).set_montgomery(lhs + product);
                     (*values.as_mut_ptr().add(index + stage.distance))
-                        .set_montgomery(reduce_once(lhs + two_p - product, two_p));
+                        .set_montgomery(lhs + two_p - product);
                 }
             }
         }
@@ -41,8 +40,8 @@ pub(super) unsafe fn inverse<const MODULUS: u32>(
             for (lhs_value, rhs_value) in lhs_values.iter_mut().zip(rhs_values) {
                 let lhs = lhs_value.montgomery();
                 let rhs = rhs_value.montgomery();
-                lhs_value.set_montgomery(reduce_once(lhs + rhs, two_p));
-                let difference = reduce_once(lhs + two_p - rhs, two_p);
+                let difference = lhs + two_p - rhs;
+                lhs_value.set_montgomery(halve_interval(lhs + rhs, two_p));
                 rhs_value.set_montgomery(shoup_mul_lazy::<MODULUS>(difference, twiddle));
             }
         }
@@ -66,13 +65,12 @@ pub(super) unsafe fn forward_static<const MODULUS: u32, const N: usize>(
             for index in start..start + distance {
                 // SAFETY: both halves are inside the current static butterfly block.
                 unsafe {
-                    let lhs = (*values.as_ptr().add(index)).montgomery();
+                    let lhs = halve_interval((*values.as_ptr().add(index)).montgomery(), two_p);
                     let rhs = (*values.as_ptr().add(index + distance)).montgomery();
                     let product = shoup_mul_lazy::<MODULUS>(rhs, twiddle);
-                    (*values.as_mut_ptr().add(index))
-                        .set_montgomery(reduce_once(lhs + product, two_p));
+                    (*values.as_mut_ptr().add(index)).set_montgomery(lhs + product);
                     (*values.as_mut_ptr().add(index + distance))
-                        .set_montgomery(reduce_once(lhs + two_p - product, two_p));
+                        .set_montgomery(lhs + two_p - product);
                 }
             }
         }
@@ -99,8 +97,9 @@ pub(super) unsafe fn inverse_static<const MODULUS: u32, const N: usize>(
                 unsafe {
                     let lhs = (*values.as_ptr().add(index)).montgomery();
                     let rhs = (*values.as_ptr().add(index + distance)).montgomery();
-                    (*values.as_mut_ptr().add(index)).set_montgomery(reduce_once(lhs + rhs, two_p));
-                    let difference = reduce_once(lhs + two_p - rhs, two_p);
+                    let difference = lhs + two_p - rhs;
+                    (*values.as_mut_ptr().add(index))
+                        .set_montgomery(halve_interval(lhs + rhs, two_p));
                     (*values.as_mut_ptr().add(index + distance)).set_montgomery(shoup_mul_lazy::<
                         MODULUS,
                     >(
@@ -128,14 +127,18 @@ const fn reduce_once(value: u32, modulus: u32) -> u32 {
 
 #[inline(always)]
 fn normalize<const MODULUS: u32>(values: &mut [FieldElement<MODULUS>]) {
+    let two_p = MODULUS * 2;
     for value in values {
-        value.set_montgomery(reduce_once(value.montgomery(), MODULUS));
+        let halved = halve_interval(value.montgomery(), two_p);
+        value.set_montgomery(reduce_once(halved, MODULUS));
     }
 }
 
 #[inline(always)]
 fn normalize_static<const MODULUS: u32, const N: usize>(values: &mut [FieldElement<MODULUS>; N]) {
+    let two_p = MODULUS * 2;
     for value in values {
-        value.set_montgomery(reduce_once(value.montgomery(), MODULUS));
+        let halved = halve_interval(value.montgomery(), two_p);
+        value.set_montgomery(reduce_once(halved, MODULUS));
     }
 }
