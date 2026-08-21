@@ -5,19 +5,12 @@
 
 use std::hint::black_box;
 
+use bench_common as common;
 use criterion::{
     BatchSize, BenchmarkGroup, BenchmarkId, Criterion, Throughput, criterion_group, criterion_main,
     measurement::WallTime,
 };
 use prime_field_layer::PrimeField;
-
-const BULK_LENGTHS: [usize; 3] = [256, 4_096, 65_536];
-
-fn values(length: usize, modulus: u32, offset: u64) -> Vec<u32> {
-    (0..length)
-        .map(|index| ((index as u64 * 2_654_435_761 + offset) % u64::from(modulus)) as u32)
-        .collect()
-}
 
 fn bench_construction<const MODULUS: u32>(group: &mut BenchmarkGroup<'_, WallTime>) {
     group.bench_function(BenchmarkId::from_parameter(MODULUS), |b| {
@@ -69,10 +62,15 @@ fn scalar(c: &mut Criterion) {
 
 fn bench_bulk<const MODULUS: u32>(group: &mut BenchmarkGroup<'_, WallTime>) {
     let field = PrimeField::<MODULUS>::new();
-    for length in BULK_LENGTHS {
+    let lengths: &[usize] = if common::is_quick() {
+        &[256, 4_096]
+    } else {
+        &[256, 4_096, 65_536]
+    };
+    for &length in lengths {
         group.throughput(Throughput::Elements(length as u64));
-        let lhs = values(length, MODULUS, 12_345);
-        let rhs = values(length, MODULUS, 97);
+        let lhs = common::values(length, MODULUS, 12_345);
+        let rhs = common::values(length, MODULUS, 97);
         let lhs_elements: Vec<_> = lhs
             .iter()
             .map(|&value| field.element(u64::from(value)))
@@ -150,9 +148,14 @@ fn bulk(c: &mut Criterion) {
 fn batch_inversion(c: &mut Criterion) {
     let mut group = c.benchmark_group("batch_inversion");
     let field = PrimeField::<998_244_353>::new();
-    for length in [16, 256, 4_096] {
+    let lengths: &[usize] = if common::is_quick() {
+        &[4_096]
+    } else {
+        &[16, 256, 4_096]
+    };
+    for &length in lengths {
         group.throughput(Throughput::Elements(length as u64));
-        let input = values(length, field.modulus(), 1);
+        let input = common::values(length, field.modulus(), 1);
         group.bench_with_input(BenchmarkId::new("batch", length), &length, |b, _| {
             b.iter_batched_ref(
                 || input.clone(),
@@ -164,5 +167,9 @@ fn batch_inversion(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, construction, scalar, bulk, batch_inversion);
+criterion_group! {
+    name = benches;
+    config = common::criterion_default();
+    targets = construction, scalar, bulk, batch_inversion
+}
 criterion_main!(benches);

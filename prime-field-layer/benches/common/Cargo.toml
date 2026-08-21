@@ -1,0 +1,11 @@
+[package]
+name = "bench-common"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[features]
+quick = []
+
+[dependencies]
+criterion = "0.5"

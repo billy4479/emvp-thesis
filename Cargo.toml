@@ -1,5 +1,6 @@
 [workspace]
 members = ["prime-field-layer"]
+exclude = ["prime-field-layer/benches/common"]
 resolver = "3"
 
 [profile.release]

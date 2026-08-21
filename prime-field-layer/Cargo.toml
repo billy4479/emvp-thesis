@@ -3,6 +3,9 @@ name = "prime-field-layer"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+bench-quick = ["bench-common/quick"]
+
 [lints.rust]
 # The optimized backends use documented inline assembly and AVX2-vectorized kernels.
 unsafe_code = "allow"
@@ -66,6 +69,7 @@ allow_attributes_without_reason = "warn"
 [dependencies]
 
 [dev-dependencies]
+bench-common = { path = "benches/common" }
 criterion = "0.5"
 proptest = "1"
 
@@ -74,9 +78,21 @@ name = "field"
 harness = false
 
 [[bench]]
-name = "ntt"
+name = "dynamic_ntt"
+harness = false
+
+[[bench]]
+name = "backends"
+harness = false
+
+[[bench]]
+name = "crossover"
 harness = false
 
 [[bench]]
 name = "static_ntt"
+harness = false
+
+[[bench]]
+name = "compare_static_dynamic_ntt"
 harness = false
