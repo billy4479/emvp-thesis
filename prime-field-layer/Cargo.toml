@@ -96,3 +96,7 @@ harness = false
 [[bench]]
 name = "compare_static_dynamic_ntt"
 harness = false
+
+[[bench]]
+name = "extension_field"
+harness = false

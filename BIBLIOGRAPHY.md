@@ -14,3 +14,13 @@
   *Mathematics of Computation* 44.170 (1985), 519-521.
   [doi:10.2307/2007970](https://doi.org/10.2307/2007970).
   Used for field-element pointwise multiplication and inverse normalization.
+- Michael O. Rabin, "Probabilistic Algorithms in Finite Fields," *SIAM Journal
+  on Computing* 9.2 (1980), 273-280.
+  [doi:10.1137/0209024](https://doi.org/10.1137/0209024).
+  Used for the deterministic Frobenius and polynomial-GCD irreducibility
+  criterion in `prime-field-layer::extension_field`.
+- Andrew V. Sutherland, "Finite field arithmetic," MIT 18.783 lecture notes 4
+  (2019), sections 4.1-4.2.
+  [Lecture notes](https://math.mit.edu/classes/18.783/2019/LectureNotes4.pdf).
+  Used for polynomial reversal, truncated inverse, and fast Euclidean division
+  in fixed monic reduction.
