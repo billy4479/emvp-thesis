@@ -165,6 +165,7 @@ fn montgomery_simd_handles_boundary_values_and_tails() {
     check_montgomery_boundaries::<17>();
     check_montgomery_boundaries::<65_537>();
     check_montgomery_boundaries::<998_244_353>();
+    check_montgomery_boundaries::<2_013_265_921>();
     check_montgomery_boundaries::<4_294_967_291>();
 }
 

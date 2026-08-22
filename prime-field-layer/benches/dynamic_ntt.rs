@@ -95,9 +95,7 @@ fn transforms(c: &mut Criterion) {
     for length in [1_024, 4_096, 16_384, 65_536] {
         transforms_for_modulus::<998_244_353>(c, length);
     }
-    if !common::is_quick() {
-        transforms_for_modulus::<2_013_265_921>(c, 4_096);
-    }
+    transforms_for_modulus::<2_013_265_921>(c, 4_096);
     transforms_for_modulus::<2_281_701_377>(c, 4_096);
 }
 

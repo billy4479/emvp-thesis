@@ -167,6 +167,7 @@ fn round_trips_all_modulus_tiers_and_lengths() {
     }
     check_round_trip::<65_537>(256);
     check_round_trip::<998_244_353>(1_024);
+    check_round_trip::<2_013_265_921>(4_096);
     check_round_trip::<2_281_701_377>(256);
 }
 
@@ -254,6 +255,7 @@ fn convolution_variants_match_independent_oracles() {
     check_convolutions::<17>();
     check_convolutions::<65_537>();
     check_convolutions::<998_244_353>();
+    check_convolutions::<2_013_265_921>();
     check_convolutions::<2_281_701_377>();
 }
 
@@ -442,11 +444,25 @@ fn diagnostics_report_the_actual_modulus_tier() {
     );
 
     let tight = NttPlan::<2_013_265_921>::new(256).unwrap();
-    assert_eq!(tight.backend(), NttBackend::ScalarShoup);
-    assert_eq!(
-        tight.performance_warning(),
-        Some(NttPerformanceWarning::ModulusTooLargeForAvx2)
-    );
+    #[cfg(target_arch = "x86_64")]
+    if std::arch::is_x86_feature_detected!("avx2") {
+        assert_eq!(tight.backend(), NttBackend::Avx2Shoup);
+        assert_eq!(tight.performance_warning(), None);
+    } else {
+        assert_eq!(tight.backend(), NttBackend::ScalarShoup);
+        assert_eq!(
+            tight.performance_warning(),
+            Some(NttPerformanceWarning::Avx2Unavailable)
+        );
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        assert_eq!(tight.backend(), NttBackend::ScalarShoup);
+        assert_eq!(
+            tight.performance_warning(),
+            Some(NttPerformanceWarning::Avx2Unavailable)
+        );
+    }
 
     let wide = NttPlan::<2_281_701_377>::new(256).unwrap();
     assert_eq!(wide.backend(), NttBackend::ScalarMontgomery);
@@ -454,11 +470,27 @@ fn diagnostics_report_the_actual_modulus_tier() {
         wide.performance_warning(),
         Some(NttPerformanceWarning::MontgomeryFallback)
     );
+    assert!(matches!(
+        NttPlan::<2_281_701_377>::new_avx2(256),
+        Err(FieldError::Avx2Unavailable)
+    ));
 
     let below_boundary = NttPlan::<1_053_818_881>::new_scalar(16).unwrap();
     assert_eq!(below_boundary.backend(), NttBackend::ScalarShoupLazy);
-    let above_boundary = NttPlan::<1_107_296_257>::new(16).unwrap();
+    let above_boundary = NttPlan::<1_107_296_257>::new_scalar(16).unwrap();
     assert_eq!(above_boundary.backend(), NttBackend::ScalarShoup);
+
+    #[cfg(target_arch = "x86_64")]
+    if std::arch::is_x86_feature_detected!("avx2") {
+        assert_eq!(
+            NttPlan::<1_053_818_881>::new_avx2(16).unwrap().backend(),
+            NttBackend::Avx2ShoupLazy
+        );
+        assert_eq!(
+            NttPlan::<1_107_296_257>::new_avx2(16).unwrap().backend(),
+            NttBackend::Avx2Shoup
+        );
+    }
 
     let short_auto = NttPlan::<998_244_353>::new(256).unwrap();
     #[cfg(target_arch = "x86_64")]

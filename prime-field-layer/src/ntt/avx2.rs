@@ -50,6 +50,53 @@ pub(super) unsafe fn inverse<const MODULUS: u32>(
 }
 
 #[target_feature(enable = "avx2")]
+pub(super) unsafe fn forward_reduced<const MODULUS: u32>(
+    values: &mut [FieldElement<MODULUS>],
+    stages: &[Stage],
+) {
+    for stage in stages {
+        for (block, &twiddle) in stage.forward.iter().enumerate() {
+            let start = block * 2 * stage.distance;
+            for index in start..start + stage.distance {
+                // SAFETY: construction partitions every stage into in-bounds blocks.
+                unsafe {
+                    let lhs = (*values.as_ptr().add(index)).montgomery();
+                    let rhs = (*values.as_ptr().add(index + stage.distance)).montgomery();
+                    let product = shoup_mul_reduced::<MODULUS>(rhs, twiddle);
+                    (*values.as_mut_ptr().add(index))
+                        .set_montgomery(reduce_once(lhs + product, MODULUS));
+                    (*values.as_mut_ptr().add(index + stage.distance))
+                        .set_montgomery(reduce_once(lhs + MODULUS - product, MODULUS));
+                }
+            }
+        }
+    }
+}
+
+#[target_feature(enable = "avx2")]
+pub(super) unsafe fn inverse_reduced<const MODULUS: u32>(
+    values: &mut [FieldElement<MODULUS>],
+    stages: &[Stage],
+) {
+    for stage in stages.iter().rev() {
+        for (block, &twiddle) in stage.inverse.iter().enumerate() {
+            let start = block * 2 * stage.distance;
+            let (lhs_values, rhs_values) =
+                values[start..start + 2 * stage.distance].split_at_mut(stage.distance);
+            for (lhs_value, rhs_value) in lhs_values.iter_mut().zip(rhs_values) {
+                let lhs = lhs_value.montgomery();
+                let rhs = rhs_value.montgomery();
+                lhs_value.set_montgomery(reduce_once(lhs + rhs, MODULUS));
+                rhs_value.set_montgomery(shoup_mul_reduced::<MODULUS>(
+                    reduce_once(lhs + MODULUS - rhs, MODULUS),
+                    twiddle,
+                ));
+            }
+        }
+    }
+}
+
+#[target_feature(enable = "avx2")]
 pub(super) unsafe fn forward_static<const MODULUS: u32, const N: usize>(
     values: &mut [FieldElement<MODULUS>; N],
     twiddles: &[Twiddle; N],
@@ -113,10 +160,80 @@ pub(super) unsafe fn inverse_static<const MODULUS: u32, const N: usize>(
     normalize_static::<MODULUS, N>(values);
 }
 
+#[target_feature(enable = "avx2")]
+pub(super) unsafe fn forward_reduced_static<const MODULUS: u32, const N: usize>(
+    values: &mut [FieldElement<MODULUS>; N],
+    twiddles: &[Twiddle; N],
+) {
+    let mut distance = N / 2;
+    while distance != 0 {
+        let blocks = N / (2 * distance);
+        for block in 0..blocks {
+            // SAFETY: the compile-time stage layout has exactly `blocks` entries.
+            let twiddle = unsafe { *twiddles.get_unchecked(stage_twiddle_index(blocks, block)) };
+            let start = block * 2 * distance;
+            for index in start..start + distance {
+                // SAFETY: both halves are inside the current static butterfly block.
+                unsafe {
+                    let lhs = (*values.as_ptr().add(index)).montgomery();
+                    let rhs = (*values.as_ptr().add(index + distance)).montgomery();
+                    let product = shoup_mul_reduced::<MODULUS>(rhs, twiddle);
+                    (*values.as_mut_ptr().add(index))
+                        .set_montgomery(reduce_once(lhs + product, MODULUS));
+                    (*values.as_mut_ptr().add(index + distance))
+                        .set_montgomery(reduce_once(lhs + MODULUS - product, MODULUS));
+                }
+            }
+        }
+        distance /= 2;
+    }
+}
+
+#[target_feature(enable = "avx2")]
+pub(super) unsafe fn inverse_reduced_static<const MODULUS: u32, const N: usize>(
+    values: &mut [FieldElement<MODULUS>; N],
+    twiddles: &[Twiddle; N],
+) {
+    let mut distance = 1;
+    while distance < N {
+        let blocks = N / (2 * distance);
+        for block in 0..blocks {
+            // SAFETY: the compile-time stage layout has exactly `blocks` entries.
+            let twiddle = unsafe { *twiddles.get_unchecked(stage_twiddle_index(blocks, block)) };
+            let start = block * 2 * distance;
+            for index in start..start + distance {
+                // SAFETY: both halves are inside the current static butterfly block.
+                unsafe {
+                    let lhs = (*values.as_ptr().add(index)).montgomery();
+                    let rhs = (*values.as_ptr().add(index + distance)).montgomery();
+                    (*values.as_mut_ptr().add(index))
+                        .set_montgomery(reduce_once(lhs + rhs, MODULUS));
+                    (*values.as_mut_ptr().add(index + distance)).set_montgomery(
+                        shoup_mul_reduced::<MODULUS>(
+                            reduce_once(lhs + MODULUS - rhs, MODULUS),
+                            twiddle,
+                        ),
+                    );
+                }
+            }
+        }
+        distance *= 2;
+    }
+}
+
 #[inline(always)]
 fn shoup_mul_lazy<const MODULUS: u32>(value: u32, twiddle: Twiddle) -> u32 {
     let quotient = (u64::from(value) * u64::from(twiddle.shoup)) >> 32;
     (u64::from(value) * u64::from(twiddle.canonical) - quotient * u64::from(MODULUS)) as u32
+}
+
+/// Shoup product for canonical inputs when `MODULUS < 2^31`.
+///
+/// The uncorrected product is in `[0, 2p)`, so it and the butterfly sums fit a
+/// `u32` lane. One correction restores `[0, p)` after every multiplication.
+#[inline(always)]
+fn shoup_mul_reduced<const MODULUS: u32>(value: u32, twiddle: Twiddle) -> u32 {
+    reduce_once(shoup_mul_lazy::<MODULUS>(value, twiddle), MODULUS)
 }
 
 #[inline(always)]

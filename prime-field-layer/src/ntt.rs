@@ -105,7 +105,9 @@ pub use static_plan::StaticNttPlan;
 ///
 /// Selection occurs once during construction. Inspect this value for
 /// diagnostics or benchmarking, not to infer transform ordering or results:
-/// all variants implement the same field transform.
+/// all variants implement the same field transform. This describes butterfly
+/// dispatch only; pointwise products and inverse normalization dispatch through
+/// [`PrimeField`] independently.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum NttBackend {
     /// Scalar lazy Harvey Shoup butterflies with one correction per butterfly.
@@ -132,9 +134,15 @@ pub enum NttBackend {
     /// Available only on x86-64 after runtime AVX2 detection, for
     /// `p < 2^30`. Public transform outputs are normalized to `[0, p)`.
     Avx2ShoupLazy,
+    /// LLVM-vectorized AVX2 Shoup butterflies reduced to `[0, p)` after each
+    /// butterfly.
+    ///
+    /// Available only on x86-64 after runtime AVX2 detection, for
+    /// `2^30 <= p < 2^31`.
+    Avx2Shoup,
 }
 
-/// A typed explanation for scalar-only fallback or explicit scalar selection.
+/// A typed explanation for scalar-transform fallback or explicit selection.
 ///
 /// [`NttPlan::performance_warning`] reports at most one construction-time
 /// reason. `None` means the selected automatic or forced backend has no warning;
@@ -148,8 +156,6 @@ pub enum NttPerformanceWarning {
     TransformTooShortForAvx2,
     /// [`NttPlan::new_scalar`] explicitly requested a portable scalar backend.
     ScalarRequested,
-    /// The modulus is at least `2^30`, too large for the lazy Shoup AVX2 bounds.
-    ModulusTooLargeForAvx2,
     /// The modulus is at least `2^31`, requiring scalar Montgomery butterflies.
     MontgomeryFallback,
 }
@@ -162,9 +168,6 @@ impl fmt::Display for NttPerformanceWarning {
                 formatter.write_str("the transform is too short for AVX2 dispatch")
             }
             Self::ScalarRequested => formatter.write_str("the scalar backend was requested"),
-            Self::ModulusTooLargeForAvx2 => {
-                formatter.write_str("the modulus is too large for lazy AVX2 butterflies")
-            }
             Self::MontgomeryFallback => {
                 formatter.write_str("the modulus requires scalar Montgomery butterflies")
             }
@@ -237,9 +240,10 @@ impl<const MODULUS: u32> NttPlan<MODULUS> {
     /// retained and temporary storage for roots and stage twiddles. Prefer this
     /// constructor for normal use, then reuse the plan across operations.
     ///
-    /// On x86-64 with runtime AVX2 support and `MODULUS < 2^30`,
-    /// automatic dispatch uses compiler-vectorized AVX2 transforms from length
-    /// 16. Other targets and modulus tiers select the applicable scalar backend.
+    /// On x86-64 with runtime AVX2 support and `MODULUS < 2^31`, automatic
+    /// dispatch uses compiler-vectorized AVX2 transforms from length 16. The
+    /// lazy kernel covers moduli below `2^30`; larger moduli use reduced Shoup
+    /// butterflies. Other targets select the applicable scalar backend.
     /// Use [`Self::new_scalar`] for
     /// portable benchmarking or [`Self::new_avx2`] to require AVX2 butterflies.
     ///
@@ -280,7 +284,7 @@ impl<const MODULUS: u32> NttPlan<MODULUS> {
     ///
     /// In addition to [`FieldError::UnsupportedTransformLength`], this returns
     /// [`FieldError::Avx2Unavailable`] unless the target is x86-64, AVX2
-    /// is detected at runtime, and `MODULUS < 2^30`. No plan is returned with a
+    /// is detected at runtime, and `MODULUS < 2^31`. No plan is returned with a
     /// scalar fallback.
     pub fn new_avx2(length: usize) -> Result<Self, FieldError> {
         Self::with_backend(length, BackendPreference::Avx2)
@@ -349,7 +353,7 @@ impl<const MODULUS: u32> NttPlan<MODULUS> {
         false
     }
 
-    /// Returns the arithmetic and instruction-set backend selected at setup.
+    /// Returns the butterfly backend selected at setup.
     ///
     /// This `O(1)` diagnostic does not perform runtime detection again. All
     /// backends have identical transform semantics and ordering.
@@ -455,6 +459,15 @@ impl<const MODULUS: u32> NttPlan<MODULUS> {
                 #[cfg(not(target_arch = "x86_64"))]
                 unreachable!()
             }
+            NttBackend::Avx2Shoup => {
+                #[cfg(target_arch = "x86_64")]
+                // SAFETY: this backend is selected only after runtime AVX2 detection.
+                unsafe {
+                    avx2::forward_reduced(values, &self.stages);
+                }
+                #[cfg(not(target_arch = "x86_64"))]
+                unreachable!()
+            }
         }
         Ok(())
     }
@@ -468,7 +481,7 @@ impl<const MODULUS: u32> NttPlan<MODULUS> {
     /// [`FieldElement::value`] for canonical `u32` residues.
     ///
     /// The operation takes `O(N log N)` time and allocates nothing. It uses the
-    /// plan's transform backend; AVX2-capable plans also use the field's
+    /// plan's transform backend, then uses the field's independently
     /// runtime-dispatched bulk scalar multiplication for normalization.
     ///
     /// # Errors
@@ -493,13 +506,18 @@ impl<const MODULUS: u32> NttPlan<MODULUS> {
                 #[cfg(not(target_arch = "x86_64"))]
                 unreachable!()
             }
+            NttBackend::Avx2Shoup => {
+                #[cfg(target_arch = "x86_64")]
+                // SAFETY: this backend is selected only after runtime AVX2 detection.
+                unsafe {
+                    avx2::inverse_reduced(values, &self.stages);
+                }
+                #[cfg(not(target_arch = "x86_64"))]
+                unreachable!()
+            }
         }
-        if matches!(self.backend, NttBackend::Avx2ShoupLazy) {
-            self.field
-                .scalar_mul_elements_assign(values, self.inverse_length);
-        } else {
-            Self::scalar_pointwise(values, self.inverse_length);
-        }
+        self.field
+            .scalar_mul_elements_assign(values, self.inverse_length);
         Ok(())
     }
 
@@ -511,9 +529,9 @@ impl<const MODULUS: u32> NttPlan<MODULUS> {
     /// Montgomery representation. Apply [`Self::inverse`] to obtain a cyclic
     /// convolution. Prefer [`Self::cyclic_convolution`] for a one-call product.
     ///
-    /// This takes `O(N)` time and allocates nothing. AVX2 plans call
-    /// [`PrimeField::mul_elements_assign`], which dispatches AVX2 at runtime;
-    /// other plans use scalar multiplication.
+    /// This takes `O(N)` time and allocates nothing. It calls
+    /// [`PrimeField::mul_elements_assign`], whose runtime AVX2 dispatch is
+    /// independent of the transform backend.
     ///
     /// # Errors
     ///
@@ -526,14 +544,7 @@ impl<const MODULUS: u32> NttPlan<MODULUS> {
     ) -> Result<(), FieldError> {
         self.check_length(lhs.len())?;
         self.check_length(rhs.len())?;
-        if matches!(self.backend, NttBackend::Avx2ShoupLazy) {
-            self.field.mul_elements_assign(lhs, rhs)
-        } else {
-            for (lhs, &rhs) in lhs.iter_mut().zip(rhs) {
-                *lhs *= rhs;
-            }
-            Ok(())
-        }
+        self.field.mul_elements_assign(lhs, rhs)
     }
 
     /// Computes a linear polynomial convolution using this reusable NTT plan.
@@ -632,12 +643,6 @@ impl<const MODULUS: u32> NttPlan<MODULUS> {
             })
         } else {
             Ok(())
-        }
-    }
-
-    fn scalar_pointwise(values: &mut [FieldElement<MODULUS>], scalar: FieldElement<MODULUS>) {
-        for value in values {
-            *value *= scalar;
         }
     }
 
@@ -1089,7 +1094,7 @@ fn select_backend<const MODULUS: u32>(
     length: usize,
     preference: BackendPreference,
 ) -> Result<(NttBackend, Option<NttPerformanceWarning>), FieldError> {
-    if matches!(preference, BackendPreference::Avx2) && MODULUS >= 1 << 30 {
+    if matches!(preference, BackendPreference::Avx2) && MODULUS >= 1 << 31 {
         return Err(FieldError::Avx2Unavailable);
     }
     if MODULUS >= 1 << 31 {
@@ -1098,29 +1103,30 @@ fn select_backend<const MODULUS: u32>(
             Some(NttPerformanceWarning::MontgomeryFallback),
         ));
     }
-    if MODULUS >= 1 << 30 {
-        return Ok((
-            NttBackend::ScalarShoup,
-            Some(NttPerformanceWarning::ModulusTooLargeForAvx2),
-        ));
-    }
+    let scalar_backend = if MODULUS < 1 << 30 {
+        NttBackend::ScalarShoupLazy
+    } else {
+        NttBackend::ScalarShoup
+    };
+    let avx2_backend = if MODULUS < 1 << 30 {
+        NttBackend::Avx2ShoupLazy
+    } else {
+        NttBackend::Avx2Shoup
+    };
     if matches!(preference, BackendPreference::Scalar) {
-        return Ok((
-            NttBackend::ScalarShoupLazy,
-            Some(NttPerformanceWarning::ScalarRequested),
-        ));
+        return Ok((scalar_backend, Some(NttPerformanceWarning::ScalarRequested)));
     }
     #[cfg(target_arch = "x86_64")]
     {
         if matches!(preference, BackendPreference::Avx2) {
             return if std::arch::is_x86_feature_detected!("avx2") {
-                Ok((NttBackend::Avx2ShoupLazy, None))
+                Ok((avx2_backend, None))
             } else {
                 Err(FieldError::Avx2Unavailable)
             };
         }
         if std::arch::is_x86_feature_detected!("avx2") && length >= 16 {
-            return Ok((NttBackend::Avx2ShoupLazy, None));
+            return Ok((avx2_backend, None));
         }
     }
     #[cfg(not(target_arch = "x86_64"))]
@@ -1135,7 +1141,7 @@ fn select_backend<const MODULUS: u32>(
     };
     #[cfg(not(target_arch = "x86_64"))]
     let warning = NttPerformanceWarning::Avx2Unavailable;
-    Ok((NttBackend::ScalarShoupLazy, Some(warning)))
+    Ok((scalar_backend, Some(warning)))
 }
 
 fn schoolbook_linear_convolution<const MODULUS: u32>(
@@ -1224,8 +1230,11 @@ fn shoup_mul<const MODULUS: u32>(value: u32, twiddle: Twiddle) -> u32 {
 /// `0 <= t < 2p` for every input `z` in `[0, 2^32)`, not only reduced inputs:
 /// from `w' <= w * 2^32 / p < w' + 1` follows `q <= z * w / p`, hence `t >= 0`,
 /// and `q > z * w / p - z / 2^32 - 1`, hence
-/// `t < (z / 2^32 + 1) * p < 2p`. Intermediates stay below `2^62`, and
-/// `t < 2p < 2^31` fits a `u32` lane.
+/// `t < (z / 2^32 + 1) * p < 2p`. The lazy callers have `p < 2^30` and
+/// arbitrary `u32` inputs; the reduced callers have `p < 2^31` and inputs
+/// below `p`. Thus `z * w` and `q * p` are below `2^62`. The quotient product
+/// `z * w'` is below `2^64` for lazy callers and `2^63` for reduced callers,
+/// so every intermediate fits `u64`; `t < 2p < 2^32` fits a `u32` lane.
 ///
 /// This bound is what lets the lazy butterflies feed unreduced lazy words
 /// straight into the multiplication: a difference planted with a `+2p` offset
@@ -1289,22 +1298,43 @@ mod tests {
     #[test]
     #[cfg(target_arch = "x86_64")]
     fn forced_avx2_matches_forced_scalar() {
+        fn check<const MODULUS: u32>() {
+            let scalar = NttPlan::<MODULUS>::new_scalar(256).unwrap();
+            let avx2 = NttPlan::<MODULUS>::new_avx2(256).unwrap();
+            let boundaries = [0, 1, MODULUS / 2, MODULUS - 2, MODULUS - 1];
+            let input: Vec<_> = (0_u64..256)
+                .map(|index| {
+                    if index < boundaries.len() as u64 {
+                        boundaries[index as usize]
+                    } else {
+                        ((index * 2_654_435_761 + 97) % u64::from(MODULUS)) as u32
+                    }
+                })
+                .collect();
+            let mut scalar_values = scalar.elements(&input);
+            let mut avx2_values = avx2.elements(&input);
+            scalar.forward(&mut scalar_values).unwrap();
+            avx2.forward(&mut avx2_values).unwrap();
+            assert_eq!(avx2_values, scalar_values);
+
+            let scalar_rhs = scalar_values.clone();
+            let avx2_rhs = avx2_values.clone();
+            scalar
+                .pointwise_mul_assign(&mut scalar_values, &scalar_rhs)
+                .unwrap();
+            avx2.pointwise_mul_assign(&mut avx2_values, &avx2_rhs)
+                .unwrap();
+            assert_eq!(avx2_values, scalar_values);
+            scalar.inverse(&mut scalar_values).unwrap();
+            avx2.inverse(&mut avx2_values).unwrap();
+            assert_eq!(avx2_values, scalar_values);
+        }
+
         if !std::arch::is_x86_feature_detected!("avx2") {
             return;
         }
-        let scalar = NttPlan::<998_244_353>::new_scalar(256).unwrap();
-        let avx2 = NttPlan::<998_244_353>::new_avx2(256).unwrap();
-        let input: Vec<_> = (0_u64..256)
-            .map(|index| ((index * 2_654_435_761 + 97) % 998_244_353) as u32)
-            .collect();
-        let mut scalar_values = scalar.elements(&input);
-        let mut avx2_values = avx2.elements(&input);
-        scalar.forward(&mut scalar_values).unwrap();
-        avx2.forward(&mut avx2_values).unwrap();
-        assert_eq!(avx2_values, scalar_values);
-        scalar.inverse(&mut scalar_values).unwrap();
-        avx2.inverse(&mut avx2_values).unwrap();
-        assert_eq!(avx2_values, scalar_values);
+        check::<998_244_353>();
+        check::<2_013_265_921>();
     }
 
     #[test]

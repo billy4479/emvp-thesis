@@ -50,8 +50,8 @@ impl<const MODULUS: u32, const N: usize> StaticNttPlan<MODULUS, N> {
     /// Constructs a fixed-size plan using automatic backend dispatch.
     ///
     /// Setup performs CPU feature detection but allocates and computes no
-    /// tables. On x86-64, supported lazy-Shoup transforms use LLVM-vectorized
-    /// AVX2 kernels from length 16.
+    /// tables. On x86-64, supported Shoup transforms use LLVM-vectorized AVX2
+    /// kernels from length 16.
     ///
     /// # Errors
     ///
@@ -105,7 +105,7 @@ impl<const MODULUS: u32, const N: usize> StaticNttPlan<MODULUS, N> {
         false
     }
 
-    /// Returns the selected arithmetic and instruction-set backend.
+    /// Returns the selected butterfly backend.
     #[must_use]
     pub const fn backend(&self) -> NttBackend {
         self.backend
@@ -144,6 +144,15 @@ impl<const MODULUS: u32, const N: usize> StaticNttPlan<MODULUS, N> {
                 #[cfg(not(target_arch = "x86_64"))]
                 unreachable!()
             }
+            NttBackend::Avx2Shoup => {
+                #[cfg(target_arch = "x86_64")]
+                // SAFETY: construction selects this backend only after AVX2 detection.
+                unsafe {
+                    super::avx2::forward_reduced_static(values, &Self::FORWARD_TWIDDLES);
+                }
+                #[cfg(not(target_arch = "x86_64"))]
+                unreachable!()
+            }
         }
     }
 
@@ -167,15 +176,18 @@ impl<const MODULUS: u32, const N: usize> StaticNttPlan<MODULUS, N> {
                 #[cfg(not(target_arch = "x86_64"))]
                 unreachable!()
             }
-        }
-        if matches!(self.backend, NttBackend::Avx2ShoupLazy) {
-            self.field
-                .scalar_mul_elements_assign(values, Self::INVERSE_LENGTH);
-        } else {
-            for value in values {
-                *value *= Self::INVERSE_LENGTH;
+            NttBackend::Avx2Shoup => {
+                #[cfg(target_arch = "x86_64")]
+                // SAFETY: construction selects this backend only after AVX2 detection.
+                unsafe {
+                    super::avx2::inverse_reduced_static(values, &Self::INVERSE_TWIDDLES);
+                }
+                #[cfg(not(target_arch = "x86_64"))]
+                unreachable!()
             }
         }
+        self.field
+            .scalar_mul_elements_assign(values, Self::INVERSE_LENGTH);
     }
 
     /// Multiplies two fixed-size transform-domain arrays element-wise.
@@ -184,13 +196,7 @@ impl<const MODULUS: u32, const N: usize> StaticNttPlan<MODULUS, N> {
         lhs: &mut [FieldElement<MODULUS>; N],
         rhs: &[FieldElement<MODULUS>; N],
     ) {
-        if matches!(self.backend, NttBackend::Avx2ShoupLazy) {
-            PrimeField::<MODULUS>::mul_element_arrays_assign(lhs, rhs);
-        } else {
-            for (lhs, &rhs) in lhs.iter_mut().zip(rhs) {
-                *lhs *= rhs;
-            }
-        }
+        PrimeField::<MODULUS>::mul_element_arrays_assign(lhs, rhs);
     }
 
     /// Applies two forward transforms, a pointwise product, and one inverse.
