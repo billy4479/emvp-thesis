@@ -125,12 +125,45 @@ fn check_static_matches_dynamic<const MODULUS: u32, const N: usize>() {
 
 #[test]
 fn compile_time_size_plans_match_dynamic_plans() {
+    check_static_matches_dynamic::<2, 1>();
     check_static_matches_dynamic::<17, 1>();
     check_static_matches_dynamic::<17, 8>();
     check_static_matches_dynamic::<65_537, 256>();
     check_static_matches_dynamic::<998_244_353, 1_024>();
     check_static_matches_dynamic::<2_013_265_921, 256>();
     check_static_matches_dynamic::<2_281_701_377, 256>();
+}
+
+#[test]
+fn modulus_two_length_one_static_plan_preserves_montgomery_one() {
+    let plan = StaticNttPlan::<2, 1>::new_scalar().unwrap();
+    for input in [[0], [1], [2], [u32::MAX]] {
+        let mut values = plan.elements(&input);
+        plan.forward(&mut values);
+        plan.inverse(&mut values);
+        assert_eq!(
+            values.map(prime_field_layer::FieldElement::value),
+            [input[0] & 1]
+        );
+    }
+}
+
+#[test]
+fn cloned_dynamic_plan_keeps_shared_tables_alive_for_transforms() {
+    let plan = NttPlan::<998_244_353>::new(4_096).unwrap();
+    let clone = plan.clone();
+    let input: Vec<_> = (0..plan.len()).map(|index| index as u32).collect();
+    let mut values = plan.elements(&input);
+    plan.forward(&mut values).unwrap();
+    drop(plan);
+    clone.inverse(&mut values).unwrap();
+    assert_eq!(
+        values
+            .into_iter()
+            .map(prime_field_layer::FieldElement::value)
+            .collect::<Vec<_>>(),
+        input
+    );
 }
 
 #[test]

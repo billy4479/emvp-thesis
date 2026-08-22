@@ -28,6 +28,18 @@ fn plan_construction(c: &mut Criterion) {
     group.finish();
 }
 
+fn plan_cloning(c: &mut Criterion) {
+    let mut group = c.benchmark_group("ntt_plan_clone");
+    for length in [256, 4_096, 65_536] {
+        let plan = NttPlan::<998_244_353>::new(length).unwrap();
+        group.throughput(Throughput::Elements(length as u64));
+        group.bench_function(BenchmarkId::new("p998244353", length), |b| {
+            b.iter(|| black_box(black_box(&plan).clone()));
+        });
+    }
+    group.finish();
+}
+
 fn transforms_for_modulus<const MODULUS: u32>(c: &mut Criterion, length: usize) {
     let mut group = c.benchmark_group(format!("ntt_cached_p{MODULUS}"));
     common::tune_group(
@@ -242,6 +254,6 @@ fn fixed_operand_convolutions(c: &mut Criterion) {
 criterion_group! {
     name = benches;
     config = common::criterion_tuned(20, Duration::from_secs(1), Duration::from_secs(2));
-    targets = plan_construction, transforms, convolutions, fixed_operand_convolutions
+    targets = plan_construction, plan_cloning, transforms, convolutions, fixed_operand_convolutions
 }
 criterion_main!(benches);

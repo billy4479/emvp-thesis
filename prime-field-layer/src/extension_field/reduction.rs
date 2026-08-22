@@ -67,7 +67,7 @@ impl<const MODULUS: u32, const K: usize> PolynomialReductionPlan<MODULUS, K> {
         let field = PrimeField::<MODULUS>::new();
         let negative_modulus = modulus[..K]
             .iter()
-            .map(|&coefficient| field.element_u32(field.neg(coefficient)))
+            .map(|&coefficient| field.element_u32(field.neg_canonical(coefficient)))
             .collect();
         let (algorithm, ntt) = if K <= SCHOOLBOOK_EXTENSION_DEGREE {
             (PolynomialAlgorithm::Schoolbook, None)
@@ -316,12 +316,12 @@ fn reversed_inverse<const MODULUS: u32>(modulus: &[u32], length: usize) -> Vec<u
     for degree in 1..length {
         let mut sum = 0;
         for index in 1..=degree.min(modulus.len() - 1) {
-            sum = field.add(
+            sum = field.add_canonical(
                 sum,
                 field.mul(modulus[modulus.len() - 1 - index], inverse[degree - index]),
             );
         }
-        inverse[degree] = field.neg(sum);
+        inverse[degree] = field.neg_canonical(sum);
     }
     inverse
 }

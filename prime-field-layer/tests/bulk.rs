@@ -25,20 +25,20 @@ fn check_elementwise<const MODULUS: u32>() {
         let (lhs, rhs) = inputs(length, MODULUS);
 
         let mut actual = lhs.clone();
-        field.add_assign(&mut actual, &rhs).unwrap();
+        field.add_assign_canonical(&mut actual, &rhs).unwrap();
         let expected: Vec<_> = lhs
             .iter()
             .zip(&rhs)
-            .map(|(&lhs, &rhs)| field.add(lhs, rhs))
+            .map(|(&lhs, &rhs)| field.add_canonical(lhs, rhs))
             .collect();
         assert_eq!(actual, expected, "add, modulus {MODULUS}, length {length}");
 
         let mut actual = lhs.clone();
-        field.sub_assign(&mut actual, &rhs).unwrap();
+        field.sub_assign_canonical(&mut actual, &rhs).unwrap();
         let expected: Vec<_> = lhs
             .iter()
             .zip(&rhs)
-            .map(|(&lhs, &rhs)| field.sub(lhs, rhs))
+            .map(|(&lhs, &rhs)| field.sub_canonical(lhs, rhs))
             .collect();
         assert_eq!(actual, expected, "sub, modulus {MODULUS}, length {length}");
 
@@ -66,13 +66,16 @@ fn check_unary_and_scalar<const MODULUS: u32>() {
         let (values, _) = inputs(length, MODULUS);
 
         let mut actual = values.clone();
-        field.neg_assign(&mut actual);
-        let expected: Vec<_> = values.iter().map(|&value| field.neg(value)).collect();
+        field.neg_assign_canonical(&mut actual);
+        let expected: Vec<_> = values
+            .iter()
+            .map(|&value| field.neg_canonical(value))
+            .collect();
         assert_eq!(actual, expected, "neg, modulus {MODULUS}, length {length}");
 
         for scalar in [0, 1, MODULUS / 2, MODULUS - 1] {
             let mut actual = values.clone();
-            field.scalar_mul_assign(&mut actual, scalar);
+            field.scalar_mul_assign_canonical(&mut actual, scalar);
             let expected: Vec<_> = values
                 .iter()
                 .map(|&value| field.mul(value, scalar))
@@ -96,11 +99,10 @@ fn check_dot<const MODULUS: u32>() {
     let field = PrimeField::<MODULUS>::new();
     for length in LENGTHS {
         let (lhs, rhs) = inputs(length, MODULUS);
-        let expected = lhs
-            .iter()
-            .zip(&rhs)
-            .fold(0, |sum, (&lhs, &rhs)| field.add(sum, field.mul(lhs, rhs)));
-        assert_eq!(field.dot(&lhs, &rhs).unwrap(), expected);
+        let expected = lhs.iter().zip(&rhs).fold(0, |sum, (&lhs, &rhs)| {
+            field.add_canonical(sum, field.mul(lhs, rhs))
+        });
+        assert_eq!(field.dot_canonical(&lhs, &rhs).unwrap(), expected);
     }
 }
 
@@ -192,22 +194,58 @@ fn batch_inverse_matches_scalar_inversion() {
     check_batch_inverse::<998_244_353>();
 }
 
+fn check_batch_inverse_rejects_noncanonical_zero<const MODULUS: u32>() {
+    let largest_multiple = u32::MAX / MODULUS * MODULUS;
+    for zero in [MODULUS, largest_multiple] {
+        let mut values = [1, zero, MODULUS + 1];
+        let original = values;
+        assert_eq!(
+            PrimeField::<MODULUS>::new().batch_inv_assign(&mut values),
+            Err(FieldError::DivisionByZero)
+        );
+        assert_eq!(values, original);
+    }
+}
+
+#[test]
+fn batch_inverse_rejects_multiples_of_the_modulus_before_mutation() {
+    check_batch_inverse_rejects_noncanonical_zero::<2>();
+    check_batch_inverse_rejects_noncanonical_zero::<17>();
+    check_batch_inverse_rejects_noncanonical_zero::<65_537>();
+    check_batch_inverse_rejects_noncanonical_zero::<998_244_353>();
+    check_batch_inverse_rejects_noncanonical_zero::<4_294_967_291>();
+}
+
+#[test]
+fn batch_inverse_reduces_noncanonical_nonzero_values() {
+    let binary = PrimeField::<2>::new();
+    let mut binary_values = [3, u32::MAX];
+    binary.batch_inv_assign(&mut binary_values).unwrap();
+    assert_eq!(binary_values, [1, 1]);
+
+    let field = PrimeField::<998_244_353>::new();
+    let mut values = [998_244_354, 1_996_488_705, u32::MAX];
+    let expected = values.map(|value| field.inv(value).unwrap());
+    field.batch_inv_assign(&mut values).unwrap();
+    assert_eq!(values, expected);
+}
+
 #[test]
 fn binary_kernels_reject_mismatched_lengths() {
     let field = PrimeField::<65_537>::new();
     let rhs = [1, 2, 3];
 
     assert_eq!(
-        field.add_assign(&mut [1, 2], &rhs),
+        field.add_assign_canonical(&mut [1, 2], &rhs),
         Err(FieldError::LengthMismatch)
     );
     assert_eq!(
-        field.sub_assign(&mut [1, 2], &rhs),
+        field.sub_assign_canonical(&mut [1, 2], &rhs),
         Err(FieldError::LengthMismatch)
     );
     assert_eq!(
         field.mul_assign(&mut [1, 2], &rhs),
         Err(FieldError::LengthMismatch)
     );
-    field.dot(&[1, 2], &rhs).unwrap_err();
+    field.dot_canonical(&[1, 2], &rhs).unwrap_err();
 }

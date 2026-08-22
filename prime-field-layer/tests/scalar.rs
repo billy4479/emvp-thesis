@@ -29,11 +29,11 @@ fn boundary_values(modulus: u32) -> Vec<u32> {
 fn check_pair<const MODULUS: u32>(field: PrimeField<MODULUS>, lhs: u32, rhs: u32) {
     let modulus = MODULUS as u64;
     assert_eq!(
-        field.add(lhs, rhs),
+        field.add_canonical(lhs, rhs),
         ((lhs as u64 + rhs as u64) % modulus) as u32
     );
     assert_eq!(
-        field.sub(lhs, rhs),
+        field.sub_canonical(lhs, rhs),
         ((lhs as u64 + modulus - rhs as u64) % modulus) as u32
     );
     assert_eq!(
@@ -46,7 +46,10 @@ fn check_boundaries<const MODULUS: u32>() {
     let field = PrimeField::<MODULUS>::new();
     let values = boundary_values(MODULUS);
     for &lhs in &values {
-        assert_eq!(field.neg(lhs), if lhs == 0 { 0 } else { MODULUS - lhs });
+        assert_eq!(
+            field.neg_canonical(lhs),
+            if lhs == 0 { 0 } else { MODULUS - lhs }
+        );
         assert_eq!(field.square(lhs), field.mul(lhs, lhs));
         for &rhs in &values {
             check_pair(field, lhs, rhs);
@@ -161,6 +164,42 @@ fn inversion_is_multiplicative_and_rejects_zero() {
     check_boundary_inverses::<4_294_967_291>();
 }
 
+fn check_noncanonical_inverses<const MODULUS: u32>() {
+    let field = PrimeField::<MODULUS>::new();
+    let largest_multiple = u32::MAX / MODULUS * MODULUS;
+    for zero in [MODULUS, largest_multiple] {
+        assert_eq!(field.inv(zero), Err(FieldError::DivisionByZero));
+    }
+
+    for value in [MODULUS + 1, u32::MAX] {
+        if !value.is_multiple_of(MODULUS) {
+            let inverse = field.inv(value).unwrap();
+            assert_eq!(field.mul(value, inverse), 1);
+        }
+    }
+}
+
+#[test]
+fn inversion_reduces_full_width_inputs_before_the_zero_check() {
+    check_noncanonical_inverses::<2>();
+    check_noncanonical_inverses::<17>();
+    check_noncanonical_inverses::<65_537>();
+    check_noncanonical_inverses::<998_244_353>();
+    check_noncanonical_inverses::<4_294_967_291>();
+}
+
+#[test]
+fn full_width_raw_operations_documented_as_reducing_match_the_oracle() {
+    let field = PrimeField::<17>::new();
+    for value in [17, 18, u32::MAX - 1, u32::MAX] {
+        assert_eq!(field.square(value), oracle_pow(value % 17, 2, 17));
+        assert_eq!(field.pow(value, 31), oracle_pow(value % 17, 31, 17));
+        assert_eq!(field.mul(value, u32::MAX), {
+            (u64::from(value) * u64::from(u32::MAX) % 17) as u32
+        });
+    }
+}
+
 fn check_random<const MODULUS: u32>(lhs: u32, rhs: u32, exponent: u32) {
     let field = PrimeField::<MODULUS>::new();
     let lhs = (lhs as u64 % MODULUS as u64) as u32;
@@ -169,8 +208,8 @@ fn check_random<const MODULUS: u32>(lhs: u32, rhs: u32, exponent: u32) {
     let expected_sub = ((lhs as u64 + MODULUS as u64 - rhs as u64) % MODULUS as u64) as u32;
     let expected_mul = (lhs as u64 * rhs as u64 % MODULUS as u64) as u32;
 
-    assert_eq!(field.add(lhs, rhs), expected_add);
-    assert_eq!(field.sub(lhs, rhs), expected_sub);
+    assert_eq!(field.add_canonical(lhs, rhs), expected_add);
+    assert_eq!(field.sub_canonical(lhs, rhs), expected_sub);
     assert_eq!(field.mul(lhs, rhs), expected_mul);
     assert_eq!(field.square(lhs), field.mul(lhs, lhs));
     assert_eq!(

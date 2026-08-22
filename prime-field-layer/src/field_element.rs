@@ -141,9 +141,10 @@ impl<const MODULUS: u32> PrimeField<MODULUS> {
     /// Adds `rhs` element-wise into `lhs` in Montgomery representation.
     ///
     /// This takes `O(n)` time, allocates nothing, and leaves each `lhs[i]` as
-    /// `lhs[i] + rhs[i]` in the field. Unlike [`Self::add_assign`], these slices
-    /// contain [`FieldElement`] rather than canonical `u32` residues. This loop
-    /// is scalar on every target. A length mismatch returns
+    /// `lhs[i] + rhs[i]` in the field. Unlike
+    /// [`Self::add_assign_canonical`], these slices contain [`FieldElement`]
+    /// rather than canonical `u32` residues. This loop is scalar on every
+    /// target. A length mismatch returns
     /// [`FieldError::LengthMismatch`] before mutating `lhs`.
     ///
     /// # Errors
@@ -158,7 +159,7 @@ impl<const MODULUS: u32> PrimeField<MODULUS> {
             return Err(FieldError::LengthMismatch);
         }
         for (lhs, rhs) in lhs.iter_mut().zip(rhs) {
-            lhs.montgomery = self.add(lhs.montgomery, rhs.montgomery);
+            lhs.montgomery = self.add_canonical(lhs.montgomery, rhs.montgomery);
         }
         Ok(())
     }
@@ -166,9 +167,10 @@ impl<const MODULUS: u32> PrimeField<MODULUS> {
     /// Subtracts `rhs` element-wise from `lhs` in Montgomery representation.
     ///
     /// This takes `O(n)` time, allocates nothing, and leaves each `lhs[i]` as
-    /// `lhs[i] - rhs[i]` in the field. Unlike [`Self::sub_assign`], these slices
-    /// contain [`FieldElement`] rather than canonical `u32` residues. This loop
-    /// is scalar on every target. A length mismatch returns
+    /// `lhs[i] - rhs[i]` in the field. Unlike
+    /// [`Self::sub_assign_canonical`], these slices contain [`FieldElement`]
+    /// rather than canonical `u32` residues. This loop is scalar on every
+    /// target. A length mismatch returns
     /// [`FieldError::LengthMismatch`] before mutating `lhs`.
     ///
     /// # Errors
@@ -183,7 +185,7 @@ impl<const MODULUS: u32> PrimeField<MODULUS> {
             return Err(FieldError::LengthMismatch);
         }
         for (lhs, rhs) in lhs.iter_mut().zip(rhs) {
-            lhs.montgomery = self.sub(lhs.montgomery, rhs.montgomery);
+            lhs.montgomery = self.sub_canonical(lhs.montgomery, rhs.montgomery);
         }
         Ok(())
     }
@@ -332,7 +334,7 @@ impl<const MODULUS: u32> Add for FieldElement<MODULUS> {
     #[inline(always)]
     fn add(self, rhs: Self) -> Self::Output {
         let field = self.field();
-        Self::from_montgomery(field.add(self.montgomery, rhs.montgomery))
+        Self::from_montgomery(field.add_canonical(self.montgomery, rhs.montgomery))
     }
 }
 
@@ -349,7 +351,7 @@ impl<const MODULUS: u32> Sub for FieldElement<MODULUS> {
     #[inline(always)]
     fn sub(self, rhs: Self) -> Self::Output {
         let field = self.field();
-        Self::from_montgomery(field.sub(self.montgomery, rhs.montgomery))
+        Self::from_montgomery(field.sub_canonical(self.montgomery, rhs.montgomery))
     }
 }
 
@@ -385,7 +387,7 @@ impl<const MODULUS: u32> Neg for FieldElement<MODULUS> {
     #[inline(always)]
     fn neg(self) -> Self::Output {
         let field = self.field();
-        Self::from_montgomery(field.neg(self.montgomery))
+        Self::from_montgomery(field.neg_canonical(self.montgomery))
     }
 }
 

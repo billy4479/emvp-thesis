@@ -405,6 +405,9 @@ const fn root_of_unity<const MODULUS: u32, const N: usize>() -> u32 {
 }
 
 const fn to_montgomery_const<const MODULUS: u32>(value: u32) -> u32 {
+    if MODULUS == 2 {
+        return value & 1;
+    }
     ((value as u128 * (1u128 << 32)) % MODULUS as u128) as u32
 }
 

@@ -36,10 +36,10 @@ fn arithmetic_uses_the_static_field() {
     let lhs = field.element(15);
     let rhs = field.element(5);
 
-    assert_eq!((lhs + rhs).value(), field.add(15, 5));
-    assert_eq!((lhs - rhs).value(), field.sub(15, 5));
+    assert_eq!((lhs + rhs).value(), field.add_canonical(15, 5));
+    assert_eq!((lhs - rhs).value(), field.sub_canonical(15, 5));
     assert_eq!((lhs * rhs).value(), field.mul(15, 5));
-    assert_eq!((-lhs).value(), field.neg(15));
+    assert_eq!((-lhs).value(), field.neg_canonical(15));
     assert_eq!(lhs.square().value(), field.square(15));
     assert_eq!(lhs.pow(13).value(), field.pow(15, 13));
     assert_eq!(lhs.inv().unwrap().value(), field.inv(15).unwrap());
@@ -55,7 +55,7 @@ fn assignment_operators_use_montgomery_arithmetic() {
     value *= field.element(31);
     value -= field.element(9);
 
-    let expected = field.sub(field.mul(field.add(123_456_789, 17), 31), 9);
+    let expected = field.sub_canonical(field.mul(field.add_canonical(123_456_789, 17), 31), 9);
     assert_eq!(value.value(), expected);
 }
 

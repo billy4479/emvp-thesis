@@ -32,7 +32,7 @@ fn bench_scalar<const MODULUS: u32>(group: &mut BenchmarkGroup<'_, WallTime>) {
     let rhs = MODULUS - 1;
 
     group.bench_function(BenchmarkId::new("add", MODULUS), |b| {
-        b.iter(|| field.add(black_box(lhs), black_box(rhs)));
+        b.iter(|| field.add_canonical(black_box(lhs), black_box(rhs)));
     });
     group.bench_function(BenchmarkId::new("mul", MODULUS), |b| {
         b.iter(|| field.mul(black_box(lhs), black_box(rhs)));
@@ -86,7 +86,7 @@ fn bench_bulk<const MODULUS: u32>(group: &mut BenchmarkGroup<'_, WallTime>) {
                 || lhs.clone(),
                 |output| {
                     field
-                        .add_assign(black_box(output), black_box(&rhs))
+                        .add_assign_canonical(black_box(output), black_box(&rhs))
                         .unwrap();
                 },
                 BatchSize::SmallInput,
@@ -128,12 +128,18 @@ fn bench_bulk<const MODULUS: u32>(group: &mut BenchmarkGroup<'_, WallTime>) {
         group.bench_function(BenchmarkId::new("scalar_mul_assign", &parameter), |b| {
             b.iter_batched_ref(
                 || lhs.clone(),
-                |output| field.scalar_mul_assign(black_box(output), black_box(MODULUS - 1)),
+                |output| {
+                    field.scalar_mul_assign_canonical(black_box(output), black_box(MODULUS - 1));
+                },
                 BatchSize::SmallInput,
             );
         });
         group.bench_function(BenchmarkId::new("dot", &parameter), |b| {
-            b.iter(|| field.dot(black_box(&lhs), black_box(&rhs)).unwrap());
+            b.iter(|| {
+                field
+                    .dot_canonical(black_box(&lhs), black_box(&rhs))
+                    .unwrap()
+            });
         });
     }
 }

@@ -77,7 +77,7 @@ fn mul_mod<const MODULUS: u32>(
     for (lhs_index, &lhs) in lhs.iter().enumerate() {
         for (rhs_index, &rhs) in rhs.iter().enumerate() {
             let index = lhs_index + rhs_index;
-            product[index] = field.add(product[index], field.mul(lhs, rhs));
+            product[index] = field.add_canonical(product[index], field.mul(lhs, rhs));
         }
     }
     remainder(field, product, modulus)
@@ -95,7 +95,8 @@ fn remainder<const MODULUS: u32>(
         let factor = *dividend.last().unwrap_or(&0);
         for (index, &coefficient) in divisor.iter().enumerate() {
             let target = degree + index;
-            dividend[target] = field.sub(dividend[target], field.mul(factor, coefficient));
+            dividend[target] =
+                field.sub_canonical(dividend[target], field.mul(factor, coefficient));
         }
         trim_in_place(&mut dividend);
     }
@@ -136,7 +137,8 @@ fn general_remainder<const MODULUS: u32>(
         let factor = field.mul(*dividend.last().unwrap_or(&0), inverse_leading);
         for (index, &coefficient) in divisor.iter().enumerate() {
             let target = degree + index;
-            dividend[target] = field.sub(dividend[target], field.mul(factor, coefficient));
+            dividend[target] =
+                field.sub_canonical(dividend[target], field.mul(factor, coefficient));
         }
         trim_in_place(&mut dividend);
     }
@@ -147,7 +149,7 @@ fn sub<const MODULUS: u32>(field: PrimeField<MODULUS>, lhs: &[u32], rhs: &[u32])
     let length = lhs.len().max(rhs.len());
     let mut result = vec![0; length];
     for (index, output) in result.iter_mut().enumerate() {
-        *output = field.sub(
+        *output = field.sub_canonical(
             lhs.get(index).copied().unwrap_or(0),
             rhs.get(index).copied().unwrap_or(0),
         );

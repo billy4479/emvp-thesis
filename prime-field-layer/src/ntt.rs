@@ -91,7 +91,7 @@
 //! copied. See `NTT_REFERENCES.md` in the crate root for the design literature
 //! and provenance statement.
 
-use std::fmt;
+use std::{fmt, sync::Arc};
 
 use crate::{FieldElement, FieldError, PrimeField, constant_time::reduce_once_u64};
 
@@ -194,8 +194,8 @@ struct Stage {
 /// A plan fixes the prime modulus, length, roots, inverse normalization, and
 /// runtime-selected [`NttBackend`]. Construction allocates and retains `O(N)`
 /// stage-ordered twiddles and takes `O(N + log MODULUS)` field operations.
-/// Cloning a plan clones those tables. Reusing one avoids setup for subsequent
-/// `O(N log N)` transforms and convolutions.
+/// Clones share those immutable tables through reference counting. Reusing one
+/// avoids setup for subsequent `O(N log N)` transforms and convolutions.
 ///
 /// Transform methods operate in place on exactly `N` [`FieldElement`] values,
 /// allocate nothing, and keep both coefficient- and frequency-domain values in
@@ -206,7 +206,7 @@ pub struct NttPlan<const MODULUS: u32> {
     field: PrimeField<MODULUS>,
     length: usize,
     inverse_length: FieldElement<MODULUS>,
-    stages: Vec<Stage>,
+    stages: Arc<[Stage]>,
     backend: NttBackend,
     warning: Option<NttPerformanceWarning>,
 }
@@ -330,7 +330,7 @@ impl<const MODULUS: u32> NttPlan<MODULUS> {
             field,
             length,
             inverse_length,
-            stages,
+            stages: stages.into(),
             backend,
             warning,
         })
@@ -660,7 +660,7 @@ impl<const MODULUS: u32> NttPlan<MODULUS> {
     // the tier gate selecting this backend; `normalize` restores [0, p).
     fn forward_shoup_lazy(&self, values: &mut [FieldElement<MODULUS>]) {
         let two_p = MODULUS * 2;
-        for stage in &self.stages {
+        for stage in self.stages.iter() {
             for (block, &twiddle) in stage.forward.iter().enumerate() {
                 let start = block * 2 * stage.distance;
                 let (lhs_values, rhs_values) =
@@ -709,7 +709,7 @@ impl<const MODULUS: u32> NttPlan<MODULUS> {
     }
 
     fn forward_shoup(&self, values: &mut [FieldElement<MODULUS>]) {
-        for stage in &self.stages {
+        for stage in self.stages.iter() {
             for (block, &twiddle) in stage.forward.iter().enumerate() {
                 let start = block * 2 * stage.distance;
                 let (lhs_values, rhs_values) =
@@ -747,7 +747,7 @@ impl<const MODULUS: u32> NttPlan<MODULUS> {
     }
 
     fn forward_montgomery(&self, values: &mut [FieldElement<MODULUS>]) {
-        for stage in &self.stages {
+        for stage in self.stages.iter() {
             for (block, twiddle) in stage.forward.iter().enumerate() {
                 let start = block * 2 * stage.distance;
                 let (lhs_values, rhs_values) =
@@ -1441,7 +1441,7 @@ mod tests {
         let field = PrimeField::<65_537>::new();
         let plan = NttPlan::<65_537>::new_scalar(256).unwrap();
         let root = field.root_of_unity(256).unwrap();
-        for stage in &plan.stages {
+        for stage in plan.stages.iter() {
             let bits = stage.forward.len().trailing_zeros();
             for (block, twiddle) in stage.forward.iter().enumerate() {
                 let reversed = if bits == 0 {

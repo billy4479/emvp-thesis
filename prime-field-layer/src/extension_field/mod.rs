@@ -163,7 +163,7 @@ impl<const MODULUS: u32, const K: usize> ExtensionField<MODULUS, K> {
     pub fn add(&self, lhs: &[u32; K], rhs: &[u32; K]) -> [u32; K] {
         let field = PrimeField::<MODULUS>::new();
         std::array::from_fn(|index| {
-            field.add(
+            field.add_canonical(
                 field.reduce_u64(u64::from(lhs[index])),
                 field.reduce_u64(u64::from(rhs[index])),
             )
@@ -175,7 +175,7 @@ impl<const MODULUS: u32, const K: usize> ExtensionField<MODULUS, K> {
     pub fn sub(&self, lhs: &[u32; K], rhs: &[u32; K]) -> [u32; K] {
         let field = PrimeField::<MODULUS>::new();
         std::array::from_fn(|index| {
-            field.sub(
+            field.sub_canonical(
                 field.reduce_u64(u64::from(lhs[index])),
                 field.reduce_u64(u64::from(rhs[index])),
             )

@@ -42,7 +42,13 @@ impl fmt::Display for FieldError {
 
 impl std::error::Error for FieldError {}
 
-/// Arithmetic for canonical residues modulo the compile-time prime `MODULUS`.
+/// Arithmetic modulo the compile-time prime `MODULUS`.
+///
+/// Methods whose names end in `_canonical` require every raw `u32` operand to
+/// be less than `MODULUS`. This explicit low-level API avoids a remainder in hot
+/// loops. Other raw `u32` methods accept the full `u32` range and reduce as part
+/// of their operation. Prefer [`crate::FieldElement`] when values remain in the
+/// field across multiple operations; its type guarantees the representation.
 ///
 /// Invalid moduli are rejected during compilation:
 ///
@@ -213,34 +219,45 @@ impl<const MODULUS: u32> PrimeField<MODULUS> {
         self.reduce_u64(high * u64::from(Self::MONTGOMERY_R2) + low)
     }
 
+    /// Adds two canonical residues.
+    ///
+    /// Both operands must be less than `MODULUS`. The result is canonical.
     #[inline(always)]
     #[must_use]
-    pub fn add(&self, lhs: u32, rhs: u32) -> u32 {
+    pub fn add_canonical(&self, lhs: u32, rhs: u32) -> u32 {
         reduce_once_u64(u64::from(lhs) + u64::from(rhs), Self::MODULUS_U64) as u32
     }
 
+    /// Subtracts one canonical residue from another.
+    ///
+    /// Both operands must be less than `MODULUS`. The result is canonical.
     #[inline(always)]
     #[must_use]
-    pub fn sub(&self, lhs: u32, rhs: u32) -> u32 {
+    pub fn sub_canonical(&self, lhs: u32, rhs: u32) -> u32 {
         reduce_once_u64(
             u64::from(lhs) + Self::MODULUS_U64 - u64::from(rhs),
             Self::MODULUS_U64,
         ) as u32
     }
 
+    /// Negates a canonical residue.
+    ///
+    /// `value` must be less than `MODULUS`. The result is canonical.
     #[inline(always)]
     #[must_use]
-    pub fn neg(&self, value: u32) -> u32 {
+    pub fn neg_canonical(&self, value: u32) -> u32 {
         let negated = MODULUS - value;
         negated & 0u32.wrapping_sub(u32::from(value != 0))
     }
 
+    /// Multiplies two arbitrary `u32` values and returns a canonical residue.
     #[inline(always)]
     #[must_use]
     pub fn mul(&self, lhs: u32, rhs: u32) -> u32 {
         (u64::from(lhs) * u64::from(rhs) % Self::MODULUS_U64) as u32
     }
 
+    /// Squares an arbitrary `u32` value and returns a canonical residue.
     #[inline(always)]
     #[must_use]
     pub fn square(&self, value: u32) -> u32 {
@@ -297,57 +314,71 @@ impl<const MODULUS: u32> PrimeField<MODULUS> {
         result
     }
 
+    /// Raises an arbitrary `u32` value to `exponent` and returns a canonical residue.
     #[must_use]
     pub fn pow(&self, base: u32, exponent: u64) -> u32 {
         let base = Self::to_montgomery(base);
         Self::from_montgomery(Self::pow_montgomery(base, exponent))
     }
 
-    /// Returns the multiplicative inverse of `value`.
+    /// Returns the multiplicative inverse of an arbitrary `u32` representation.
+    ///
+    /// The result is canonical. Every representable multiple of `MODULUS` is a
+    /// representation of zero and is rejected.
     ///
     /// # Errors
     ///
-    /// Returns [`FieldError::DivisionByZero`] when `value` is zero.
+    /// Returns [`FieldError::DivisionByZero`] when `value mod MODULUS` is zero.
     pub fn inv(&self, value: u32) -> Result<u32, FieldError> {
+        let value = Self::to_montgomery(value);
         if value == 0 {
             return Err(FieldError::DivisionByZero);
         }
-        Ok(self.pow(value, u64::from(MODULUS - 2)))
+        Ok(Self::from_montgomery(Self::pow_montgomery(
+            value,
+            u64::from(MODULUS - 2),
+        )))
     }
 
-    /// Adds `rhs` element-wise into `lhs` without allocating.
+    /// Adds canonical `rhs` residues element-wise into canonical `lhs` residues.
+    ///
+    /// Every input must be less than `MODULUS`. Results are canonical and the
+    /// operation allocates no memory.
     ///
     /// # Errors
     ///
     /// Returns [`FieldError::LengthMismatch`] when the slices have different lengths.
-    pub fn add_assign(&self, lhs: &mut [u32], rhs: &[u32]) -> Result<(), FieldError> {
+    pub fn add_assign_canonical(&self, lhs: &mut [u32], rhs: &[u32]) -> Result<(), FieldError> {
         if lhs.len() != rhs.len() {
             return Err(FieldError::LengthMismatch);
         }
 
         for (lhs, &rhs) in lhs.iter_mut().zip(rhs) {
-            *lhs = self.add(*lhs, rhs);
+            *lhs = self.add_canonical(*lhs, rhs);
         }
         Ok(())
     }
 
-    /// Subtracts `rhs` element-wise from `lhs` without allocating.
+    /// Subtracts canonical `rhs` residues from canonical `lhs` residues.
+    ///
+    /// Every input must be less than `MODULUS`. Results are canonical and the
+    /// operation allocates no memory.
     ///
     /// # Errors
     ///
     /// Returns [`FieldError::LengthMismatch`] when the slices have different lengths.
-    pub fn sub_assign(&self, lhs: &mut [u32], rhs: &[u32]) -> Result<(), FieldError> {
+    pub fn sub_assign_canonical(&self, lhs: &mut [u32], rhs: &[u32]) -> Result<(), FieldError> {
         if lhs.len() != rhs.len() {
             return Err(FieldError::LengthMismatch);
         }
 
         for (lhs, &rhs) in lhs.iter_mut().zip(rhs) {
-            *lhs = self.sub(*lhs, rhs);
+            *lhs = self.sub_canonical(*lhs, rhs);
         }
         Ok(())
     }
 
-    /// Multiplies `lhs` element-wise by `rhs` without allocating.
+    /// Multiplies arbitrary `u32` values element-wise and canonicalizes `lhs`.
     ///
     /// # Errors
     ///
@@ -363,13 +394,20 @@ impl<const MODULUS: u32> PrimeField<MODULUS> {
         Ok(())
     }
 
-    pub fn neg_assign(&self, values: &mut [u32]) {
+    /// Negates canonical residues in place.
+    ///
+    /// Every input must be less than `MODULUS`. Results are canonical.
+    pub fn neg_assign_canonical(&self, values: &mut [u32]) {
         for value in values {
-            *value = self.neg(*value);
+            *value = self.neg_canonical(*value);
         }
     }
 
-    pub fn scalar_mul_assign(&self, values: &mut [u32], scalar: u32) {
+    /// Multiplies canonical residues by a canonical scalar in place.
+    ///
+    /// Every input and `scalar` must be less than `MODULUS`. Results are
+    /// canonical.
+    pub fn scalar_mul_assign_canonical(&self, values: &mut [u32], scalar: u32) {
         let shoup = (u64::from(scalar) << 32) / Self::MODULUS_U64;
         for value in values {
             let product = u64::from(*value) * u64::from(scalar);
@@ -379,12 +417,14 @@ impl<const MODULUS: u32> PrimeField<MODULUS> {
         }
     }
 
-    /// Computes the dot product of two slices.
+    /// Computes the dot product of two canonical-residue slices.
+    ///
+    /// Every input must be less than `MODULUS`. The result is canonical.
     ///
     /// # Errors
     ///
     /// Returns [`FieldError::LengthMismatch`] when the slices have different lengths.
-    pub fn dot(&self, lhs: &[u32], rhs: &[u32]) -> Result<u32, FieldError> {
+    pub fn dot_canonical(&self, lhs: &[u32], rhs: &[u32]) -> Result<u32, FieldError> {
         if lhs.len() != rhs.len() {
             return Err(FieldError::LengthMismatch);
         }
@@ -439,17 +479,20 @@ impl<const MODULUS: u32> PrimeField<MODULUS> {
     /// Inverts all values using one exponentiation and approximately three
     /// multiplications per value.
     ///
+    /// Inputs may use any `u32` representation. Successful output is canonical.
+    ///
     /// # Errors
     ///
-    /// Returns [`FieldError::DivisionByZero`] when any value is zero.
+    /// Returns [`FieldError::DivisionByZero`] when any value is zero modulo
+    /// `MODULUS`. The check completes before any value is changed.
     pub fn batch_inv_assign(&self, values: &mut [u32]) -> Result<(), FieldError> {
-        if values.contains(&0) {
-            return Err(FieldError::DivisionByZero);
-        }
         if values.is_empty() {
             return Ok(());
         }
         if MODULUS == 2 {
+            if values.iter().any(|value| value & 1 == 0) {
+                return Err(FieldError::DivisionByZero);
+            }
             // MONTGOMERY_ONE is zero for this modulus, so the Montgomery
             // seeding below cannot represent the identity.
             values.fill(1);
@@ -459,7 +502,11 @@ impl<const MODULUS: u32> PrimeField<MODULUS> {
         let mut prefixes = Vec::with_capacity(values.len());
         let mut product = Self::MONTGOMERY_ONE;
         for &value in values.iter() {
-            product = Self::montgomery_mul(product, Self::to_montgomery(value));
+            let value = Self::to_montgomery(value);
+            if value == 0 {
+                return Err(FieldError::DivisionByZero);
+            }
+            product = Self::montgomery_mul(product, value);
             prefixes.push(product);
         }
 
