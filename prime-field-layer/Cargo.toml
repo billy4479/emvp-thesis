@@ -80,6 +80,10 @@ name = "field"
 harness = false
 
 [[bench]]
+name = "arithmetic_kernels"
+harness = false
+
+[[bench]]
 name = "dynamic_ntt"
 harness = false
 
