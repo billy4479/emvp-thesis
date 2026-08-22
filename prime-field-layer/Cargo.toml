@@ -67,11 +67,13 @@ allow_attributes = "warn"
 allow_attributes_without_reason = "warn"
 
 [dependencies]
+rand_core = { version = "0.9", default-features = false }
 
 [dev-dependencies]
 bench-common = { path = "benches/common" }
 criterion = "0.5"
 proptest = "1"
+rand_chacha = { version = "0.9", default-features = false }
 
 [[bench]]
 name = "field"

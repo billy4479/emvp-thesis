@@ -412,6 +412,8 @@ dependencies = [
  "bench-common",
  "criterion",
  "proptest",
+ "rand_chacha",
+ "rand_core",
 ]
 
 [[package]]

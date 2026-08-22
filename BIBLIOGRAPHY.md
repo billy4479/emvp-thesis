@@ -24,3 +24,20 @@
   [Lecture notes](https://math.mit.edu/classes/18.783/2019/LectureNotes4.pdf).
   Used for polynomial reversal, truncated inverse, and fast Euclidean division
   in fixed monic reduction.
+- Daniel Lemire, "Fast Random Integer Generation in an Interval," *ACM
+  Transactions on Modeling and Computer Simulation* 29.1 (2019), article 3.
+  [doi:10.1145/3230636](https://doi.org/10.1145/3230636).
+  Used for the unbiased reduction of fixed-width random words to a bounded
+  integer by rejecting the incomplete range.
+
+## Dependency notes
+
+- `rand_core` 0.9.5 supplies the maintained `RngCore` and `CryptoRng` traits for
+  caller-owned cryptographic RNGs. It is used without default features, so the
+  library gains no OS RNG or implicit seeding. The crate is dual-licensed under
+  MIT or Apache-2.0.
+  [crate documentation](https://docs.rs/rand_core/0.9.5/rand_core/).
+- `rand_chacha` 0.9.0 is a development-only dependency used for reproducible
+  sampling tests. It is dual-licensed under MIT or Apache-2.0 and does not form
+  part of the library API.
+  [crate documentation](https://docs.rs/rand_chacha/0.9.0/rand_chacha/).
