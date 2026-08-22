@@ -41,6 +41,20 @@
 //! # Ok::<(), prime_field_layer::FieldError>(())
 //! ```
 //!
+//! # Repeated linear products with one fixed operand
+//!
+//! ```
+//! use prime_field_layer::NttPlan;
+//!
+//! let plan = NttPlan::<17>::new(8)?;
+//! let fixed = plan.pretransform_linear_operand(&[1, 2, 3])?;
+//! let mut workspace = fixed.workspace();
+//! let mut output = [0; 5];
+//! fixed.convolve(&[4, 5, 6], &mut output, &mut workspace)?;
+//! assert_eq!(output, [4, 13, 11, 10, 1]);
+//! # Ok::<(), prime_field_layer::FieldError>(())
+//! ```
+//!
 //! # Negacyclic and one-shot linear convolution
 //!
 //! ```
@@ -192,6 +206,27 @@ pub struct NttPlan<const MODULUS: u32> {
     stages: Vec<Stage>,
     backend: NttBackend,
     warning: Option<NttPerformanceWarning>,
+}
+
+/// One natural-order operand transformed for repeated linear convolutions.
+///
+/// This value borrows the [`NttPlan`] that transformed it. Its private frequency
+/// storage therefore remains tied to the field modulus, transform length, root
+/// convention, bit-reversed ordering, and backend that subsequent calls use.
+/// Construction allocates and transforms one plan-length buffer once.
+pub struct PretransformedLinearOperand<'plan, const MODULUS: u32> {
+    plan: &'plan NttPlan<MODULUS>,
+    values: Vec<FieldElement<MODULUS>>,
+    coefficient_length: usize,
+}
+
+/// Reusable work storage for [`PretransformedLinearOperand::convolve`].
+///
+/// Construct this with [`PretransformedLinearOperand::workspace`]. Allocation
+/// occurs once at construction; convolution calls only overwrite the retained
+/// plan-length buffer.
+pub struct LinearConvolutionWorkspace<const MODULUS: u32> {
+    values: Vec<FieldElement<MODULUS>>,
 }
 
 impl<const MODULUS: u32> NttPlan<MODULUS> {
@@ -347,6 +382,44 @@ impl<const MODULUS: u32> NttPlan<MODULUS> {
             .collect()
     }
 
+    /// Transforms one operand for repeated allocation-free linear convolution.
+    ///
+    /// `operand` is interpreted in natural coefficient order and may contain
+    /// unreduced values. It is zero-padded to this plan's length and transformed
+    /// once. The returned value borrows this plan so its transform-domain data
+    /// cannot be used with a plan having another length, root convention, or
+    /// ordering.
+    ///
+    /// Construct a [`LinearConvolutionWorkspace`] from the returned value, then
+    /// reuse both with [`PretransformedLinearOperand::convolve`]. Construction
+    /// allocates one plan-length vector and takes `O(N log N)` time.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FieldError::ConvolutionLengthOverflow`] if rounding the operand
+    /// length to a transform length overflows, and [`FieldError::PlanTooSmall`]
+    /// if the padded operand does not fit this plan. An empty operand is valid
+    /// and preserves the empty-result semantics of [`Self::linear_convolution`].
+    pub fn pretransform_linear_operand(
+        &self,
+        operand: &[u32],
+    ) -> Result<PretransformedLinearOperand<'_, MODULUS>, FieldError> {
+        if !operand.is_empty() {
+            self.check_convolution_capacity(operand.len())?;
+        }
+
+        let mut values = vec![self.field.element_u32(0); self.length];
+        for (output, &value) in values.iter_mut().zip(operand) {
+            *output = self.field.element_u32(value);
+        }
+        self.forward(&mut values)?;
+        Ok(PretransformedLinearOperand {
+            plan: self,
+            values,
+            coefficient_length: operand.len(),
+        })
+    }
+
     /// Applies the forward Cooley-Tukey NTT in place.
     ///
     /// For `omega = PrimeField::root_of_unity(N)`, natural-order input `x[j]`
@@ -488,15 +561,7 @@ impl<const MODULUS: u32> NttPlan<MODULUS> {
             return Ok(Vec::new());
         }
         let result_length = convolution_result_length(lhs.len(), rhs.len())?;
-        let required_transform = result_length
-            .checked_next_power_of_two()
-            .ok_or(FieldError::ConvolutionLengthOverflow)?;
-        if required_transform > self.length {
-            return Err(FieldError::PlanTooSmall {
-                required: required_transform,
-                available: self.length,
-            });
-        }
+        self.check_convolution_capacity(result_length)?;
         let mut lhs_elements = vec![self.field.element_u32(0); self.length];
         let mut rhs_elements = vec![self.field.element_u32(0); self.length];
         for (output, &value) in lhs_elements.iter_mut().zip(lhs) {
@@ -553,6 +618,20 @@ impl<const MODULUS: u32> NttPlan<MODULUS> {
             Ok(())
         } else {
             Err(FieldError::LengthMismatch)
+        }
+    }
+
+    fn check_convolution_capacity(&self, result_length: usize) -> Result<(), FieldError> {
+        let required = result_length
+            .checked_next_power_of_two()
+            .ok_or(FieldError::ConvolutionLengthOverflow)?;
+        if required > self.length {
+            Err(FieldError::PlanTooSmall {
+                required,
+                available: self.length,
+            })
+        } else {
+            Ok(())
         }
     }
 
@@ -698,6 +777,98 @@ impl<const MODULUS: u32> NttPlan<MODULUS> {
                 }
             }
         }
+    }
+}
+
+impl<const MODULUS: u32> PretransformedLinearOperand<'_, MODULUS> {
+    /// Returns the number of coefficients in the fixed operand.
+    #[must_use]
+    pub const fn len(&self) -> usize {
+        self.coefficient_length
+    }
+
+    /// Returns whether the fixed operand has no coefficients.
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.coefficient_length == 0
+    }
+
+    /// Returns the plan length retained by this pretransformed operand.
+    #[must_use]
+    pub const fn transform_len(&self) -> usize {
+        self.plan.len()
+    }
+
+    /// Allocates work storage suitable for repeated calls to [`Self::convolve`].
+    #[must_use]
+    pub fn workspace(&self) -> LinearConvolutionWorkspace<MODULUS> {
+        LinearConvolutionWorkspace {
+            values: vec![self.plan.field.element_u32(0); self.plan.len()],
+        }
+    }
+
+    /// Returns the linear-convolution output length for an input length.
+    ///
+    /// Either empty operand produces length zero. For nonempty operands, this
+    /// also checks that the product fits the retained transform length.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FieldError::ConvolutionLengthOverflow`] if the result or rounded
+    /// transform length overflows, and [`FieldError::PlanTooSmall`] if this plan
+    /// cannot hold the zero-padded product.
+    pub fn output_len(&self, input_length: usize) -> Result<usize, FieldError> {
+        if self.is_empty() || input_length == 0 {
+            return Ok(0);
+        }
+        let result_length = convolution_result_length(self.len(), input_length)?;
+        self.plan.check_convolution_capacity(result_length)?;
+        Ok(result_length)
+    }
+
+    /// Convolves an input with this fixed operand into caller-provided output.
+    ///
+    /// Inputs use natural coefficient order and may be unreduced. For nonempty
+    /// lengths `m` and `n`, `output` must have exactly `m + n - 1` elements.
+    /// Empty input or an empty fixed operand requires empty output. Zero padding
+    /// gives the same linear, non-wrapping semantics as
+    /// [`NttPlan::linear_convolution`].
+    ///
+    /// After [`Self::workspace`] has allocated the work vector, this method
+    /// allocates nothing. It performs one forward transform, one pointwise
+    /// multiplication, and one inverse transform. The fixed transform is reused.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FieldError::LengthMismatch`] before mutation if `output` has the
+    /// wrong result length or `workspace` was made for another transform length.
+    /// Capacity and overflow errors match [`Self::output_len`].
+    pub fn convolve(
+        &self,
+        input: &[u32],
+        output: &mut [u32],
+        workspace: &mut LinearConvolutionWorkspace<MODULUS>,
+    ) -> Result<(), FieldError> {
+        let output_length = self.output_len(input.len())?;
+        if output.len() != output_length || workspace.values.len() != self.plan.len() {
+            return Err(FieldError::LengthMismatch);
+        }
+        if output_length == 0 {
+            return Ok(());
+        }
+
+        workspace.values.fill(self.plan.field.element_u32(0));
+        for (element, &value) in workspace.values.iter_mut().zip(input) {
+            *element = self.plan.field.element_u32(value);
+        }
+        self.plan.forward(&mut workspace.values)?;
+        self.plan
+            .pointwise_mul_assign(&mut workspace.values, &self.values)?;
+        self.plan.inverse(&mut workspace.values)?;
+        for (output, value) in output.iter_mut().zip(&workspace.values) {
+            *output = value.value();
+        }
+        Ok(())
     }
 }
 

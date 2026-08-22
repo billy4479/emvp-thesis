@@ -187,9 +187,63 @@ fn convolutions(c: &mut Criterion) {
     group.finish();
 }
 
+fn fixed_operand_convolutions(c: &mut Criterion) {
+    // A fixed Toeplitz matrix reduces to convolution with fixed diagonal data;
+    // repeated calls vary only the input vector and reuse the transformed data.
+    let mut group = c.benchmark_group("fixed_operand_linear_convolution_p998244353");
+    common::tune_group(
+        &mut group,
+        20,
+        Duration::from_secs(1),
+        Duration::from_secs(2),
+    );
+    let lengths: &[(usize, usize)] = if common::is_quick() {
+        &[(257, 256), (2_049, 2_048)]
+    } else {
+        &[(65, 64), (257, 256), (1_025, 1_024), (4_097, 4_096)]
+    };
+
+    for &(fixed_length, input_length) in lengths {
+        let output_length = fixed_length + input_length - 1;
+        let transform_length = output_length.next_power_of_two();
+        let fixed = common::values(fixed_length, 998_244_353, 97);
+        let input = common::values(input_length, 998_244_353, 12_345);
+        let plan = NttPlan::<998_244_353>::new(transform_length).unwrap();
+        let prepared = plan.pretransform_linear_operand(&fixed).unwrap();
+        let mut workspace = prepared.workspace();
+        let mut output = vec![0; output_length];
+        group.throughput(Throughput::Elements(output_length as u64));
+
+        group.bench_function(
+            BenchmarkId::new("convenience_allocating", transform_length),
+            |b| {
+                b.iter(|| {
+                    plan.linear_convolution(black_box(&fixed), black_box(&input))
+                        .unwrap()
+                });
+            },
+        );
+        group.bench_function(
+            BenchmarkId::new("pretransformed_allocation_free", transform_length),
+            |b| {
+                b.iter(|| {
+                    prepared
+                        .convolve(
+                            black_box(&input),
+                            black_box(&mut output),
+                            black_box(&mut workspace),
+                        )
+                        .unwrap();
+                });
+            },
+        );
+    }
+    group.finish();
+}
+
 criterion_group! {
     name = benches;
     config = common::criterion_tuned(20, Duration::from_secs(1), Duration::from_secs(2));
-    targets = plan_construction, transforms, convolutions
+    targets = plan_construction, transforms, convolutions, fixed_operand_convolutions
 }
 criterion_main!(benches);
