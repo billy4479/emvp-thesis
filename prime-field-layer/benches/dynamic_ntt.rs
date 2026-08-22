@@ -19,6 +19,9 @@ fn plan_construction(c: &mut Criterion) {
         group.bench_function(BenchmarkId::new("p998244353", length), |b| {
             b.iter(|| NttPlan::<998_244_353>::new(black_box(length)).unwrap());
         });
+        group.bench_function(BenchmarkId::new("p2013265921", length), |b| {
+            b.iter(|| NttPlan::<2_013_265_921>::new(black_box(length)).unwrap());
+        });
         if !common::is_quick() {
             group.bench_function(BenchmarkId::new("p2281701377", length), |b| {
                 b.iter(|| NttPlan::<2_281_701_377>::new(black_box(length)).unwrap());
@@ -32,9 +35,13 @@ fn plan_cloning(c: &mut Criterion) {
     let mut group = c.benchmark_group("ntt_plan_clone");
     for length in [256, 4_096, 65_536] {
         let plan = NttPlan::<998_244_353>::new(length).unwrap();
+        let tight_plan = NttPlan::<2_013_265_921>::new(length).unwrap();
         group.throughput(Throughput::Elements(length as u64));
         group.bench_function(BenchmarkId::new("p998244353", length), |b| {
             b.iter(|| black_box(black_box(&plan).clone()));
+        });
+        group.bench_function(BenchmarkId::new("p2013265921", length), |b| {
+            b.iter(|| black_box(black_box(&tight_plan).clone()));
         });
     }
     group.finish();
@@ -197,10 +204,10 @@ fn convolutions(c: &mut Criterion) {
     group.finish();
 }
 
-fn fixed_operand_convolutions(c: &mut Criterion) {
+fn fixed_operand_convolutions_for_modulus<const MODULUS: u32>(c: &mut Criterion) {
     // A fixed Toeplitz matrix reduces to convolution with fixed diagonal data;
     // repeated calls vary only the input vector and reuse the transformed data.
-    let mut group = c.benchmark_group("fixed_operand_linear_convolution_p998244353");
+    let mut group = c.benchmark_group(format!("fixed_operand_linear_convolution_p{MODULUS}"));
     common::tune_group(
         &mut group,
         20,
@@ -216,9 +223,9 @@ fn fixed_operand_convolutions(c: &mut Criterion) {
     for &(fixed_length, input_length) in lengths {
         let output_length = fixed_length + input_length - 1;
         let transform_length = output_length.next_power_of_two();
-        let fixed = common::values(fixed_length, 998_244_353, 97);
-        let input = common::values(input_length, 998_244_353, 12_345);
-        let plan = NttPlan::<998_244_353>::new(transform_length).unwrap();
+        let fixed = common::values(fixed_length, MODULUS, 97);
+        let input = common::values(input_length, MODULUS, 12_345);
+        let plan = NttPlan::<MODULUS>::new(transform_length).unwrap();
         let prepared = plan.pretransform_linear_operand(&fixed).unwrap();
         let mut workspace = prepared.workspace();
         let mut output = vec![0; output_length];
@@ -249,6 +256,11 @@ fn fixed_operand_convolutions(c: &mut Criterion) {
         );
     }
     group.finish();
+}
+
+fn fixed_operand_convolutions(c: &mut Criterion) {
+    fixed_operand_convolutions_for_modulus::<998_244_353>(c);
+    fixed_operand_convolutions_for_modulus::<2_013_265_921>(c);
 }
 
 criterion_group! {

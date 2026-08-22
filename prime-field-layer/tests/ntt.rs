@@ -49,8 +49,8 @@ fn oracle_linear<const MODULUS: u32>(lhs: &[u32], rhs: &[u32]) -> Vec<u32> {
     for (lhs_index, &lhs) in lhs.iter().enumerate() {
         for (rhs_index, &rhs) in rhs.iter().enumerate() {
             let index = lhs_index + rhs_index;
-            result[index] =
-                ((result[index] as u64 + lhs as u64 * rhs as u64) % MODULUS as u64) as u32;
+            result[index] = ((u128::from(result[index]) + u128::from(lhs) * u128::from(rhs))
+                % u128::from(MODULUS)) as u32;
         }
     }
     result
@@ -290,6 +290,42 @@ fn convolution_variants_match_independent_oracles() {
     check_convolutions::<998_244_353>();
     check_convolutions::<2_013_265_921>();
     check_convolutions::<2_281_701_377>();
+}
+
+#[test]
+fn tight_prime_rectangular_linear_convolution_matches_full_width_schoolbook_oracle() {
+    const MODULUS: u32 = 2_013_265_921;
+    const BOUNDARIES: [u32; 7] = [
+        0,
+        1,
+        MODULUS - 1,
+        MODULUS,
+        MODULUS + 1,
+        u32::MAX - 1,
+        u32::MAX,
+    ];
+    let lhs: Vec<_> = (0..97)
+        .map(|index| {
+            BOUNDARIES
+                .get(index)
+                .copied()
+                .unwrap_or_else(|| (index as u32).wrapping_mul(2_654_435_761).wrapping_add(97))
+        })
+        .collect();
+    let rhs: Vec<_> = (0..65)
+        .map(|index| {
+            BOUNDARIES.get(index).copied().unwrap_or_else(|| {
+                (index as u32)
+                    .wrapping_mul(1_103_515_245)
+                    .wrapping_add(12_345)
+            })
+        })
+        .collect();
+
+    assert_eq!(
+        linear_convolution::<MODULUS>(&lhs, &rhs).unwrap(),
+        oracle_linear::<MODULUS>(&lhs, &rhs)
+    );
 }
 
 #[test]
