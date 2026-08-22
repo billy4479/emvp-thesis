@@ -1,6 +1,14 @@
-use crate::{FieldElement, FieldError, NttPlan, PrimeField, StaticNttPlan};
+mod backend;
+mod construction;
+mod ntt;
+
+use crate::{FieldElement, PrimeField};
 
 use super::ExtensionFieldError;
+
+#[doc(hidden)]
+pub use backend::{DynamicReductionNtt, ReductionNtt, StaticReductionNtt};
+use ntt::NttReduction;
 
 /// Extension products at or below this degree use schoolbook code.
 ///
@@ -14,82 +22,6 @@ pub const SCHOOLBOOK_EXTENSION_DEGREE: usize = 23;
 pub enum PolynomialAlgorithm {
     Schoolbook,
     Ntt { transform_length: usize },
-}
-
-#[doc(hidden)]
-pub trait ReductionNtt<const MODULUS: u32> {
-    fn forward(&self, values: &mut [FieldElement<MODULUS>]) -> Result<(), FieldError>;
-    fn inverse(&self, values: &mut [FieldElement<MODULUS>]) -> Result<(), FieldError>;
-    fn pointwise_mul_assign(
-        &self,
-        lhs: &mut [FieldElement<MODULUS>],
-        rhs: &[FieldElement<MODULUS>],
-    ) -> Result<(), FieldError>;
-}
-
-/// Dynamic transform backend used by the default polynomial reduction plan.
-#[doc(hidden)]
-pub struct DynamicReductionNtt<const MODULUS: u32>(NttPlan<MODULUS>);
-
-impl<const MODULUS: u32> ReductionNtt<MODULUS> for DynamicReductionNtt<MODULUS> {
-    fn forward(&self, values: &mut [FieldElement<MODULUS>]) -> Result<(), FieldError> {
-        self.0.forward(values)
-    }
-
-    fn inverse(&self, values: &mut [FieldElement<MODULUS>]) -> Result<(), FieldError> {
-        self.0.inverse(values)
-    }
-
-    fn pointwise_mul_assign(
-        &self,
-        lhs: &mut [FieldElement<MODULUS>],
-        rhs: &[FieldElement<MODULUS>],
-    ) -> Result<(), FieldError> {
-        self.0.pointwise_mul_assign(lhs, rhs)
-    }
-}
-
-/// Compile-time transform backend used by [`StaticPolynomialReductionPlan`].
-#[doc(hidden)]
-pub struct StaticReductionNtt<const MODULUS: u32, const N: usize>(StaticNttPlan<MODULUS, N>);
-
-impl<const MODULUS: u32, const N: usize> ReductionNtt<MODULUS> for StaticReductionNtt<MODULUS, N> {
-    fn forward(&self, values: &mut [FieldElement<MODULUS>]) -> Result<(), FieldError> {
-        let values = values
-            .try_into()
-            .map_err(|_slice| FieldError::LengthMismatch)?;
-        self.0.forward(values);
-        Ok(())
-    }
-
-    fn inverse(&self, values: &mut [FieldElement<MODULUS>]) -> Result<(), FieldError> {
-        let values = values
-            .try_into()
-            .map_err(|_slice| FieldError::LengthMismatch)?;
-        self.0.inverse(values);
-        Ok(())
-    }
-
-    fn pointwise_mul_assign(
-        &self,
-        lhs: &mut [FieldElement<MODULUS>],
-        rhs: &[FieldElement<MODULUS>],
-    ) -> Result<(), FieldError> {
-        let lhs = lhs
-            .try_into()
-            .map_err(|_slice| FieldError::LengthMismatch)?;
-        let rhs = rhs
-            .try_into()
-            .map_err(|_slice| FieldError::LengthMismatch)?;
-        self.0.pointwise_mul_assign(lhs, rhs);
-        Ok(())
-    }
-}
-
-struct NttReduction<const MODULUS: u32, Ntt> {
-    plan: Ntt,
-    reversed_inverse: Vec<FieldElement<MODULUS>>,
-    modulus: Vec<FieldElement<MODULUS>>,
 }
 
 /// Reusable reduction data for one fixed monic degree-`K` polynomial.
@@ -138,114 +70,6 @@ pub struct PolynomialReductionScratch<const MODULUS: u32, const K: usize> {
 /// ```
 pub type StaticPolynomialReductionPlan<const MODULUS: u32, const K: usize, const N: usize> =
     PolynomialReductionPlan<MODULUS, K, StaticReductionNtt<MODULUS, N>>;
-
-impl<const MODULUS: u32, const K: usize>
-    PolynomialReductionPlan<MODULUS, K, DynamicReductionNtt<MODULUS>>
-{
-    /// Validates and precomputes reduction for a fixed monic modulus polynomial.
-    ///
-    /// This does not test irreducibility because polynomial reduction is valid in
-    /// any monic quotient ring. [`super::ExtensionField::new`] adds that check.
-    ///
-    /// # Errors
-    ///
-    /// Returns a validation error for degree zero, a coefficient-count mismatch,
-    /// or nonmonicity. Large degrees can also return an NTT construction error.
-    pub fn new(modulus: &[u32]) -> Result<Self, ExtensionFieldError> {
-        Self::from_canonical(validate_modulus::<MODULUS, K>(modulus)?)
-    }
-
-    pub(super) fn from_canonical(modulus: Vec<u32>) -> Result<Self, ExtensionFieldError> {
-        let field = PrimeField::<MODULUS>::new();
-        let negative_modulus = modulus[..K]
-            .iter()
-            .map(|&coefficient| field.element_u32(field.neg_canonical(coefficient)))
-            .collect();
-        let (algorithm, ntt) = if K <= SCHOOLBOOK_EXTENSION_DEGREE {
-            (PolynomialAlgorithm::Schoolbook, None)
-        } else {
-            let product_length = product_len::<K>()?;
-            let transform_length = product_length
-                .checked_next_power_of_two()
-                .ok_or(crate::FieldError::ConvolutionLengthOverflow)?;
-            let plan = DynamicReductionNtt(NttPlan::<MODULUS>::new(transform_length)?);
-            let inverse = reversed_inverse::<MODULUS>(&modulus, K.saturating_sub(1));
-            let mut reversed_inverse = padded_elements(field, &inverse, transform_length);
-            let mut transformed_modulus = padded_elements(field, &modulus, transform_length);
-            plan.forward(&mut reversed_inverse)?;
-            plan.forward(&mut transformed_modulus)?;
-            (
-                PolynomialAlgorithm::Ntt { transform_length },
-                Some(NttReduction {
-                    plan,
-                    reversed_inverse,
-                    modulus: transformed_modulus,
-                }),
-            )
-        };
-        Ok(Self {
-            field,
-            modulus,
-            negative_modulus,
-            algorithm,
-            ntt,
-        })
-    }
-}
-
-impl<const MODULUS: u32, const K: usize, const N: usize>
-    PolynomialReductionPlan<MODULUS, K, StaticReductionNtt<MODULUS, N>>
-{
-    /// Validates and precomputes reduction using a compile-time NTT length.
-    ///
-    /// `N` must equal `next_power_of_two(2K - 1)`. Invalid static dimensions
-    /// fail during constant evaluation.
-    ///
-    /// # Errors
-    ///
-    /// Returns a validation error for degree zero, a coefficient-count mismatch,
-    /// or nonmonicity.
-    pub fn new(modulus: &[u32]) -> Result<Self, ExtensionFieldError> {
-        Self::from_canonical(validate_modulus::<MODULUS, K>(modulus)?)
-    }
-
-    pub(super) fn from_canonical(modulus: Vec<u32>) -> Result<Self, ExtensionFieldError> {
-        const {
-            assert!(
-                K > SCHOOLBOOK_EXTENSION_DEGREE,
-                "static NTT reduction requires an NTT-dispatched extension degree"
-            );
-            assert!(
-                N == static_transform_len(K),
-                "static NTT length must equal next_power_of_two(2K - 1)"
-            );
-        }
-        let field = PrimeField::<MODULUS>::new();
-        let negative_modulus = modulus[..K]
-            .iter()
-            .map(|&coefficient| field.element_u32(field.neg_canonical(coefficient)))
-            .collect();
-        let plan = StaticReductionNtt(StaticNttPlan::<MODULUS, N>::new()?);
-        let inverse = reversed_inverse::<MODULUS>(&modulus, K - 1);
-        let mut reversed_inverse = padded_elements(field, &inverse, N);
-        let mut transformed_modulus = padded_elements(field, &modulus, N);
-        plan.forward(&mut reversed_inverse)?;
-        plan.forward(&mut transformed_modulus)?;
-        Ok(Self {
-            field,
-            modulus,
-            negative_modulus,
-            algorithm: PolynomialAlgorithm::Ntt {
-                transform_length: N,
-            },
-            ntt: Some(NttReduction {
-                plan,
-                reversed_inverse,
-                modulus: transformed_modulus,
-            }),
-        })
-    }
-}
 
 impl<const MODULUS: u32, const K: usize, Ntt> PolynomialReductionPlan<MODULUS, K, Ntt>
 where
@@ -319,36 +143,6 @@ where
         }
     }
 
-    pub(super) fn convolve(
-        &self,
-        lhs: &mut [FieldElement<MODULUS>],
-        rhs: &mut [FieldElement<MODULUS>],
-    ) -> Result<(), ExtensionFieldError> {
-        let Some(ntt) = &self.ntt else {
-            return Ok(());
-        };
-        ntt.plan
-            .forward(lhs)
-            .and_then(|()| ntt.plan.forward(rhs))
-            .and_then(|()| ntt.plan.pointwise_mul_assign(lhs, rhs))
-            .and_then(|()| ntt.plan.inverse(lhs))
-            .map_err(ExtensionFieldError::from)
-    }
-
-    pub(super) fn square_convolution(
-        &self,
-        values: &mut [FieldElement<MODULUS>],
-    ) -> Result<(), ExtensionFieldError> {
-        let Some(ntt) = &self.ntt else {
-            return Ok(());
-        };
-        ntt.plan.forward(values)?;
-        for value in values.iter_mut() {
-            *value = value.square();
-        }
-        ntt.plan.inverse(values).map_err(ExtensionFieldError::from)
-    }
-
     pub(super) fn reduce_elements(
         &self,
         output: &mut [u32; K],
@@ -375,40 +169,6 @@ where
         for (output, value) in output.iter_mut().zip(values.iter()) {
             *output = value.value();
         }
-    }
-
-    fn reduce_ntt(
-        output: &mut [u32; K],
-        scratch: &mut PolynomialReductionScratch<MODULUS, K>,
-        ntt: &NttReduction<MODULUS, Ntt>,
-    ) -> Result<(), ExtensionFieldError> {
-        let zero = PrimeField::<MODULUS>::new().element_u32(0);
-        scratch.work.fill(zero);
-        for index in 0..K - 1 {
-            scratch.work[index] = scratch.values[2 * K - 2 - index];
-        }
-        ntt.plan
-            .forward(&mut scratch.work)
-            .and_then(|()| {
-                ntt.plan
-                    .pointwise_mul_assign(&mut scratch.work, &ntt.reversed_inverse)
-            })
-            .and_then(|()| ntt.plan.inverse(&mut scratch.work))?;
-
-        scratch.work[..K - 1].reverse();
-        scratch.work[K - 1..].fill(zero);
-        ntt.plan
-            .forward(&mut scratch.work)
-            .and_then(|()| {
-                ntt.plan
-                    .pointwise_mul_assign(&mut scratch.work, &ntt.modulus)
-            })
-            .and_then(|()| ntt.plan.inverse(&mut scratch.work))?;
-
-        for (index, output) in output.iter_mut().enumerate() {
-            *output = (scratch.values[index] - scratch.work[index]).value();
-        }
-        Ok(())
     }
 }
 
@@ -447,36 +207,4 @@ fn product_len<const K: usize>() -> Result<usize, ExtensionFieldError> {
 
 const fn static_transform_len(degree: usize) -> usize {
     (degree * 2 - 1).next_power_of_two()
-}
-
-fn padded_elements<const MODULUS: u32>(
-    field: PrimeField<MODULUS>,
-    coefficients: &[u32],
-    length: usize,
-) -> Vec<FieldElement<MODULUS>> {
-    let mut result = vec![field.element_u32(0); length];
-    for (target, &coefficient) in result.iter_mut().zip(coefficients) {
-        *target = field.element_u32(coefficient);
-    }
-    result
-}
-
-fn reversed_inverse<const MODULUS: u32>(modulus: &[u32], length: usize) -> Vec<u32> {
-    let field = PrimeField::<MODULUS>::new();
-    let mut inverse = vec![0; length];
-    if length == 0 {
-        return inverse;
-    }
-    inverse[0] = 1;
-    for degree in 1..length {
-        let mut sum = 0;
-        for index in 1..=degree.min(modulus.len() - 1) {
-            sum = field.add_canonical(
-                sum,
-                field.mul(modulus[modulus.len() - 1 - index], inverse[degree - index]),
-            );
-        }
-        inverse[degree] = field.neg_canonical(sum);
-    }
-    inverse
 }
