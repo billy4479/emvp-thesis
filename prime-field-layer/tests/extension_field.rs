@@ -4,6 +4,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use prime_field_layer::{
     ExtensionField, ExtensionFieldError, PolynomialAlgorithm, PolynomialReductionPlan,
+    StaticExtensionField, StaticPolynomialReductionPlan,
 };
 
 struct CountingAllocator;
@@ -201,6 +202,59 @@ fn ntt_reduction_multiplication_and_squaring_match_slow_oracle() {
         .reduce(&input, &mut reduced, &mut reduction_scratch)
         .unwrap();
     assert_eq!(reduced, oracle_reduce(MODULUS, &modulus, &input));
+}
+
+#[test]
+fn static_ntt_extension_arithmetic_matches_dynamic_plan() {
+    const MODULUS: u32 = 998_244_353;
+    const K: usize = 24;
+    const N: usize = 64;
+    let modulus = irreducible_binomial::<K>(MODULUS);
+    let dynamic = ExtensionField::<MODULUS, K>::new_unchecked_irreducible(&modulus).unwrap();
+    let static_field =
+        StaticExtensionField::<MODULUS, K, N>::new_unchecked_irreducible(&modulus).unwrap();
+    let lhs = std::array::from_fn(|index| (index as u32).wrapping_mul(2_654_435_761));
+    let rhs = std::array::from_fn(|index| (index as u32).wrapping_mul(1_103_515_245));
+    let mut dynamic_scratch = dynamic.scratch();
+    let mut static_scratch = static_field.scratch();
+    let mut dynamic_product = [0; K];
+    let mut static_product = [0; K];
+    let mut dynamic_square = [0; K];
+    let mut static_square = [0; K];
+
+    dynamic
+        .mul(&lhs, &rhs, &mut dynamic_product, &mut dynamic_scratch)
+        .unwrap();
+    static_field
+        .mul(&lhs, &rhs, &mut static_product, &mut static_scratch)
+        .unwrap();
+    dynamic
+        .square(&lhs, &mut dynamic_square, &mut dynamic_scratch)
+        .unwrap();
+    static_field
+        .square(&lhs, &mut static_square, &mut static_scratch)
+        .unwrap();
+
+    assert_eq!(static_product, dynamic_product);
+    assert_eq!(static_square, dynamic_square);
+    assert_eq!(static_field.algorithm(), dynamic.algorithm());
+
+    let input: Vec<_> = (0..2 * K - 1)
+        .map(|index| (index as u32).wrapping_mul(2_654_435_761).wrapping_add(97))
+        .collect();
+    let dynamic_reduction = PolynomialReductionPlan::<MODULUS, K>::new(&modulus).unwrap();
+    let static_reduction = StaticPolynomialReductionPlan::<MODULUS, K, N>::new(&modulus).unwrap();
+    let mut dynamic_reduction_scratch = dynamic_reduction.scratch();
+    let mut static_reduction_scratch = static_reduction.scratch();
+    let mut dynamic_output = [0; K];
+    let mut static_output = [0; K];
+    dynamic_reduction
+        .reduce(&input, &mut dynamic_output, &mut dynamic_reduction_scratch)
+        .unwrap();
+    static_reduction
+        .reduce(&input, &mut static_output, &mut static_reduction_scratch)
+        .unwrap();
+    assert_eq!(static_output, dynamic_output);
 }
 
 #[test]

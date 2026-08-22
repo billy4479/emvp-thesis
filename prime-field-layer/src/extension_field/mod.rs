@@ -17,6 +17,11 @@
 //! [`ExtensionFieldScratch`], whose allocation is reusable. Addition and
 //! subtraction need no scratch. Every public coefficient input may be any
 //! `u32`; every public output and stored modulus coefficient is canonical.
+//!
+//! [`StaticExtensionField`] uses [`StaticNttPlan`](crate::StaticNttPlan) when
+//! both the extension degree and transform length are protocol constants. The
+//! dynamic type remains the default because static specialization is
+//! size-dependent and adds transform tables to the binary.
 
 mod irreducibility;
 mod reduction;
@@ -25,9 +30,11 @@ use std::fmt;
 
 use crate::{FieldElement, FieldError, PrimeField};
 
+#[doc(hidden)]
+pub use reduction::{DynamicReductionNtt, ReductionNtt, StaticReductionNtt};
 pub use reduction::{
     PolynomialAlgorithm, PolynomialReductionPlan, PolynomialReductionScratch,
-    SCHOOLBOOK_EXTENSION_DEGREE,
+    SCHOOLBOOK_EXTENSION_DEGREE, StaticPolynomialReductionPlan,
 };
 
 use irreducibility::is_irreducible;
@@ -86,9 +93,18 @@ impl From<FieldError> for ExtensionFieldError {
 }
 
 /// Arithmetic in `F_q[X]/(f)` for a fixed degree-`K` monic polynomial `f`.
-pub struct ExtensionField<const MODULUS: u32, const K: usize> {
-    reduction: PolynomialReductionPlan<MODULUS, K>,
+pub struct ExtensionField<const MODULUS: u32, const K: usize, Ntt = DynamicReductionNtt<MODULUS>> {
+    reduction: PolynomialReductionPlan<MODULUS, K, Ntt>,
 }
+
+/// An extension field whose NTT length is fixed at compile time.
+///
+/// `N` must equal `next_power_of_two(2K - 1)`, and `K` must exceed
+/// [`SCHOOLBOOK_EXTENSION_DEGREE`]. Construction checks both requirements during
+/// constant evaluation. Prefer the default [`ExtensionField`] unless benchmarks
+/// for the intended degree show that static specialization is faster.
+pub type StaticExtensionField<const MODULUS: u32, const K: usize, const N: usize> =
+    ExtensionField<MODULUS, K, StaticReductionNtt<MODULUS, N>>;
 
 /// Caller-owned work storage for allocation-free extension multiplication.
 pub struct ExtensionFieldScratch<const MODULUS: u32, const K: usize> {
@@ -96,7 +112,7 @@ pub struct ExtensionFieldScratch<const MODULUS: u32, const K: usize> {
     rhs: Vec<FieldElement<MODULUS>>,
 }
 
-impl<const MODULUS: u32, const K: usize> ExtensionField<MODULUS, K> {
+impl<const MODULUS: u32, const K: usize> ExtensionField<MODULUS, K, DynamicReductionNtt<MODULUS>> {
     /// Constructs an extension field after deterministic irreducibility testing.
     ///
     /// Rabin's test computes successive `q`-power Frobenius images modulo `f`,
@@ -115,7 +131,10 @@ impl<const MODULUS: u32, const K: usize> ExtensionField<MODULUS, K> {
             return Err(ExtensionFieldError::ReducibleModulus);
         }
         Ok(Self {
-            reduction: PolynomialReductionPlan::from_canonical(canonical)?,
+            reduction:
+                PolynomialReductionPlan::<MODULUS, K, DynamicReductionNtt<MODULUS>>::from_canonical(
+                    canonical,
+                )?,
         })
     }
 
@@ -132,10 +151,53 @@ impl<const MODULUS: u32, const K: usize> ExtensionField<MODULUS, K> {
     /// that it cannot return [`ExtensionFieldError::ReducibleModulus`].
     pub fn new_unchecked_irreducible(modulus: &[u32]) -> Result<Self, ExtensionFieldError> {
         Ok(Self {
-            reduction: PolynomialReductionPlan::new(modulus)?,
+            reduction: PolynomialReductionPlan::<MODULUS, K, DynamicReductionNtt<MODULUS>>::new(
+                modulus,
+            )?,
+        })
+    }
+}
+
+impl<const MODULUS: u32, const K: usize, const N: usize>
+    ExtensionField<MODULUS, K, StaticReductionNtt<MODULUS, N>>
+{
+    /// Constructs a statically sized extension field after irreducibility testing.
+    ///
+    /// `N` must equal `next_power_of_two(2K - 1)`. Invalid static dimensions
+    /// fail during constant evaluation.
+    ///
+    /// # Errors
+    ///
+    /// Returns a validation error for degree zero, a coefficient-count mismatch,
+    /// nonmonicity, or reducibility.
+    pub fn new(modulus: &[u32]) -> Result<Self, ExtensionFieldError> {
+        let canonical = reduction::validate_modulus::<MODULUS, K>(modulus)?;
+        if !is_irreducible::<MODULUS>(&canonical) {
+            return Err(ExtensionFieldError::ReducibleModulus);
+        }
+        Ok(Self {
+            reduction: StaticPolynomialReductionPlan::from_canonical(canonical)?,
         })
     }
 
+    /// Constructs a statically sized extension field while trusting an external
+    /// irreducibility proof.
+    ///
+    /// # Errors
+    ///
+    /// Returns a validation error for degree zero, a coefficient-count mismatch,
+    /// or nonmonicity.
+    pub fn new_unchecked_irreducible(modulus: &[u32]) -> Result<Self, ExtensionFieldError> {
+        Ok(Self {
+            reduction: StaticPolynomialReductionPlan::new(modulus)?,
+        })
+    }
+}
+
+impl<const MODULUS: u32, const K: usize, Ntt> ExtensionField<MODULUS, K, Ntt>
+where
+    Ntt: ReductionNtt<MODULUS>,
+{
     /// Returns the canonical coefficients of `f`, including its leading one.
     #[must_use]
     pub fn modulus_polynomial(&self) -> &[u32] {
