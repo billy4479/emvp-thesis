@@ -29,6 +29,31 @@
   [doi:10.1145/3230636](https://doi.org/10.1145/3230636).
   Used for the unbiased reduction of fixed-width random words to a bounded
   integer by rejecting the incomplete range.
+- Fabrice Benhamouda, Caicai Chen, Shai Halevi, Yuval Ishai, Hugo Krawczyk,
+  Tamer Mour, Tal Rabin, and Alon Rosen, "Encrypted Matrix-Vector Products from
+  Secret Dual Codes," IACR ePrint 2025/858 (2025), Definition 2.3 and Sections
+  5.1-5.2. [ePrint](https://eprint.iacr.org/2025/858).
+  Primary specification for all three constructions in `trapdoor-matrices`.
+- Elette Boyle, Geoffroy Couteau, Niv Gilboa, Yuval Ishai, Lisa Kohl, and Peter
+  Scholl, "Efficient Pseudorandom Correlation Generators from Ring-LPN," IACR
+  ePrint 2022/1035; CRYPTO 2020. [ePrint](https://eprint.iacr.org/2022/1035).
+  Used for the irreducible-extension Ring-LPN assumption and its structural
+  security caveats.
+- Stefan Heyse, Eike Kiltz, Vadim Lyubashevsky, Christof Paar, and Krzysztof
+  Pietrzak, "Lapin: An Efficient Authentication Protocol Based on Ring-LPN,"
+  FSE 2012, LNCS 7549, 346-365.
+  [preprint](https://www.iacr.org/workshops/fse2012/FSEpreproceedings/PDF/19.pdf).
+  Used for the conservative choice of an irreducible Ring-LPN modulus.
+- Martijn Brehm, Binyi Chen, Ben Fisch, Nicolas Resch, Ron D. Rothblum, and
+  Hadas Zeilberger, "Blaze: Fast SNARKs from Interleaved RAA Codes," IACR
+  ePrint 2024/1609; EUROCRYPT 2025.
+  [ePrint](https://eprint.iacr.org/2024/1609).
+  Used only as algorithmic background for repeat-accumulate-accumulate codes;
+  its coding results do not prove pseudorandomness of the weighted TDM.
+- Guy E. Blelloch, "Prefix Sums and Their Applications," in *Synthesis of
+  Parallel Algorithms* (1993).
+  [author-hosted paper](https://www.cs.cmu.edu/~guyb/papers/Ble93.pdf).
+  Used for the weighted-prefix-scan formulation of the RAA evaluator.
 
 ## Dependency notes
 
@@ -41,3 +66,7 @@
   sampling tests. It is dual-licensed under MIT or Apache-2.0 and does not form
   part of the library API.
   [crate documentation](https://docs.rs/rand_chacha/0.9.0/rand_chacha/).
+- `allocation-counter` 0.8 is a development-only dependency used to prevent
+  allocation regressions in warmed TDM evaluation. It is dual-licensed under
+  MIT or Apache-2.0 and installs its counting allocator only in test binaries.
+  [crate documentation](https://docs.rs/allocation-counter/0.8/allocation_counter/).
