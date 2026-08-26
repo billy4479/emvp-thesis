@@ -1,33 +1,26 @@
-use crate::{FieldElement, PrimeField};
+use crate::{FieldElement, FieldError, PrimeField};
 
 use super::ExtensionFieldError;
 use super::irreducibility::is_irreducible;
 use super::reduction::{
-    self, DynamicReductionNtt, PolynomialAlgorithm, PolynomialReductionPlan,
-    PolynomialReductionScratch, ReductionNtt, StaticPolynomialReductionPlan, StaticReductionNtt,
+    self, PolynomialAlgorithm, PolynomialReductionPlan, PolynomialReductionScratch,
 };
 
 /// Arithmetic in `F_q[X]/(f)` for a fixed degree-`K` monic polynomial `f`.
-pub struct ExtensionField<const MODULUS: u32, const K: usize, Ntt = DynamicReductionNtt<MODULUS>> {
-    reduction: PolynomialReductionPlan<MODULUS, K, Ntt>,
+pub struct ExtensionField<const MODULUS: u32> {
+    k: usize,
+    field: PrimeField<MODULUS>,
+    reduction: PolynomialReductionPlan<MODULUS>,
 }
 
-/// An extension field whose NTT length is fixed at compile time.
-///
-/// `N` must equal `next_power_of_two(2K - 1)`, and `K` must exceed
-/// [`crate::SCHOOLBOOK_EXTENSION_DEGREE`]. Construction checks both requirements during
-/// constant evaluation. Prefer the default [`ExtensionField`] unless benchmarks
-/// for the intended degree show that static specialization is faster.
-pub type StaticExtensionField<const MODULUS: u32, const K: usize, const N: usize> =
-    ExtensionField<MODULUS, K, StaticReductionNtt<MODULUS, N>>;
-
 /// Caller-owned work storage for allocation-free extension multiplication.
-pub struct ExtensionFieldScratch<const MODULUS: u32, const K: usize> {
-    reduction: PolynomialReductionScratch<MODULUS, K>,
+pub struct ExtensionFieldScratch<const MODULUS: u32> {
+    k: usize,
+    reduction: PolynomialReductionScratch<MODULUS>,
     rhs: Vec<FieldElement<MODULUS>>,
 }
 
-impl<const MODULUS: u32, const K: usize> ExtensionField<MODULUS, K, DynamicReductionNtt<MODULUS>> {
+impl<const MODULUS: u32> ExtensionField<MODULUS> {
     /// Constructs an extension field after deterministic irreducibility testing.
     ///
     /// Rabin's test computes successive `q`-power Frobenius images modulo `f`,
@@ -40,16 +33,15 @@ impl<const MODULUS: u32, const K: usize> ExtensionField<MODULUS, K, DynamicReduc
     /// Returns a validation error for degree zero, a coefficient-count mismatch,
     /// nonmonicity, or reducibility. Large degrees selected for NTT arithmetic
     /// can also return the underlying transform-construction error.
-    pub fn new(modulus: &[u32]) -> Result<Self, ExtensionFieldError> {
-        let canonical = reduction::validate_modulus::<MODULUS, K>(modulus)?;
+    pub fn new(k: usize, modulus: &[u32]) -> Result<Self, ExtensionFieldError> {
+        let canonical = reduction::validate_modulus::<MODULUS>(k, modulus)?;
         if !is_irreducible::<MODULUS>(&canonical) {
             return Err(ExtensionFieldError::ReducibleModulus);
         }
         Ok(Self {
-            reduction:
-                PolynomialReductionPlan::<MODULUS, K, DynamicReductionNtt<MODULUS>>::from_canonical(
-                    canonical,
-                )?,
+            k,
+            field: PrimeField::new(),
+            reduction: PolynomialReductionPlan::from_canonical(k, canonical)?,
         })
     }
 
@@ -64,55 +56,17 @@ impl<const MODULUS: u32, const K: usize> ExtensionField<MODULUS, K, DynamicReduc
     ///
     /// Returns the same shape, monicity, and NTT errors as [`Self::new`], except
     /// that it cannot return [`ExtensionFieldError::ReducibleModulus`].
-    pub fn new_unchecked_irreducible(modulus: &[u32]) -> Result<Self, ExtensionFieldError> {
+    pub fn new_unchecked_irreducible(
+        k: usize,
+        modulus: &[u32],
+    ) -> Result<Self, ExtensionFieldError> {
         Ok(Self {
-            reduction: PolynomialReductionPlan::<MODULUS, K, DynamicReductionNtt<MODULUS>>::new(
-                modulus,
-            )?,
-        })
-    }
-}
-
-impl<const MODULUS: u32, const K: usize, const N: usize>
-    ExtensionField<MODULUS, K, StaticReductionNtt<MODULUS, N>>
-{
-    /// Constructs a statically sized extension field after irreducibility testing.
-    ///
-    /// `N` must equal `next_power_of_two(2K - 1)`. Invalid static dimensions
-    /// fail during constant evaluation.
-    ///
-    /// # Errors
-    ///
-    /// Returns a validation error for degree zero, a coefficient-count mismatch,
-    /// nonmonicity, or reducibility.
-    pub fn new(modulus: &[u32]) -> Result<Self, ExtensionFieldError> {
-        let canonical = reduction::validate_modulus::<MODULUS, K>(modulus)?;
-        if !is_irreducible::<MODULUS>(&canonical) {
-            return Err(ExtensionFieldError::ReducibleModulus);
-        }
-        Ok(Self {
-            reduction: StaticPolynomialReductionPlan::from_canonical(canonical)?,
+            k,
+            field: PrimeField::new(),
+            reduction: PolynomialReductionPlan::new(k, modulus)?,
         })
     }
 
-    /// Constructs a statically sized extension field while trusting an external
-    /// irreducibility proof.
-    ///
-    /// # Errors
-    ///
-    /// Returns a validation error for degree zero, a coefficient-count mismatch,
-    /// or nonmonicity.
-    pub fn new_unchecked_irreducible(modulus: &[u32]) -> Result<Self, ExtensionFieldError> {
-        Ok(Self {
-            reduction: StaticPolynomialReductionPlan::new(modulus)?,
-        })
-    }
-}
-
-impl<const MODULUS: u32, const K: usize, Ntt> ExtensionField<MODULUS, K, Ntt>
-where
-    Ntt: ReductionNtt<MODULUS>,
-{
     /// Returns the canonical coefficients of `f`, including its leading one.
     #[must_use]
     pub fn modulus_polynomial(&self) -> &[u32] {
@@ -127,36 +81,47 @@ where
 
     /// Allocates work storage for repeated multiplication and squaring.
     #[must_use]
-    pub fn scratch(&self) -> ExtensionFieldScratch<MODULUS, K> {
+    pub fn scratch(&self) -> ExtensionFieldScratch<MODULUS> {
         let length = self.reduction.work_len();
         ExtensionFieldScratch {
+            k: self.k,
             reduction: self.reduction.scratch(),
             rhs: vec![self.reduction.zero(); length],
         }
     }
 
     /// Adds two extension elements coefficient by coefficient.
-    #[must_use]
-    pub fn add(&self, lhs: &[u32; K], rhs: &[u32; K]) -> [u32; K] {
-        let field = PrimeField::<MODULUS>::new();
-        std::array::from_fn(|index| {
-            field.add_canonical(
-                field.reduce_u64(u64::from(lhs[index])),
-                field.reduce_u64(u64::from(rhs[index])),
-            )
-        })
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FieldError::LengthMismatch`] unless both slices have the extension degree.
+    pub fn add_assign(&self, lhs: &mut [u32], rhs: &[u32]) -> Result<(), FieldError> {
+        if lhs.len() != self.k || rhs.len() != self.k {
+            return Err(FieldError::LengthMismatch);
+        }
+        for (lhs, &rhs) in lhs.iter_mut().zip(rhs) {
+            let lhs_canonical = self.field.reduce_u32(*lhs);
+            let rhs_canonical = self.field.reduce_u32(rhs);
+            *lhs = self.field.add_canonical(lhs_canonical, rhs_canonical);
+        }
+        Ok(())
     }
 
     /// Subtracts two extension elements coefficient by coefficient.
-    #[must_use]
-    pub fn sub(&self, lhs: &[u32; K], rhs: &[u32; K]) -> [u32; K] {
-        let field = PrimeField::<MODULUS>::new();
-        std::array::from_fn(|index| {
-            field.sub_canonical(
-                field.reduce_u64(u64::from(lhs[index])),
-                field.reduce_u64(u64::from(rhs[index])),
-            )
-        })
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FieldError::LengthMismatch`] unless both slices have the extension degree.
+    pub fn sub_assign(&self, lhs: &mut [u32], rhs: &[u32]) -> Result<(), FieldError> {
+        if lhs.len() != self.k || rhs.len() != self.k {
+            return Err(FieldError::LengthMismatch);
+        }
+        for (lhs, &rhs) in lhs.iter_mut().zip(rhs) {
+            let lhs_canonical = self.field.reduce_u32(*lhs);
+            let rhs_canonical = self.field.reduce_u32(rhs);
+            *lhs = self.field.sub_canonical(lhs_canonical, rhs_canonical);
+        }
+        Ok(())
     }
 
     /// Multiplies two extension elements without allocating.
@@ -167,15 +132,23 @@ where
     ///
     /// # Errors
     ///
-    /// Returns a base-field length error only if the scratch storage does not
-    /// match this degree's fixed transform plan.
+    /// Returns a base-field length error if an operand, the output, or the
+    /// scratch storage does not have this extension's degree.
     pub fn mul(
         &self,
-        lhs: &[u32; K],
-        rhs: &[u32; K],
-        output: &mut [u32; K],
-        scratch: &mut ExtensionFieldScratch<MODULUS, K>,
+        lhs: &[u32],
+        rhs: &[u32],
+        output: &mut [u32],
+        scratch: &mut ExtensionFieldScratch<MODULUS>,
     ) -> Result<(), ExtensionFieldError> {
+        if lhs.len() != self.k
+            || rhs.len() != self.k
+            || output.len() != self.k
+            || scratch.k != self.k
+        {
+            return Err(ExtensionFieldError::BaseField(FieldError::LengthMismatch));
+        }
+
         self.prepare_operand(lhs, &mut scratch.reduction.values);
         self.prepare_operand(rhs, &mut scratch.rhs);
         match self.algorithm() {
@@ -185,7 +158,7 @@ where
                 product.fill(zero);
                 for (lhs_index, &lhs) in lhs.iter().enumerate() {
                     let lhs = PrimeField::<MODULUS>::new().element_u32(lhs);
-                    for (rhs_index, &rhs) in scratch.rhs[..K].iter().enumerate() {
+                    for (rhs_index, &rhs) in scratch.rhs[..self.k].iter().enumerate() {
                         product[lhs_index + rhs_index] += lhs * rhs;
                     }
                 }
@@ -207,24 +180,28 @@ where
     ///
     /// # Errors
     ///
-    /// Returns a base-field length error only if the scratch storage does not
-    /// match this degree's fixed transform plan.
+    /// Returns a base-field length error if the input, output, or scratch
+    /// storage does not have this extension's degree.
     pub fn square(
         &self,
-        value: &[u32; K],
-        output: &mut [u32; K],
-        scratch: &mut ExtensionFieldScratch<MODULUS, K>,
+        value: &[u32],
+        output: &mut [u32],
+        scratch: &mut ExtensionFieldScratch<MODULUS>,
     ) -> Result<(), ExtensionFieldError> {
+        if value.len() != self.k || output.len() != self.k || scratch.k != self.k {
+            return Err(ExtensionFieldError::BaseField(FieldError::LengthMismatch));
+        }
+
         self.prepare_operand(value, &mut scratch.rhs);
         let zero = self.reduction.zero();
         let product = &mut scratch.reduction.values;
         product.fill(zero);
         match self.algorithm() {
             PolynomialAlgorithm::Schoolbook => {
-                for lhs_index in 0..K {
+                for lhs_index in 0..self.k {
                     let lhs = scratch.rhs[lhs_index];
                     product[lhs_index * 2] += lhs.square();
-                    for rhs_index in lhs_index + 1..K {
+                    for rhs_index in lhs_index + 1..self.k {
                         let cross = lhs * scratch.rhs[rhs_index];
                         product[lhs_index + rhs_index] += cross + cross;
                     }
@@ -239,11 +216,10 @@ where
             .reduce_elements(output, &mut scratch.reduction)
     }
 
-    fn prepare_operand(&self, input: &[u32; K], output: &mut [FieldElement<MODULUS>]) {
-        let field = PrimeField::<MODULUS>::new();
+    fn prepare_operand(&self, input: &[u32], output: &mut [FieldElement<MODULUS>]) {
         output.fill(self.reduction.zero());
         for (output, &input) in output.iter_mut().zip(input) {
-            *output = field.element_u32(input);
+            *output = self.field.element_u32(input);
         }
     }
 }

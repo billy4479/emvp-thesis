@@ -1,15 +1,12 @@
-use crate::{FieldElement, NttPlan, PrimeField, StaticNttPlan};
+use crate::{FieldElement, NttPlan, PrimeField};
 
 use super::{
-    DynamicReductionNtt, NttReduction, PolynomialAlgorithm, PolynomialReductionPlan, ReductionNtt,
-    SCHOOLBOOK_EXTENSION_DEGREE, StaticReductionNtt, product_len, static_transform_len,
-    validate_modulus,
+    NttReduction, PolynomialAlgorithm, PolynomialReductionPlan, SCHOOLBOOK_EXTENSION_DEGREE,
+    product_len, validate_modulus,
 };
 use crate::extension_field::ExtensionFieldError;
 
-impl<const MODULUS: u32, const K: usize>
-    PolynomialReductionPlan<MODULUS, K, DynamicReductionNtt<MODULUS>>
-{
+impl<const MODULUS: u32> PolynomialReductionPlan<MODULUS> {
     /// Validates and precomputes reduction for a fixed monic modulus polynomial.
     ///
     /// This does not test irreducibility because polynomial reduction is valid in
@@ -19,27 +16,28 @@ impl<const MODULUS: u32, const K: usize>
     ///
     /// Returns a validation error for degree zero, a coefficient-count mismatch,
     /// or nonmonicity. Large degrees can also return an NTT construction error.
-    pub fn new(modulus: &[u32]) -> Result<Self, ExtensionFieldError> {
-        Self::from_canonical(validate_modulus::<MODULUS, K>(modulus)?)
+    pub fn new(k: usize, modulus: &[u32]) -> Result<Self, ExtensionFieldError> {
+        Self::from_canonical(k, validate_modulus::<MODULUS>(k, modulus)?)
     }
 
     pub(in crate::extension_field) fn from_canonical(
+        k: usize,
         modulus: Vec<u32>,
     ) -> Result<Self, ExtensionFieldError> {
         let field = PrimeField::<MODULUS>::new();
-        let negative_modulus = modulus[..K]
+        let negative_modulus = modulus[..k]
             .iter()
             .map(|&coefficient| field.element_u32(field.neg_canonical(coefficient)))
             .collect();
-        let (algorithm, ntt) = if K <= SCHOOLBOOK_EXTENSION_DEGREE {
+        let (algorithm, ntt) = if k <= SCHOOLBOOK_EXTENSION_DEGREE {
             (PolynomialAlgorithm::Schoolbook, None)
         } else {
-            let product_length = product_len::<K>()?;
+            let product_length = product_len(k)?;
             let transform_length = product_length
                 .checked_next_power_of_two()
                 .ok_or(crate::FieldError::ConvolutionLengthOverflow)?;
-            let plan = DynamicReductionNtt(NttPlan::<MODULUS>::new(transform_length)?);
-            let inverse = reversed_inverse::<MODULUS>(&modulus, K.saturating_sub(1));
+            let plan = NttPlan::<MODULUS>::new(transform_length)?;
+            let inverse = reversed_inverse::<MODULUS>(&modulus, k.saturating_sub(1));
             let mut reversed_inverse = padded_elements(field, &inverse, transform_length);
             let mut transformed_modulus = padded_elements(field, &modulus, transform_length);
             plan.forward(&mut reversed_inverse)?;
@@ -55,66 +53,11 @@ impl<const MODULUS: u32, const K: usize>
         };
         Ok(Self {
             field,
+            k,
             modulus,
             negative_modulus,
             algorithm,
             ntt,
-        })
-    }
-}
-
-impl<const MODULUS: u32, const K: usize, const N: usize>
-    PolynomialReductionPlan<MODULUS, K, StaticReductionNtt<MODULUS, N>>
-{
-    /// Validates and precomputes reduction using a compile-time NTT length.
-    ///
-    /// `N` must equal `next_power_of_two(2K - 1)`. Invalid static dimensions
-    /// fail during constant evaluation.
-    ///
-    /// # Errors
-    ///
-    /// Returns a validation error for degree zero, a coefficient-count mismatch,
-    /// or nonmonicity.
-    pub fn new(modulus: &[u32]) -> Result<Self, ExtensionFieldError> {
-        Self::from_canonical(validate_modulus::<MODULUS, K>(modulus)?)
-    }
-
-    pub(in crate::extension_field) fn from_canonical(
-        modulus: Vec<u32>,
-    ) -> Result<Self, ExtensionFieldError> {
-        const {
-            assert!(
-                K > SCHOOLBOOK_EXTENSION_DEGREE,
-                "static NTT reduction requires an NTT-dispatched extension degree"
-            );
-            assert!(
-                N == static_transform_len(K),
-                "static NTT length must equal next_power_of_two(2K - 1)"
-            );
-        }
-        let field = PrimeField::<MODULUS>::new();
-        let negative_modulus = modulus[..K]
-            .iter()
-            .map(|&coefficient| field.element_u32(field.neg_canonical(coefficient)))
-            .collect();
-        let plan = StaticReductionNtt(StaticNttPlan::<MODULUS, N>::new()?);
-        let inverse = reversed_inverse::<MODULUS>(&modulus, K - 1);
-        let mut reversed_inverse = padded_elements(field, &inverse, N);
-        let mut transformed_modulus = padded_elements(field, &modulus, N);
-        plan.forward(&mut reversed_inverse)?;
-        plan.forward(&mut transformed_modulus)?;
-        Ok(Self {
-            field,
-            modulus,
-            negative_modulus,
-            algorithm: PolynomialAlgorithm::Ntt {
-                transform_length: N,
-            },
-            ntt: Some(NttReduction {
-                plan,
-                reversed_inverse,
-                modulus: transformed_modulus,
-            }),
         })
     }
 }

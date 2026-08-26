@@ -1,31 +1,6 @@
-use prime_field_layer::{FieldError, NegacyclicPlan, NttPlan, PrimeField, StaticNttPlan};
+use prime_field_layer::{FieldError, NegacyclicPlan, NttPlan, PrimeField};
 
-use crate::support::{bit_reverse, check_round_trip, check_static_matches_dynamic, oracle_dft};
-
-#[test]
-fn compile_time_size_plans_match_dynamic_plans() {
-    check_static_matches_dynamic::<2, 1>();
-    check_static_matches_dynamic::<17, 1>();
-    check_static_matches_dynamic::<17, 8>();
-    check_static_matches_dynamic::<65_537, 256>();
-    check_static_matches_dynamic::<998_244_353, 1_024>();
-    check_static_matches_dynamic::<2_013_265_921, 256>();
-    check_static_matches_dynamic::<2_281_701_377, 256>();
-}
-
-#[test]
-fn modulus_two_length_one_static_plan_preserves_montgomery_one() {
-    let plan = StaticNttPlan::<2, 1>::new_scalar().unwrap();
-    for input in [[0], [1], [2], [u32::MAX]] {
-        let mut values = plan.elements(&input);
-        plan.forward(&mut values);
-        plan.inverse(&mut values);
-        assert_eq!(
-            values.map(prime_field_layer::FieldElement::value),
-            [input[0] & 1]
-        );
-    }
-}
+use crate::support::{bit_reverse, check_round_trip, oracle_dft};
 
 #[test]
 fn cloned_dynamic_plan_keeps_shared_tables_alive_for_transforms() {
@@ -43,29 +18,6 @@ fn cloned_dynamic_plan_keeps_shared_tables_alive_for_transforms() {
             .collect::<Vec<_>>(),
         input
     );
-}
-
-#[test]
-fn compile_time_size_pointwise_product_matches_dynamic_plan() {
-    const MODULUS: u32 = 998_244_353;
-    const N: usize = 256;
-    let dynamic = NttPlan::<MODULUS>::new(N).unwrap();
-    let static_plan = StaticNttPlan::<MODULUS, N>::new().unwrap();
-    let lhs = std::array::from_fn(|index| index as u32 * 31 + 7);
-    let rhs = std::array::from_fn(|index| index as u32 * 17 + 11);
-    let mut dynamic_lhs = dynamic.elements(&lhs);
-    let mut dynamic_rhs = dynamic.elements(&rhs);
-    let mut static_lhs = static_plan.elements(&lhs);
-    let mut static_rhs = static_plan.elements(&rhs);
-    dynamic.forward(&mut dynamic_lhs).unwrap();
-    dynamic.forward(&mut dynamic_rhs).unwrap();
-    static_plan.forward(&mut static_lhs);
-    static_plan.forward(&mut static_rhs);
-    dynamic
-        .pointwise_mul_assign(&mut dynamic_lhs, &dynamic_rhs)
-        .unwrap();
-    static_plan.pointwise_mul_assign(&mut static_lhs, &static_rhs);
-    assert_eq!(static_lhs.as_slice(), dynamic_lhs);
 }
 
 #[test]

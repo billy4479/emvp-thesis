@@ -129,12 +129,12 @@ impl<const MODULUS: u32> SparseMatrix<MODULUS> {
 ///
 /// This storage contains values derived from the secret sparse matrix. It is
 /// not zeroized on drop.
-pub struct RingLpnScratch<const MODULUS: u32, const K: usize> {
+pub struct RingLpnScratch<const MODULUS: u32> {
     sparse_product: Vec<FieldElement<MODULUS>>,
-    extension: ExtensionFieldScratch<MODULUS, K>,
-    u0: [u32; K],
-    u1: [u32; K],
-    result: [u32; K],
+    extension: ExtensionFieldScratch<MODULUS>,
+    u0: Box<[u32]>,
+    u1: Box<[u32]>,
+    result: Box<[u32]>,
 }
 
 /// The irreducible-extension Ring-LPN map `H = [I | M_a]` with secret `E`.
@@ -144,13 +144,14 @@ pub struct RingLpnScratch<const MODULUS: u32, const K: usize> {
 /// set is known for this construction. Evaluation accesses its work buffer at
 /// secret-dependent row indices and does not hide the support of `E`. Neither
 /// the instance nor its scratch storage is zeroized on drop.
-pub struct IrreducibleRingLpn<const MODULUS: u32, const K: usize> {
-    extension: ExtensionField<MODULUS, K>,
-    multiplier: [u32; K],
+pub struct IrreducibleRingLpn<const MODULUS: u32> {
+    k: usize,
+    extension: ExtensionField<MODULUS>,
+    multiplier: Box<[u32]>,
     sparse_matrix: SparseMatrix<MODULUS>,
 }
 
-impl<const MODULUS: u32, const K: usize> IrreducibleRingLpn<MODULUS, K> {
+impl<const MODULUS: u32> IrreducibleRingLpn<MODULUS> {
     /// Constructs an instance and verifies that the public polynomial `f` is
     /// irreducible.
     ///
@@ -162,13 +163,14 @@ impl<const MODULUS: u32, const K: usize> IrreducibleRingLpn<MODULUS, K> {
     /// Returns an error if `K` is zero, dimensions overflow, `E` is not
     /// `2K`-by-`K`, or extension-field construction fails.
     pub fn new(
+        k: usize,
         modulus: &[u32],
-        multiplier: [u32; K],
+        multiplier: &[u32],
         sparse_matrix: SparseMatrix<MODULUS>,
     ) -> Result<Self, TdmError> {
-        Self::validate_dimensions(&sparse_matrix)?;
-        let extension = ExtensionField::<MODULUS, K>::new(modulus)?;
-        Ok(Self::from_parts(extension, multiplier, sparse_matrix))
+        Self::validate_dimensions(k, &sparse_matrix)?;
+        let extension = ExtensionField::<MODULUS>::new(k, modulus)?;
+        Ok(Self::from_parts(k, extension, multiplier, sparse_matrix))
     }
 
     /// Constructs an instance while trusting an external proof that the public
@@ -182,13 +184,14 @@ impl<const MODULUS: u32, const K: usize> IrreducibleRingLpn<MODULUS, K> {
     /// Returns an error if `K` is zero, dimensions overflow, `E` is not
     /// `2K`-by-`K`, or extension-ring construction fails.
     pub fn new_unchecked_irreducible(
+        k: usize,
         modulus: &[u32],
-        multiplier: [u32; K],
+        multiplier: &[u32],
         sparse_matrix: SparseMatrix<MODULUS>,
     ) -> Result<Self, TdmError> {
-        Self::validate_dimensions(&sparse_matrix)?;
-        let extension = ExtensionField::<MODULUS, K>::new_unchecked_irreducible(modulus)?;
-        Ok(Self::from_parts(extension, multiplier, sparse_matrix))
+        Self::validate_dimensions(k, &sparse_matrix)?;
+        let extension = ExtensionField::<MODULUS>::new_unchecked_irreducible(k, modulus)?;
+        Ok(Self::from_parts(k, extension, multiplier, sparse_matrix))
     }
 
     /// Samples a public multiplier `a` and secret sparse matrix `E`.
@@ -205,14 +208,15 @@ impl<const MODULUS: u32, const K: usize> IrreducibleRingLpn<MODULUS, K> {
     /// than the denominator, dimension overflow, or an invalid extension-field
     /// modulus.
     pub fn sample<R: CryptoRng + ?Sized>(
+        k: usize,
         modulus: &[u32],
         numerator: u32,
         denominator: u32,
         rng: &mut R,
     ) -> Result<Self, TdmError> {
-        let rows = Self::checked_rows()?;
-        let _cells = rows.checked_mul(K).ok_or(TdmError::DimensionOverflow)?;
-        let offsets_capacity = K.checked_add(1).ok_or(TdmError::DimensionOverflow)?;
+        let rows = Self::checked_rows(k)?;
+        let _cells = rows.checked_mul(k).ok_or(TdmError::DimensionOverflow)?;
+        let offsets_capacity = k.checked_add(1).ok_or(TdmError::DimensionOverflow)?;
         if denominator == 0 || numerator > denominator {
             return Err(TdmError::InvalidProbability {
                 numerator,
@@ -220,9 +224,9 @@ impl<const MODULUS: u32, const K: usize> IrreducibleRingLpn<MODULUS, K> {
             });
         }
 
-        let extension = ExtensionField::<MODULUS, K>::new(modulus)?;
+        let extension = ExtensionField::<MODULUS>::new(k, modulus)?;
         let field = PrimeField::<MODULUS>::new();
-        let multiplier = std::array::from_fn(|_| field.sample_uniform(rng).value());
+        let multiplier: Box<[u32]> = (0..k).map(|_| field.sample_uniform(rng).value()).collect();
         let denominator_bound = usize::try_from(denominator).map_err(|_conversion_error| {
             TdmError::SamplingRangeTooLarge {
                 upper_bound: usize::MAX,
@@ -238,7 +242,7 @@ impl<const MODULUS: u32, const K: usize> IrreducibleRingLpn<MODULUS, K> {
         let mut row_indices = Vec::new();
         let mut values = Vec::new();
         offsets.push(0);
-        for _column in 0..K {
+        for _column in 0..k {
             for row in 0..rows {
                 if super::permutation::sample_below(rng, denominator_bound)? < selection_bound {
                     row_indices.push(row);
@@ -248,8 +252,9 @@ impl<const MODULUS: u32, const K: usize> IrreducibleRingLpn<MODULUS, K> {
             offsets.push(row_indices.len());
         }
 
-        let sparse_matrix = SparseMatrix::new(rows, K, offsets, row_indices, values)?;
+        let sparse_matrix = SparseMatrix::new(rows, k, offsets, row_indices, values)?;
         Ok(Self {
+            k,
             extension,
             multiplier,
             sparse_matrix,
@@ -258,7 +263,7 @@ impl<const MODULUS: u32, const K: usize> IrreducibleRingLpn<MODULUS, K> {
 
     /// Returns the canonical public multiplier `a`.
     #[must_use]
-    pub const fn multiplier(&self) -> &[u32; K] {
+    pub const fn multiplier(&self) -> &[u32] {
         &self.multiplier
     }
 
@@ -283,14 +288,14 @@ impl<const MODULUS: u32, const K: usize> IrreducibleRingLpn<MODULUS, K> {
 
     /// Allocates reusable storage for evaluation.
     #[must_use]
-    pub fn scratch(&self) -> RingLpnScratch<MODULUS, K> {
+    pub fn scratch(&self) -> RingLpnScratch<MODULUS> {
         let zero = PrimeField::<MODULUS>::new().element_u32(0);
         RingLpnScratch {
             sparse_product: vec![zero; self.sparse_matrix.rows()],
             extension: self.extension.scratch(),
-            u0: [0; K],
-            u1: [0; K],
-            result: [0; K],
+            u0: vec![0; self.k].into_boxed_slice(),
+            u1: vec![0; self.k].into_boxed_slice(),
+            result: vec![0; self.k].into_boxed_slice(),
         }
     }
 
@@ -307,15 +312,15 @@ impl<const MODULUS: u32, const K: usize> IrreducibleRingLpn<MODULUS, K> {
         &self,
         input: &[FieldElement<MODULUS>],
         output: &mut [FieldElement<MODULUS>],
-        scratch: &mut RingLpnScratch<MODULUS, K>,
+        scratch: &mut RingLpnScratch<MODULUS>,
     ) -> Result<(), TdmError> {
-        check_len("input", K, input.len())?;
-        check_len("output", K, output.len())?;
+        check_len("input", self.k, input.len())?;
+        check_len("output", self.k, output.len())?;
 
         self.sparse_matrix.apply(input, &mut scratch.sparse_product);
-        for index in 0..K {
+        for index in 0..self.k {
             scratch.u0[index] = scratch.sparse_product[index].value();
-            scratch.u1[index] = scratch.sparse_product[K + index].value();
+            scratch.u1[index] = scratch.sparse_product[self.k + index].value();
         }
         self.extension.mul(
             &self.multiplier,
@@ -344,12 +349,12 @@ impl<const MODULUS: u32, const K: usize> IrreducibleRingLpn<MODULUS, K> {
         let field = PrimeField::<MODULUS>::new();
         let zero = field.element_u32(0);
         let one = field.element_u32(1);
-        let mut matrix = DenseMatrix::zero(K, K)?;
-        let mut input = vec![zero; K];
-        let mut output = vec![zero; K];
+        let mut matrix = DenseMatrix::zero(self.k, self.k)?;
+        let mut input = vec![zero; self.k].into_boxed_slice();
+        let mut output = vec![zero; self.k].into_boxed_slice();
         let mut scratch = self.scratch();
 
-        for column in 0..K {
+        for column in 0..self.k {
             input[column] = one;
             self.apply(&input, &mut output, &mut scratch)?;
             matrix.set_column(column, &output);
@@ -358,27 +363,35 @@ impl<const MODULUS: u32, const K: usize> IrreducibleRingLpn<MODULUS, K> {
         Ok(matrix)
     }
 
-    fn validate_dimensions(sparse_matrix: &SparseMatrix<MODULUS>) -> Result<(), TdmError> {
-        let rows = Self::checked_rows()?;
+    fn validate_dimensions(
+        k: usize,
+        sparse_matrix: &SparseMatrix<MODULUS>,
+    ) -> Result<(), TdmError> {
+        let rows = Self::checked_rows(k)?;
         check_len("sparse matrix rows", rows, sparse_matrix.rows())?;
-        check_len("sparse matrix columns", K, sparse_matrix.columns())
+        check_len("sparse matrix columns", k, sparse_matrix.columns())
     }
 
-    fn checked_rows() -> Result<usize, TdmError> {
-        if K == 0 {
+    fn checked_rows(k: usize) -> Result<usize, TdmError> {
+        if k == 0 {
             return Err(TdmError::ZeroDimension("extension degree"));
         }
-        K.checked_mul(2).ok_or(TdmError::DimensionOverflow)
+        k.checked_mul(2).ok_or(TdmError::DimensionOverflow)
     }
 
     fn from_parts(
-        extension: ExtensionField<MODULUS, K>,
-        multiplier: [u32; K],
+        k: usize,
+        extension: ExtensionField<MODULUS>,
+        multiplier: &[u32],
         sparse_matrix: SparseMatrix<MODULUS>,
     ) -> Self {
         let field = PrimeField::<MODULUS>::new();
-        let multiplier = multiplier.map(|value| field.reduce_u64(u64::from(value)));
+        let multiplier = multiplier
+            .iter()
+            .map(|value| field.reduce_u32(*value))
+            .collect();
         Self {
+            k,
             extension,
             multiplier,
             sparse_matrix,

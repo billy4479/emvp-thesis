@@ -29,10 +29,8 @@ mod irreducibility;
 mod reduction;
 
 pub use error::ExtensionFieldError;
-pub use field::{ExtensionField, ExtensionFieldScratch, StaticExtensionField};
-#[doc(hidden)]
-pub use reduction::{DynamicReductionNtt, ReductionNtt, StaticReductionNtt};
+pub use field::{ExtensionField, ExtensionFieldScratch};
 pub use reduction::{
     PolynomialAlgorithm, PolynomialReductionPlan, PolynomialReductionScratch,
-    SCHOOLBOOK_EXTENSION_DEGREE, StaticPolynomialReductionPlan,
+    SCHOOLBOOK_EXTENSION_DEGREE,
 };

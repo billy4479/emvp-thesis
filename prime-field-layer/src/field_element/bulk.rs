@@ -91,22 +91,6 @@ impl<const MODULUS: u32> PrimeField<MODULUS> {
         Ok(())
     }
 
-    pub(crate) fn mul_element_arrays_assign<const N: usize>(
-        lhs: &mut [FieldElement<MODULUS>; N],
-        rhs: &[FieldElement<MODULUS>; N],
-    ) {
-        #[cfg(target_arch = "x86_64")]
-        if MODULUS != 2 && N >= 8 && std::arch::is_x86_feature_detected!("avx2") {
-            // SAFETY: AVX2 was detected above and arrays have the same length.
-            unsafe { mul_elements_assign_avx2(lhs, rhs) };
-            return;
-        }
-
-        for (lhs, rhs) in lhs.iter_mut().zip(rhs) {
-            lhs.montgomery = Self::montgomery_mul(lhs.montgomery, rhs.montgomery);
-        }
-    }
-
     /// Multiplies every element in `values` by `scalar` in place.
     ///
     /// This takes `O(n)` time and allocates nothing while retaining Montgomery

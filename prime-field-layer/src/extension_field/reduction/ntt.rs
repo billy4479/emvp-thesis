@@ -1,18 +1,16 @@
 use crate::{FieldElement, PrimeField};
 
-use super::{PolynomialReductionPlan, PolynomialReductionScratch, ReductionNtt};
+use super::{PolynomialReductionPlan, PolynomialReductionScratch};
 use crate::extension_field::ExtensionFieldError;
+use crate::ntt::NttPlan;
 
-pub(super) struct NttReduction<const MODULUS: u32, Ntt> {
-    pub(super) plan: Ntt,
+pub(super) struct NttReduction<const MODULUS: u32> {
+    pub(super) plan: NttPlan<MODULUS>,
     pub(super) reversed_inverse: Vec<FieldElement<MODULUS>>,
     pub(super) modulus: Vec<FieldElement<MODULUS>>,
 }
 
-impl<const MODULUS: u32, const K: usize, Ntt> PolynomialReductionPlan<MODULUS, K, Ntt>
-where
-    Ntt: ReductionNtt<MODULUS>,
-{
+impl<const MODULUS: u32> PolynomialReductionPlan<MODULUS> {
     pub(in crate::extension_field) fn convolve(
         &self,
         lhs: &mut [FieldElement<MODULUS>],
@@ -44,14 +42,15 @@ where
     }
 
     pub(super) fn reduce_ntt(
-        output: &mut [u32; K],
-        scratch: &mut PolynomialReductionScratch<MODULUS, K>,
-        ntt: &NttReduction<MODULUS, Ntt>,
+        k: usize,
+        output: &mut [u32],
+        scratch: &mut PolynomialReductionScratch<MODULUS>,
+        ntt: &NttReduction<MODULUS>,
     ) -> Result<(), ExtensionFieldError> {
         let zero = PrimeField::<MODULUS>::new().element_u32(0);
         scratch.work.fill(zero);
-        for index in 0..K - 1 {
-            scratch.work[index] = scratch.values[2 * K - 2 - index];
+        for index in 0..k - 1 {
+            scratch.work[index] = scratch.values[2 * k - 2 - index];
         }
         ntt.plan
             .forward(&mut scratch.work)
@@ -61,8 +60,8 @@ where
             })
             .and_then(|()| ntt.plan.inverse(&mut scratch.work))?;
 
-        scratch.work[..K - 1].reverse();
-        scratch.work[K - 1..].fill(zero);
+        scratch.work[..k - 1].reverse();
+        scratch.work[k - 1..].fill(zero);
         ntt.plan
             .forward(&mut scratch.work)
             .and_then(|()| {

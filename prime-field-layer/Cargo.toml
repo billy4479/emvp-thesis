@@ -24,7 +24,7 @@ name = "arithmetic_kernels"
 harness = false
 
 [[bench]]
-name = "dynamic_ntt"
+name = "ntt"
 harness = false
 
 [[bench]]
@@ -33,14 +33,6 @@ harness = false
 
 [[bench]]
 name = "crossover"
-harness = false
-
-[[bench]]
-name = "static_ntt"
-harness = false
-
-[[bench]]
-name = "compare_static_dynamic_ntt"
 harness = false
 
 [[bench]]
@@ -106,4 +98,3 @@ dbg_macro = "warn"
 
 allow_attributes = "warn"
 allow_attributes_without_reason = "warn"
-

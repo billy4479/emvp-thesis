@@ -212,4 +212,11 @@ impl<const MODULUS: u32> PrimeField<MODULUS> {
     pub const fn reduce_u64(&self, value: u64) -> u32 {
         (value % Self::MODULUS_U64) as u32
     }
+
+    /// Reduces an arbitrary 32-bit integer to a canonical residue.
+    #[inline(always)]
+    #[must_use]
+    pub const fn reduce_u32(&self, value: u32) -> u32 {
+        value % MODULUS
+    }
 }

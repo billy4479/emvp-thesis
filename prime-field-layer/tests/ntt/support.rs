@@ -1,4 +1,4 @@
-use prime_field_layer::{NegacyclicPlan, NttPlan, StaticNttPlan, linear_convolution};
+use prime_field_layer::{NegacyclicPlan, NttPlan, linear_convolution};
 
 const fn oracle_pow(base: u32, mut exponent: usize, modulus: u32) -> u32 {
     let mut base = base as u64;
@@ -91,25 +91,6 @@ pub fn check_round_trip<const MODULUS: u32>(length: usize) {
             .into_iter()
             .map(prime_field_layer::FieldElement::value)
             .collect::<Vec<_>>(),
-        input
-    );
-}
-
-pub fn check_static_matches_dynamic<const MODULUS: u32, const N: usize>() {
-    let dynamic = NttPlan::<MODULUS>::new(N).unwrap();
-    let static_plan = StaticNttPlan::<MODULUS, N>::new().unwrap();
-    let input: [u32; N] =
-        std::array::from_fn(|index| ((index as u64 * 2_654_435_761 + 97) % MODULUS as u64) as u32);
-    let mut dynamic_values = dynamic.elements(&input);
-    let mut static_values = static_plan.elements(&input);
-    dynamic.forward(&mut dynamic_values).unwrap();
-    static_plan.forward(&mut static_values);
-    assert_eq!(static_values.as_slice(), dynamic_values);
-    dynamic.inverse(&mut dynamic_values).unwrap();
-    static_plan.inverse(&mut static_values);
-    assert_eq!(static_values.as_slice(), dynamic_values);
-    assert_eq!(
-        static_values.map(prime_field_layer::FieldElement::value),
         input
     );
 }

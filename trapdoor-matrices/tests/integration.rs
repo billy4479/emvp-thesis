@@ -450,7 +450,8 @@ fn ring_sparse_dense() -> Vec<u32> {
     ]
 }
 
-fn explicit_ring_lpn() -> IrreducibleRingLpn<17, 3> {
+fn explicit_ring_lpn() -> IrreducibleRingLpn<17> {
+    let k = 3;
     let sparse = SparseMatrix::new(
         6,
         3,
@@ -460,7 +461,7 @@ fn explicit_ring_lpn() -> IrreducibleRingLpn<17, 3> {
     )
     .unwrap();
     // x^3 + 3x + 1 has no root in F_17, so the cubic is irreducible.
-    IrreducibleRingLpn::new(&[1, 3, 0, 1], [2, 1, 3], sparse).unwrap()
+    IrreducibleRingLpn::new(k, &[1, 3, 0, 1], &[2, 1, 3], sparse).unwrap()
 }
 
 fn ring_lpn_oracle(input: &[u32]) -> Vec<u32> {
@@ -514,9 +515,10 @@ fn ring_lpn_matches_independent_sparse_and_polynomial_oracles() {
 
 #[test]
 fn ring_lpn_rejects_reducible_modulus_and_malformed_csc() {
+    let k = 3;
     let valid_sparse = SparseMatrix::new(6, 3, vec![0, 0, 0, 0], Vec::new(), Vec::new()).unwrap();
     assert!(matches!(
-        IrreducibleRingLpn::<17, 3>::new(&[0, 0, 0, 1], [1, 2, 3], valid_sparse),
+        IrreducibleRingLpn::<17>::new(k, &[0, 0, 0, 1], &[1, 2, 3], valid_sparse),
         Err(TdmError::ExtensionField(
             ExtensionFieldError::ReducibleModulus
         ))
@@ -552,7 +554,8 @@ fn ring_lpn_rejects_reducible_modulus_and_malformed_csc() {
 #[test]
 fn ring_lpn_duplicate_sparse_rows_accumulate_independently() {
     let sparse = SparseMatrix::new(2, 1, vec![0, 3], vec![0, 0, 1], elements(&[2, 3, 4])).unwrap();
-    let instance = IrreducibleRingLpn::<17, 1>::new(&[1, 1], [5], sparse).unwrap();
+    let k = 1;
+    let instance = IrreducibleRingLpn::<17>::new(k, &[1, 1], &[5], sparse).unwrap();
     let mut output = elements(&[0]);
     instance
         .apply(&elements(&[2]), &mut output, &mut instance.scratch())
@@ -564,12 +567,13 @@ fn ring_lpn_duplicate_sparse_rows_accumulate_independently() {
 fn ring_lpn_sampling_handles_probability_edges_and_is_reproducible() {
     let modulus = [1, 3, 0, 1];
     let mut zero_rng = ChaCha20Rng::from_seed([31; 32]);
-    let zero = IrreducibleRingLpn::<17, 3>::sample(&modulus, 0, 7, &mut zero_rng).unwrap();
+    let k = 3;
+    let zero = IrreducibleRingLpn::<17>::sample(k, &modulus, 0, 7, &mut zero_rng).unwrap();
     assert_eq!(zero.nnz(), 0);
     assert_eq!(zero.sparse_matrix().column_offsets(), [0, 0, 0, 0]);
 
     let mut full_rng = ChaCha20Rng::from_seed([37; 32]);
-    let full = IrreducibleRingLpn::<17, 3>::sample(&modulus, 7, 7, &mut full_rng).unwrap();
+    let full = IrreducibleRingLpn::<17>::sample(k, &modulus, 7, 7, &mut full_rng).unwrap();
     assert_eq!(full.nnz(), 18);
     assert_eq!(full.sparse_matrix().column_offsets(), [0, 6, 12, 18]);
     assert_eq!(
@@ -585,21 +589,21 @@ fn ring_lpn_sampling_handles_probability_edges_and_is_reproducible() {
 
     let mut first_rng = ChaCha20Rng::from_seed([41; 32]);
     let mut second_rng = ChaCha20Rng::from_seed([41; 32]);
-    let first = IrreducibleRingLpn::<17, 3>::sample(&modulus, 2, 5, &mut first_rng).unwrap();
-    let second = IrreducibleRingLpn::<17, 3>::sample(&modulus, 2, 5, &mut second_rng).unwrap();
+    let first = IrreducibleRingLpn::<17>::sample(k, &modulus, 2, 5, &mut first_rng).unwrap();
+    let second = IrreducibleRingLpn::<17>::sample(k, &modulus, 2, 5, &mut second_rng).unwrap();
     assert_eq!(first.multiplier(), second.multiplier());
     assert_eq!(first.sparse_matrix(), second.sparse_matrix());
 
     let mut invalid_rng = ChaCha20Rng::from_seed([43; 32]);
     assert!(matches!(
-        IrreducibleRingLpn::<17, 3>::sample(&modulus, 1, 0, &mut invalid_rng),
+        IrreducibleRingLpn::<17>::sample(k, &modulus, 1, 0, &mut invalid_rng),
         Err(TdmError::InvalidProbability {
             numerator: 1,
             denominator: 0
         })
     ));
     assert!(matches!(
-        IrreducibleRingLpn::<17, 3>::sample(&modulus, 6, 5, &mut invalid_rng),
+        IrreducibleRingLpn::<17>::sample(k, &modulus, 6, 5, &mut invalid_rng),
         Err(TdmError::InvalidProbability {
             numerator: 6,
             denominator: 5
@@ -609,8 +613,9 @@ fn ring_lpn_sampling_handles_probability_edges_and_is_reproducible() {
 
 #[test]
 fn ring_lpn_degree_one_edge_has_expected_split_orientation() {
+    let k = 1;
     let sparse = SparseMatrix::new(2, 1, vec![0, 2], vec![0, 1], elements(&[3, 4])).unwrap();
-    let instance = IrreducibleRingLpn::<17, 1>::new(&[1, 1], [5], sparse).unwrap();
+    let instance = IrreducibleRingLpn::<17>::new(k, &[1, 1], &[5], sparse).unwrap();
     let mut output = elements(&[0]);
     let mut scratch = instance.scratch();
     instance

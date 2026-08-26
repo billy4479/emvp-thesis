@@ -39,63 +39,66 @@ fn elements(count: usize) -> Throughput {
     Throughput::Elements(u64::try_from(count).unwrap())
 }
 
-fn ring_inputs<const K: usize>() -> (Vec<u32>, [u32; K], SparseMatrix<MODULUS>) {
+fn ring_inputs(k: usize) -> (Box<[u32]>, Box<[u32]>, SparseMatrix<MODULUS>) {
     let field = PrimeField::<MODULUS>::new();
-    let mut rng = seeded_rng(0x31, K);
-    let multiplier = std::array::from_fn(|_| field.sample_uniform(&mut rng).value());
-    let rows = 2 * K;
-    let target_weight = K.min(TARGET_COLUMN_WEIGHT);
-    let mut offsets = Vec::with_capacity(K + 1);
-    let mut row_indices = Vec::with_capacity(K * target_weight);
-    let mut values = Vec::with_capacity(K * target_weight);
+    let mut rng = seeded_rng(0x31, k);
+    let multiplier = (0..k)
+        .map(|_| field.sample_uniform(&mut rng).value())
+        .collect::<Box<[u32]>>();
+    let rows = 2 * k;
+    let target_weight = k.min(TARGET_COLUMN_WEIGHT);
+    let mut offsets = Vec::with_capacity(k + 1);
+    let mut row_indices = Vec::with_capacity(k * target_weight);
+    let mut values = Vec::with_capacity(k * target_weight);
     offsets.push(0);
-    for column in 0..K {
+    for column in 0..k {
         for entry in 0..target_weight {
             row_indices.push((17 * column + entry) % rows);
             values.push(field.sample_uniform_nonzero(&mut rng));
         }
         offsets.push(row_indices.len());
     }
-    let sparse = SparseMatrix::new(rows, K, offsets, row_indices, values).unwrap();
+    let sparse = SparseMatrix::new(rows, k, offsets, row_indices, values).unwrap();
 
     // This monic polynomial is benchmark input, not an irreducibility claim.
     // The unchecked API isolates construction cost from an impractical search
     // for checked degree-64 and degree-256 modulus polynomials.
-    let mut modulus = vec![0; K + 1];
+    let mut modulus = vec![0; k + 1].into_boxed_slice();
     modulus[0] = MODULUS - 3;
-    modulus[K] = 1;
+    modulus[k] = 1;
     (modulus, multiplier, sparse)
 }
 
-fn ring_instance<const K: usize>() -> IrreducibleRingLpn<MODULUS, K> {
-    let (modulus, multiplier, sparse) = ring_inputs::<K>();
-    IrreducibleRingLpn::new_unchecked_irreducible(&modulus, multiplier, sparse).unwrap()
+fn ring_instance(k: usize) -> IrreducibleRingLpn<MODULUS> {
+    let (modulus, multiplier, sparse) = ring_inputs(k);
+    IrreducibleRingLpn::new_unchecked_irreducible(k, &modulus, &multiplier, sparse).unwrap()
 }
 
-fn ring_label<const K: usize>() -> String {
-    let rows = 2 * K;
-    let target_weight = K.min(TARGET_COLUMN_WEIGHT);
-    let extension = if K == 16 {
+fn ring_label(k: usize) -> String {
+    let rows = 2 * k;
+    let target_weight = k.min(TARGET_COLUMN_WEIGHT);
+    let extension = if k == 16 {
         String::from("extension_schoolbook")
     } else {
-        format!("extension_ntt_len{}", (2 * K - 1).next_power_of_two())
+        format!("extension_ntt_len{}", (2 * k - 1).next_power_of_two())
     };
     format!(
         "{extension}_target_expected_per_column_t{target_weight}_p{target_weight}_over_{rows}_e_rows{rows}"
     )
 }
 
-fn ring_construction_for<const K: usize>(group: &mut BenchmarkGroup<'_, WallTime>) {
-    let (modulus, multiplier, sparse) = ring_inputs::<K>();
-    let target_weight = K.min(TARGET_COLUMN_WEIGHT);
-    group.throughput(elements(K + 1 + K + K * target_weight));
-    let label = format!("new_unchecked_irreducible_{}", ring_label::<K>());
-    group.bench_function(BenchmarkId::new(label, K), |b| {
+fn ring_construction_for(group: &mut BenchmarkGroup<'_, WallTime>, k: usize) {
+    let (modulus, multiplier, sparse) = ring_inputs(k);
+    let target_weight = k.min(TARGET_COLUMN_WEIGHT);
+    group.throughput(elements(k + 1 + k + k * target_weight));
+    let label = format!("new_unchecked_irreducible_{}", ring_label(k));
+    group.bench_function(BenchmarkId::new(label, k), |b| {
         b.iter_batched(
-            || (multiplier, sparse.clone()),
+            || (&multiplier, sparse.clone()),
             |(multiplier, sparse)| {
                 black_box(
-                    IrreducibleRingLpn::<MODULUS, K>::new_unchecked_irreducible(
+                    IrreducibleRingLpn::<MODULUS>::new_unchecked_irreducible(
+                        black_box(k),
                         black_box(&modulus),
                         black_box(multiplier),
                         black_box(sparse),
@@ -108,13 +111,13 @@ fn ring_construction_for<const K: usize>(group: &mut BenchmarkGroup<'_, WallTime
     });
 }
 
-fn ring_apply_for<const K: usize>(group: &mut BenchmarkGroup<'_, WallTime>) {
-    let map = ring_instance::<K>();
-    let input = field_values(K, 0x32);
-    let mut output = field_values(K, 0x33);
+fn ring_apply_for(group: &mut BenchmarkGroup<'_, WallTime>, k: usize) {
+    let map = ring_instance(k);
+    let input = field_values(k, 0x32);
+    let mut output = field_values(k, 0x33);
     let mut scratch = map.scratch();
-    group.throughput(elements(K));
-    group.bench_function(BenchmarkId::new(ring_label::<K>(), K), |b| {
+    group.throughput(elements(k));
+    group.bench_function(BenchmarkId::new(ring_label(k), k), |b| {
         b.iter(|| {
             black_box(&map)
                 .apply(
@@ -127,22 +130,19 @@ fn ring_apply_for<const K: usize>(group: &mut BenchmarkGroup<'_, WallTime>) {
     });
 }
 
-fn ring_materialize_for<const K: usize>(group: &mut BenchmarkGroup<'_, WallTime>) {
-    let map = ring_instance::<K>();
-    group.throughput(elements(K * K));
-    group.bench_function(BenchmarkId::new(ring_label::<K>(), K), |b| {
+fn ring_materialize_for(group: &mut BenchmarkGroup<'_, WallTime>, k: usize) {
+    let map = ring_instance(k);
+    group.throughput(elements(k * k));
+    group.bench_function(BenchmarkId::new(ring_label(k), k), |b| {
         b.iter(|| black_box(black_box(&map).materialize().unwrap()));
     });
 }
 
-fn toeplitz_instance<const K: usize>() -> ToeplitzFastProduct<MODULUS, K> {
-    ToeplitzFastProduct::sample(&mut seeded_rng(0x41, K)).unwrap()
+fn toeplitz_instance(k: usize) -> ToeplitzFastProduct<MODULUS> {
+    ToeplitzFastProduct::sample(k, &mut seeded_rng(0x41, k)).unwrap()
 }
 
-fn toeplitz_label<const K: usize>(
-    map: &ToeplitzFastProduct<MODULUS, K>,
-    operation: &str,
-) -> String {
+fn toeplitz_label(map: &ToeplitzFastProduct<MODULUS>, operation: &str) -> String {
     format!(
         "{operation}_{:?}_ntt_len{}",
         map.middle().backend(),
@@ -150,29 +150,32 @@ fn toeplitz_label<const K: usize>(
     )
 }
 
-fn toeplitz_construction_for<const K: usize>(group: &mut BenchmarkGroup<'_, WallTime>) {
-    let map = toeplitz_instance::<K>();
+fn toeplitz_construction_for(group: &mut BenchmarkGroup<'_, WallTime>, k: usize) {
+    let map = toeplitz_instance(k);
     let label = toeplitz_label(&map, "sample_and_cache");
-    group.throughput(elements(10 * K - 3));
-    group.bench_function(BenchmarkId::new(label, K), |b| {
+    group.throughput(elements(10 * k - 3));
+    group.bench_function(BenchmarkId::new(label, k), |b| {
         b.iter_batched(
-            || seeded_rng(0x41, K),
+            || seeded_rng(0x41, k),
             |mut rng| {
-                black_box(ToeplitzFastProduct::<MODULUS, K>::sample(black_box(&mut rng)).unwrap())
+                black_box(
+                    ToeplitzFastProduct::<MODULUS>::sample(black_box(k), black_box(&mut rng))
+                        .unwrap(),
+                )
             },
             BatchSize::SmallInput,
         );
     });
 }
 
-fn toeplitz_apply_for<const K: usize>(group: &mut BenchmarkGroup<'_, WallTime>) {
-    let map = toeplitz_instance::<K>();
-    let input = field_values(K, 0x42);
-    let mut output = field_values(K, 0x43);
+fn toeplitz_apply_for(group: &mut BenchmarkGroup<'_, WallTime>, k: usize) {
+    let map = toeplitz_instance(k);
+    let input = field_values(k, 0x42);
+    let mut output = field_values(k, 0x43);
     let mut scratch = map.scratch();
-    group.throughput(elements(K));
+    group.throughput(elements(k));
     group.bench_function(
-        BenchmarkId::new(toeplitz_label(&map, "structured"), K),
+        BenchmarkId::new(toeplitz_label(&map, "structured"), k),
         |b| {
             b.iter(|| {
                 black_box(&map)
@@ -186,10 +189,10 @@ fn toeplitz_apply_for<const K: usize>(group: &mut BenchmarkGroup<'_, WallTime>) 
         },
     );
 
-    if K <= 64 {
+    if k <= 64 {
         let dense = map.materialize().unwrap();
-        let mut dense_output = field_values(K, 0x44);
-        group.bench_function(BenchmarkId::new("direct_dense_crossover", K), |b| {
+        let mut dense_output = field_values(k, 0x44);
+        group.bench_function(BenchmarkId::new("direct_dense_crossover", k), |b| {
             b.iter(|| {
                 black_box(&dense)
                     .apply(black_box(&input), black_box(&mut dense_output))
@@ -199,28 +202,28 @@ fn toeplitz_apply_for<const K: usize>(group: &mut BenchmarkGroup<'_, WallTime>) 
     }
 }
 
-fn toeplitz_materialize_for<const K: usize>(group: &mut BenchmarkGroup<'_, WallTime>) {
-    let map = toeplitz_instance::<K>();
-    group.throughput(elements(K * K));
+fn toeplitz_materialize_for(group: &mut BenchmarkGroup<'_, WallTime>, k: usize) {
+    let map = toeplitz_instance(k);
+    group.throughput(elements(k * k));
     group.bench_function(
-        BenchmarkId::new(toeplitz_label(&map, "materialize"), K),
+        BenchmarkId::new(toeplitz_label(&map, "materialize"), k),
         |b| b.iter(|| black_box(black_box(&map).materialize().unwrap())),
     );
 }
 
-fn raa_instance(size: usize) -> RaaWeightedProduct<MODULUS> {
-    RaaWeightedProduct::sample_nonzero(size, RAA_C, &mut seeded_rng(0x51, size)).unwrap()
+fn raa_instance(k: usize) -> RaaWeightedProduct<MODULUS> {
+    RaaWeightedProduct::sample_nonzero(k, RAA_C, &mut seeded_rng(0x51, k)).unwrap()
 }
 
-fn raa_construction_for<const K: usize>(group: &mut BenchmarkGroup<'_, WallTime>) {
-    group.throughput(elements(3 * K * RAA_C));
-    group.bench_function(BenchmarkId::new("sample_nonzero_c4", K), |b| {
+fn raa_construction_for(group: &mut BenchmarkGroup<'_, WallTime>, k: usize) {
+    group.throughput(elements(3 * k * RAA_C));
+    group.bench_function(BenchmarkId::new("sample_nonzero_c4", k), |b| {
         b.iter_batched(
-            || seeded_rng(0x51, K),
+            || seeded_rng(0x51, k),
             |mut rng| {
                 black_box(
                     RaaWeightedProduct::<MODULUS>::sample_nonzero(
-                        black_box(K),
+                        black_box(k),
                         RAA_C,
                         black_box(&mut rng),
                     )
@@ -232,13 +235,13 @@ fn raa_construction_for<const K: usize>(group: &mut BenchmarkGroup<'_, WallTime>
     });
 }
 
-fn raa_apply_for<const K: usize>(group: &mut BenchmarkGroup<'_, WallTime>) {
-    let map = raa_instance(K);
-    let input = field_values(K, 0x52);
-    let mut output = field_values(K, 0x53);
+fn raa_apply_for(group: &mut BenchmarkGroup<'_, WallTime>, k: usize) {
+    let map = raa_instance(k);
+    let input = field_values(k, 0x52);
+    let mut output = field_values(k, 0x53);
     let mut scratch = map.scratch();
-    group.throughput(elements(K));
-    group.bench_function(BenchmarkId::new("structured_c4", K), |b| {
+    group.throughput(elements(k));
+    group.bench_function(BenchmarkId::new("structured_c4", k), |b| {
         b.iter(|| {
             black_box(&map)
                 .apply(
@@ -250,10 +253,10 @@ fn raa_apply_for<const K: usize>(group: &mut BenchmarkGroup<'_, WallTime>) {
         });
     });
 
-    if K <= 64 {
+    if k <= 64 {
         let dense = map.materialize().unwrap();
-        let mut dense_output = field_values(K, 0x54);
-        group.bench_function(BenchmarkId::new("direct_dense_crossover", K), |b| {
+        let mut dense_output = field_values(k, 0x54);
+        group.bench_function(BenchmarkId::new("direct_dense_crossover", k), |b| {
             b.iter(|| {
                 black_box(&dense)
                     .apply(black_box(&input), black_box(&mut dense_output))
@@ -263,10 +266,10 @@ fn raa_apply_for<const K: usize>(group: &mut BenchmarkGroup<'_, WallTime>) {
     }
 }
 
-fn raa_materialize_for<const K: usize>(group: &mut BenchmarkGroup<'_, WallTime>) {
-    let map = raa_instance(K);
-    group.throughput(elements(K * K));
-    group.bench_function(BenchmarkId::new("materialize_c4", K), |b| {
+fn raa_materialize_for(group: &mut BenchmarkGroup<'_, WallTime>, k: usize) {
+    let map = raa_instance(k);
+    group.throughput(elements(k * k));
+    group.bench_function(BenchmarkId::new("materialize_c4", k), |b| {
         b.iter(|| black_box(black_box(&map).materialize().unwrap()));
     });
 }
@@ -275,7 +278,7 @@ fn all_tdms<const MODULUS: u32>(c: &mut Criterion) {
     macro_rules! fn_for_each {
         ($func:ident, $group:ident, $($n:expr),* $(,)?) => {
             $(
-                $func::<$n>(&mut $group);
+                $func(&mut $group, $n);
             )*
         };
     }

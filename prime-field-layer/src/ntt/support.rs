@@ -3,10 +3,6 @@ use super::{
     reduce_once_u64,
 };
 
-#[inline(always)]
-pub(super) const fn stage_twiddle_index(blocks: usize, block: usize) -> usize {
-    blocks - 1 + block
-}
 #[derive(Clone, Copy)]
 pub(super) enum BackendPreference {
     Auto,

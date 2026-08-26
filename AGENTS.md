@@ -12,15 +12,13 @@ This code will be used for cryptography purposes, so prefer constant-time whenev
 
 Benchmarks live in `prime-field-layer/benches`, split by purpose: 
 - `field` (field arithmetic)
-- `dynamic_ntt` (auto-dispatch NTT plans)
-- `static_ntt` (fixed-size plans)
+- `ntt` (auto-dispatch NTT plans)
 - `backends` (forced scalar vs AVX2)
 - `crossover` (schoolbook/NTT dispatch crossover)
-- `compare_static_dynamic_ntt` (static vs dynamic plans)
 
 Always benchmark your changes. If no suitable benchmark exist write a new one.
 
-For development iterations run `cargo bench --features bench-quick`: it runs trimmed matrices of `field`, `dynamic_ntt`, and `static_ntt` only and only takes a few minutes.
+For development iterations run `cargo bench --features bench-quick`: it runs trimmed matrices of `field`, `ntt`, and only and only takes a few minutes.
 
 The full `cargo bench` suite preserves the historical benchmark ids, so criterion baselines stay comparable across the split, but it takes a while: set a long timeout (60 minutes should be enough).
 

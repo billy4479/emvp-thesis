@@ -201,7 +201,8 @@ impl<const MODULUS: u32> ToeplitzScratch<MODULUS> {
 /// permutations of length `2K`. This construction has no settled security
 /// parameters. Its secret Toeplitz diagonals and cached spectra are not zeroized
 /// on drop, and its secret-independent evaluation has not been audited.
-pub struct ToeplitzFastProduct<const MODULUS: u32, const K: usize> {
+pub struct ToeplitzFastProduct<const MODULUS: u32> {
+    k: usize,
     s_right: ToeplitzMap<MODULUS>,
     pi_right: Permutation,
     middle: ToeplitzMap<MODULUS>,
@@ -209,7 +210,7 @@ pub struct ToeplitzFastProduct<const MODULUS: u32, const K: usize> {
     s_left: ToeplitzMap<MODULUS>,
 }
 
-impl<const MODULUS: u32, const K: usize> ToeplitzFastProduct<MODULUS, K> {
+impl<const MODULUS: u32> ToeplitzFastProduct<MODULUS> {
     /// Constructs a product from explicit maps and public permutations.
     ///
     /// Arguments follow evaluation order: `S_R`, `Pi_R`, `S`, `Pi_L`, `S_L`.
@@ -219,23 +220,25 @@ impl<const MODULUS: u32, const K: usize> ToeplitzFastProduct<MODULUS, K> {
     /// Returns an error if `K` is zero, `2K` overflows, or any supplied map or
     /// permutation has a shape other than the one required by the construction.
     pub fn new(
+        k: usize,
         s_right: ToeplitzMap<MODULUS>,
         pi_right: Permutation,
         middle: ToeplitzMap<MODULUS>,
         pi_left: Permutation,
         s_left: ToeplitzMap<MODULUS>,
     ) -> Result<Self, TdmError> {
-        let expanded = expanded_dimension::<K>()?;
+        let expanded = expanded_dimension(k)?;
         check_len("S_R rows", expanded, s_right.rows())?;
-        check_len("S_R columns", K, s_right.columns())?;
+        check_len("S_R columns", k, s_right.columns())?;
         check_len("Pi_R", expanded, pi_right.len())?;
         check_len("S rows", expanded, middle.rows())?;
         check_len("S columns", expanded, middle.columns())?;
         check_len("Pi_L", expanded, pi_left.len())?;
-        check_len("S_L rows", K, s_left.rows())?;
+        check_len("S_L rows", k, s_left.rows())?;
         check_len("S_L columns", expanded, s_left.columns())?;
 
         Ok(Self {
+            k,
             s_right,
             pi_right,
             middle,
@@ -253,18 +256,18 @@ impl<const MODULUS: u32, const K: usize> ToeplitzFastProduct<MODULUS, K> {
     ///
     /// Returns an error for invalid dimensions, unsupported transform lengths,
     /// or a permutation length outside the sampler's range.
-    pub fn sample<R: CryptoRng + ?Sized>(rng: &mut R) -> Result<Self, TdmError> {
-        let expanded = expanded_dimension::<K>()?;
+    pub fn sample<R: CryptoRng + ?Sized>(k: usize, rng: &mut R) -> Result<Self, TdmError> {
+        let expanded = expanded_dimension(k)?;
         let field = PrimeField::<MODULUS>::new();
         let right_count = expanded
-            .checked_add(K)
+            .checked_add(k)
             .and_then(|sum| sum.checked_sub(1))
             .ok_or(TdmError::DimensionOverflow)?;
         let middle_count = expanded
             .checked_add(expanded)
             .and_then(|sum| sum.checked_sub(1))
             .ok_or(TdmError::DimensionOverflow)?;
-        let left_count = K
+        let left_count = k
             .checked_add(expanded)
             .and_then(|sum| sum.checked_sub(1))
             .ok_or(TdmError::DimensionOverflow)?;
@@ -276,12 +279,12 @@ impl<const MODULUS: u32, const K: usize> ToeplitzFastProduct<MODULUS, K> {
         field.fill_uniform(rng, &mut middle_diagonals);
         field.fill_uniform(rng, &mut left_diagonals);
 
-        let s_right = ToeplitzMap::new(expanded, K, right_diagonals)?;
+        let s_right = ToeplitzMap::new(expanded, k, right_diagonals)?;
         let pi_right = Permutation::sample(expanded, rng)?;
         let middle = ToeplitzMap::new(expanded, expanded, middle_diagonals)?;
         let pi_left = Permutation::sample(expanded, rng)?;
-        let s_left = ToeplitzMap::new(K, expanded, left_diagonals)?;
-        Self::new(s_right, pi_right, middle, pi_left, s_left)
+        let s_left = ToeplitzMap::new(k, expanded, left_diagonals)?;
+        Self::new(k, s_right, pi_right, middle, pi_left, s_left)
     }
 
     /// Returns `S_R`.
@@ -337,8 +340,8 @@ impl<const MODULUS: u32, const K: usize> ToeplitzFastProduct<MODULUS, K> {
         scratch: &mut ToeplitzScratch<MODULUS>,
     ) -> Result<(), TdmError> {
         let expanded = self.middle.rows();
-        check_len("fast-product input", K, input.len())?;
-        check_len("fast-product output", K, output.len())?;
+        check_len("fast-product input", self.k, input.len())?;
+        check_len("fast-product output", self.k, output.len())?;
         check_len(
             "fast-product scratch stage A",
             expanded,
@@ -380,12 +383,12 @@ impl<const MODULUS: u32, const K: usize> ToeplitzFastProduct<MODULUS, K> {
         let field = PrimeField::<MODULUS>::new();
         let zero = field.element_u32(0);
         let one = field.element_u32(1);
-        let mut matrix = DenseMatrix::zero(K, K)?;
-        let mut input = vec![zero; K];
-        let mut output = vec![zero; K];
+        let mut matrix = DenseMatrix::zero(self.k, self.k)?;
+        let mut input = vec![zero; self.k].into_boxed_slice();
+        let mut output = vec![zero; self.k].into_boxed_slice();
         let mut scratch = self.scratch();
 
-        for column in 0..K {
+        for column in 0..self.k {
             input.fill(zero);
             input[column] = one;
             self.apply(&input, &mut output, &mut scratch)?;
@@ -395,9 +398,9 @@ impl<const MODULUS: u32, const K: usize> ToeplitzFastProduct<MODULUS, K> {
     }
 }
 
-fn expanded_dimension<const K: usize>() -> Result<usize, TdmError> {
-    if K == 0 {
+fn expanded_dimension(k: usize) -> Result<usize, TdmError> {
+    if k == 0 {
         return Err(TdmError::ZeroDimension("K"));
     }
-    K.checked_mul(2).ok_or(TdmError::DimensionOverflow)
+    k.checked_mul(2).ok_or(TdmError::DimensionOverflow)
 }

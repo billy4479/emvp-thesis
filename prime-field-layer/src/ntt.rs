@@ -100,18 +100,16 @@ mod avx2;
 mod convolution;
 mod plan;
 mod scalar;
-mod static_plan;
 mod support;
 #[cfg(test)]
 mod tests;
 
 use support::{
     BackendPreference, add_mod, halve_interval, normalize, powers, reduce_once, select_backend,
-    shoup_mul, shoup_mul_lazy_for, stage_twiddle_index, sub_mod, twiddle_powers,
+    shoup_mul, shoup_mul_lazy_for, sub_mod, twiddle_powers,
 };
 
 pub use convolution::linear_convolution;
-pub use static_plan::StaticNttPlan;
 
 /// Arithmetic and instruction-set implementation selected for an [`NttPlan`].
 ///
