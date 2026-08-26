@@ -9,6 +9,14 @@ debug = true
 [profile.bench]
 debug = true
 
+[workspace.dependencies]
+rand_core = { version = "0.10", default-features = false }
+
+allocation-counter = "0.8"
+criterion = { version = "0.8", features = ["html_reports"] }
+proptest = "1"
+rand_chacha = { version = "0.10", default-features = false }
+
 [workspace.lints.rust]
 unsafe_code = "forbid"
 
@@ -20,7 +28,7 @@ nursery = { level = "deny", priority = -1 }
 unwrap_used = "deny"
 expect_used = "deny"
 indexing_slicing = "deny"
-arithmetic_side_effects = "deny"
+# arithmetic_side_effects = "deny" # This is just unavoidable for this project
 unreachable = "deny"
 unimplemented = "deny"
 unchecked_time_subtraction = "deny"

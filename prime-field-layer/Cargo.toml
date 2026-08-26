@@ -6,6 +6,47 @@ edition = "2024"
 [features]
 bench-quick = ["bench-common/quick"]
 
+[dependencies]
+rand_core = { workspace = true }
+
+[dev-dependencies]
+bench-common = { path = "./benches/common" }
+criterion = { workspace = true }
+proptest = { workspace = true }
+rand_chacha = { workspace = true }
+
+[[bench]]
+name = "field"
+harness = false
+
+[[bench]]
+name = "arithmetic_kernels"
+harness = false
+
+[[bench]]
+name = "dynamic_ntt"
+harness = false
+
+[[bench]]
+name = "backends"
+harness = false
+
+[[bench]]
+name = "crossover"
+harness = false
+
+[[bench]]
+name = "static_ntt"
+harness = false
+
+[[bench]]
+name = "compare_static_dynamic_ntt"
+harness = false
+
+[[bench]]
+name = "extension_field"
+harness = false
+
 [lints.rust]
 # The optimized backends use documented inline assembly and AVX2-vectorized kernels.
 unsafe_code = "allow"
@@ -66,43 +107,3 @@ dbg_macro = "warn"
 allow_attributes = "warn"
 allow_attributes_without_reason = "warn"
 
-[dependencies]
-rand_core = { version = "0.9", default-features = false }
-
-[dev-dependencies]
-bench-common = { path = "benches/common" }
-criterion = "0.5"
-proptest = "1"
-rand_chacha = { version = "0.9", default-features = false }
-
-[[bench]]
-name = "field"
-harness = false
-
-[[bench]]
-name = "arithmetic_kernels"
-harness = false
-
-[[bench]]
-name = "dynamic_ntt"
-harness = false
-
-[[bench]]
-name = "backends"
-harness = false
-
-[[bench]]
-name = "crossover"
-harness = false
-
-[[bench]]
-name = "static_ntt"
-harness = false
-
-[[bench]]
-name = "compare_static_dynamic_ntt"
-harness = false
-
-[[bench]]
-name = "extension_field"
-harness = false

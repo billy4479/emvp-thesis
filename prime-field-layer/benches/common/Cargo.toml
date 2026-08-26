@@ -8,4 +8,4 @@ publish = false
 quick = []
 
 [dependencies]
-criterion = "0.5"
+criterion = { workspace = true }

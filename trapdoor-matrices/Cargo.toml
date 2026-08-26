@@ -6,67 +6,18 @@ edition = "2024"
 [features]
 bench-quick = []
 
-[lints.rust]
-unsafe_code = "forbid"
-
-[lints.clippy]
-pedantic = { level = "deny", priority = -1 }
-nursery = { level = "deny", priority = -1 }
-
-unwrap_used = "deny"
-expect_used = "deny"
-indexing_slicing = "allow"
-arithmetic_side_effects = "allow"
-unreachable = "deny"
-unimplemented = "deny"
-unchecked_time_subtraction = "deny"
-todo = "deny"
-string_slice = "deny"
-panic_in_result_fn = "deny"
-panic = "deny"
-exit = "deny"
-as_conversions = "deny"
-
-cast_possible_truncation = "allow"
-cast_lossless = "allow"
-inline_always = "allow"
-
-dbg_macro = "warn"
-allow_attributes = "warn"
-allow_attributes_without_reason = "warn"
-let_underscore_future = "warn"
-let_underscore_must_use = "warn"
-unused_result_ok = "warn"
-map_err_ignore = "warn"
-assertions_on_result_states = "warn"
-await_holding_lock = "warn"
-await_holding_refcell_ref = "warn"
-large_futures = "warn"
-mem_forget = "warn"
-undocumented_unsafe_blocks = "warn"
-multiple_unsafe_ops_per_block = "warn"
-unnecessary_safety_doc = "warn"
-unnecessary_safety_comment = "warn"
-float_cmp = "warn"
-float_cmp_const = "warn"
-lossy_float_literal = "warn"
-cast_sign_loss = "warn"
-invalid_upcast_comparisons = "warn"
-rc_mutex = "warn"
-debug_assert_with_mut_call = "warn"
-iter_not_returning_iterator = "warn"
-expl_impl_clone_on_copy = "warn"
-infallible_try_from = "warn"
+[lints]
+workspace = true
 
 [dependencies]
 prime-field-layer = { path = "../prime-field-layer" }
-rand_core = { version = "0.9", default-features = false }
+rand_core = { workspace = true }
 
 [dev-dependencies]
-allocation-counter = "0.8"
-criterion = "0.5"
-proptest = "1"
-rand_chacha = { version = "0.9", default-features = false }
+allocation-counter = { workspace = true }
+criterion = { workspace = true }
+proptest = { workspace = true }
+rand_chacha = { workspace = true }
 
 [[bench]]
 name = "tdm"
