@@ -66,22 +66,6 @@
 //! # Ok::<(), prime_field_layer::FieldError>(())
 //! ```
 //!
-//! # Compile-time transform length
-//!
-//! [`StaticNttPlan`] evaluates roots, twiddles, and stage layout at compile time.
-//! Its array API makes transform-size mismatches compile-time type errors:
-//!
-//! ```
-//! use prime_field_layer::StaticNttPlan;
-//!
-//! let plan = StaticNttPlan::<17, 8>::new()?;
-//! let mut values = plan.elements(&[1, 2, 3, 4, 5, 6, 7, 8]);
-//! plan.forward(&mut values);
-//! plan.inverse(&mut values);
-//! assert_eq!(values.map(|value| value.value()), [1, 2, 3, 4, 5, 6, 7, 8]);
-//! # Ok::<(), prime_field_layer::FieldError>(())
-//! ```
-//!
 //! The arithmetic kernels are designed without coefficient-dependent control
 //! flow. Dispatch, allocation, errors, and loop counts depend on public modulus,
 //! platform, and slice lengths. This is a code-level timing precaution, not a

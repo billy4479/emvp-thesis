@@ -302,16 +302,17 @@ fn toeplitz_validation_and_length_errors_leave_output_unchanged() {
     assert_eq!(short_output, short_output_before);
 }
 
-fn explicit_fast_product() -> ToeplitzFastProduct<998_244_353, 3> {
+fn explicit_fast_product() -> ToeplitzFastProduct<998_244_353> {
+    let k = 3;
     let right = ToeplitzMap::new(6, 3, elements(&[2, 7, 1, 8, 2, 8, 1, 8])).unwrap();
     let pi_right = Permutation::new(vec![2, 5, 0, 4, 1, 3]).unwrap();
     let middle = ToeplitzMap::new(6, 6, elements(&[3, 1, 4, 1, 5, 9, 2, 6, 5, 3, 5])).unwrap();
     let pi_left = Permutation::new(vec![4, 0, 5, 2, 1, 3]).unwrap();
     let left = ToeplitzMap::new(3, 6, elements(&[8, 9, 7, 9, 3, 2, 3, 8])).unwrap();
-    ToeplitzFastProduct::new(right, pi_right, middle, pi_left, left).unwrap()
+    ToeplitzFastProduct::new(k, right, pi_right, middle, pi_left, left).unwrap()
 }
 
-fn fast_product_oracle(product: &ToeplitzFastProduct<998_244_353, 3>, input: &[u32]) -> Vec<u32> {
+fn fast_product_oracle(product: &ToeplitzFastProduct<998_244_353>, input: &[u32]) -> Vec<u32> {
     let right_diagonals = values(product.s_right().diagonals());
     let middle_diagonals = values(product.middle().diagonals());
     let left_diagonals = values(product.s_left().diagonals());
@@ -386,8 +387,8 @@ fn full_toeplitz_product_length_errors_leave_output_unchanged() {
 fn sampled_toeplitz_product_is_reproducible_from_seed() {
     let mut first_rng = ChaCha20Rng::from_seed([19; 32]);
     let mut second_rng = ChaCha20Rng::from_seed([19; 32]);
-    let first = ToeplitzFastProduct::<998_244_353, 5>::sample(&mut first_rng).unwrap();
-    let second = ToeplitzFastProduct::<998_244_353, 5>::sample(&mut second_rng).unwrap();
+    let first = ToeplitzFastProduct::<998_244_353>::sample(5, &mut first_rng).unwrap();
+    let second = ToeplitzFastProduct::<998_244_353>::sample(5, &mut second_rng).unwrap();
 
     assert_eq!(first.s_right().diagonals(), second.s_right().diagonals());
     assert_eq!(first.pi_right(), second.pi_right());
@@ -900,7 +901,7 @@ fn sampled_raa_is_reproducible_and_has_nonzero_weights() {
 #[test]
 fn toeplitz_product_k_one_matches_materialized_matrix() {
     let mut rng = ChaCha20Rng::from_seed([61; 32]);
-    let product = ToeplitzFastProduct::<17, 1>::sample(&mut rng).unwrap();
+    let product = ToeplitzFastProduct::<17>::sample(1, &mut rng).unwrap();
     let input = elements(&[7]);
     let mut structured = elements(&[0]);
     product

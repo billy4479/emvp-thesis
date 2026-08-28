@@ -17,11 +17,6 @@
 //! [`ExtensionFieldScratch`], whose allocation is reusable. Addition and
 //! subtraction need no scratch. Every public coefficient input may be any
 //! `u32`; every public output and stored modulus coefficient is canonical.
-//!
-//! [`StaticExtensionField`] uses [`StaticNttPlan`](crate::StaticNttPlan) when
-//! both the extension degree and transform length are protocol constants. The
-//! dynamic type remains the default because static specialization is
-//! size-dependent and adds transform tables to the binary.
 
 mod error;
 mod field;

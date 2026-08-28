@@ -2,7 +2,7 @@ use std::collections::VecDeque;
 
 use prime_field_layer::{FIELD_ELEMENT_ENCODED_SIZE, FieldElement, PrimeField};
 use rand_chacha::ChaCha8Rng;
-use rand_core::{CryptoRng, RngCore, SeedableRng};
+use rand_core::{Infallible, SeedableRng, TryCryptoRng, TryRng};
 
 #[derive(Debug)]
 struct ScriptedRng {
@@ -17,24 +17,34 @@ impl ScriptedRng {
             words_read: 0,
         }
     }
-}
 
-impl RngCore for ScriptedRng {
-    fn next_u32(&mut self) -> u32 {
+    fn next_word(&mut self) -> u32 {
         self.words_read += 1;
         self.words.pop_front().unwrap_or_default()
     }
+}
 
-    fn next_u64(&mut self) -> u64 {
-        u64::from(self.next_u32()) | u64::from(self.next_u32()) << 32
+impl TryRng for ScriptedRng {
+    type Error = Infallible;
+
+    fn try_next_u32(&mut self) -> Result<u32, Infallible> {
+        Ok(self.next_word())
     }
 
-    fn fill_bytes(&mut self, destination: &mut [u8]) {
-        rand_core::impls::fill_bytes_via_next(self, destination);
+    fn try_next_u64(&mut self) -> Result<u64, Infallible> {
+        Ok(u64::from(self.next_word()) | u64::from(self.next_word()) << 32)
+    }
+
+    fn try_fill_bytes(&mut self, destination: &mut [u8]) -> Result<(), Infallible> {
+        for chunk in destination.chunks_mut(4) {
+            let word = self.next_word().to_le_bytes();
+            chunk.copy_from_slice(&word[..chunk.len()]);
+        }
+        Ok(())
     }
 }
 
-impl CryptoRng for ScriptedRng {}
+impl TryCryptoRng for ScriptedRng {}
 
 fn element_values<const MODULUS: u32>(values: &[FieldElement<MODULUS>]) -> Vec<u32> {
     values.iter().map(|value| value.value()).collect()
