@@ -1,25 +1,28 @@
 # EMVP Experiments
 
-This project contains various experiments about the Encrypted Matrix-Vector Product algorithm described in `../paper/2025-858.pdf` and is part of the work for my thesis.
+This workspace is part of a larger project, read `../AGENTS.md` before continuing.
 
 ## Code style
 
-Performance is very important.
-Your code should be fast and use state-of-the-art algorithms.
-This code will be used for cryptography purposes, so prefer constant-time whenever possible.
+- Performance is very important.
+- Your code should be fast and use state-of-the-art algorithms.
+- This code will be used for cryptography purposes, so prefer constant-time whenever possible.
+- Simple but slightly slower is better than complex but slightly faster.
 
-## Benchmarks
+## Tests
 
-Benchmarks live in `prime-field-layer/benches`, split by purpose: 
-- `field` (field arithmetic)
-- `ntt` (NTT plans)
-- `crossover` (schoolbook/NTT dispatch crossover)
+Correctness comes before anything else. Write useful tests for your changes, which actually make sure the code is doing the right thing.
 
-Always benchmark your changes. If no suitable benchmark exist write a new one.
+## Benchmarks 
 
-For development iterations run `cargo bench --features bench-quick`: it runs trimmed matrices of `field`, `ntt`, and only and only takes a few minutes.
+When you need to implement a new feature or change something you should follow this procedure:
+- Look at the preexisting benchmarks and assess if they already cover what you are going to change.
+- If they are insufficient, write new ones.
+- Pick a subsection of benchmarks to run (the whole suite is very long to run) and save a baseline.
+- Implement your change.
+- Measure again against the baseline.
 
-The full `cargo bench` suite preserves the historical benchmark ids, so criterion baselines stay comparable across the split, but it takes a while: set a long timeout (60 minutes should be enough).
+Let a subagent do this benchmarking work, while you focus on the actual feature.
 
 ## References
 
