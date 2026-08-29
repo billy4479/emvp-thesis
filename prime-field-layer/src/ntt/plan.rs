@@ -3,23 +3,17 @@ use super::{
     PrimeField, Stage, select_backend, twiddle_powers,
 };
 
-#[cfg(target_arch = "x86_64")]
-use super::avx2;
-
 impl<const MODULUS: u32> NttPlan<MODULUS> {
-    /// Constructs a plan using automatic scalar or AVX2 dispatch.
+    /// Constructs a plan with the arithmetic chosen by the modulus.
     ///
     /// `length` must be a nonzero power of two dividing `MODULUS - 1`. Setup
     /// takes `O(length + log MODULUS)` field operations and uses `O(length)`
     /// retained and temporary storage for roots and stage twiddles. Prefer this
     /// constructor for normal use, then reuse the plan across operations.
     ///
-    /// On x86-64 with runtime AVX2 support and `MODULUS < 2^31`, automatic
-    /// dispatch uses compiler-vectorized AVX2 transforms from length 16. The
-    /// lazy kernel covers moduli below `2^30`; larger moduli use reduced Shoup
-    /// butterflies. Other targets select the applicable scalar backend.
-    /// Use [`Self::new_scalar`] for
-    /// portable benchmarking or [`Self::new_avx2`] to require AVX2 butterflies.
+    /// Modulus bounds choose among lazy Shoup, reduced Shoup, and Montgomery
+    /// butterflies. Use [`Self::new_scalar`] for a construction marked as an
+    /// explicit portable-kernel request.
     ///
     /// # Errors
     ///
@@ -29,39 +23,21 @@ impl<const MODULUS: u32> NttPlan<MODULUS> {
         Self::with_backend(length, BackendPreference::Auto)
     }
 
-    /// Constructs a plan that requests portable scalar transform kernels.
+    /// Constructs a plan marked as an explicit portable-kernel request.
     ///
     /// Length requirements, `O(length + log MODULUS)` setup time, and
-    /// `O(length)` allocation are the same as for [`Self::new`]. This is useful
-    /// for reproducible deployment and backend comparisons; prefer [`Self::new`]
-    /// when runtime acceleration is wanted. Modulus bounds still choose among
-    /// lazy Shoup, reduced Shoup, and Montgomery scalar arithmetic.
+    /// `O(length)` allocation are the same as for [`Self::new`]. The produced
+    /// plan behaves identically to one from [`Self::new`];
+    /// [`Self::performance_warning`] reports
+    /// [`NttPerformanceWarning::ScalarRequested`] unless a wide modulus
+    /// produces the more specific Montgomery fallback warning.
     ///
     /// # Errors
     ///
     /// Returns [`FieldError::UnsupportedTransformLength`] for an unsupported
-    /// length. [`Self::performance_warning`] normally reports
-    /// [`NttPerformanceWarning::ScalarRequested`], except when a wide modulus
-    /// produces a more specific fallback warning.
+    /// length.
     pub fn new_scalar(length: usize) -> Result<Self, FieldError> {
         Self::with_backend(length, BackendPreference::Scalar)
-    }
-
-    /// Constructs a plan that requires AVX2 Shoup butterflies.
-    ///
-    /// This is intended for testing and platform tuning; [`Self::new`] is
-    /// preferable for normal dispatch. It uses AVX2 at every supported length,
-    /// including lengths where automatic plans use scalar butterflies. Setup is
-    /// `O(length + log MODULUS)` with `O(length)` retained and temporary storage.
-    ///
-    /// # Errors
-    ///
-    /// In addition to [`FieldError::UnsupportedTransformLength`], this returns
-    /// [`FieldError::Avx2Unavailable`] unless the target is x86-64, AVX2
-    /// is detected at runtime, and `MODULUS < 2^31`. No plan is returned with a
-    /// scalar fallback.
-    pub fn new_avx2(length: usize) -> Result<Self, FieldError> {
-        Self::with_backend(length, BackendPreference::Avx2)
     }
 
     fn with_backend(length: usize, preference: BackendPreference) -> Result<Self, FieldError> {
@@ -71,7 +47,7 @@ impl<const MODULUS: u32> NttPlan<MODULUS> {
         let inverse_length = field.element(u64::from(
             field.inv((length as u64 % u64::from(MODULUS)) as u32)?,
         ));
-        let (backend, warning) = select_backend::<MODULUS>(length, preference)?;
+        let (backend, warning) = select_backend::<MODULUS>(preference);
         let forward_powers = twiddle_powers(field, root, length / 2);
         let inverse_powers = twiddle_powers(field, inverse_root, length / 2);
 
@@ -186,24 +162,6 @@ impl<const MODULUS: u32> NttPlan<MODULUS> {
             }
             NttBackend::ScalarShoup => self.forward_shoup(values),
             NttBackend::ScalarMontgomery => self.forward_montgomery(values),
-            NttBackend::Avx2ShoupLazy => {
-                #[cfg(target_arch = "x86_64")]
-                // SAFETY: this backend is selected only after runtime AVX2 detection.
-                unsafe {
-                    avx2::forward(values, &self.stages);
-                }
-                #[cfg(not(target_arch = "x86_64"))]
-                unreachable!()
-            }
-            NttBackend::Avx2Shoup => {
-                #[cfg(target_arch = "x86_64")]
-                // SAFETY: this backend is selected only after runtime AVX2 detection.
-                unsafe {
-                    avx2::forward_reduced(values, &self.stages);
-                }
-                #[cfg(not(target_arch = "x86_64"))]
-                unreachable!()
-            }
         }
         Ok(())
     }
@@ -217,8 +175,8 @@ impl<const MODULUS: u32> NttPlan<MODULUS> {
     /// [`FieldElement::value`] for canonical `u32` residues.
     ///
     /// The operation takes `O(N log N)` time and allocates nothing. It uses the
-    /// plan's transform backend, then uses the field's independently
-    /// runtime-dispatched bulk scalar multiplication for normalization.
+    /// plan's transform kernel, then multiplies by `N^-1` through the field's
+    /// bulk scalar multiplication for normalization.
     ///
     /// # Errors
     ///
@@ -233,24 +191,6 @@ impl<const MODULUS: u32> NttPlan<MODULUS> {
             }
             NttBackend::ScalarShoup => self.inverse_shoup(values),
             NttBackend::ScalarMontgomery => self.inverse_montgomery(values),
-            NttBackend::Avx2ShoupLazy => {
-                #[cfg(target_arch = "x86_64")]
-                // SAFETY: this backend is selected only after runtime AVX2 detection.
-                unsafe {
-                    avx2::inverse(values, &self.stages);
-                }
-                #[cfg(not(target_arch = "x86_64"))]
-                unreachable!()
-            }
-            NttBackend::Avx2Shoup => {
-                #[cfg(target_arch = "x86_64")]
-                // SAFETY: this backend is selected only after runtime AVX2 detection.
-                unsafe {
-                    avx2::inverse_reduced(values, &self.stages);
-                }
-                #[cfg(not(target_arch = "x86_64"))]
-                unreachable!()
-            }
         }
         self.field
             .scalar_mul_elements_assign(values, self.inverse_length);
@@ -266,8 +206,7 @@ impl<const MODULUS: u32> NttPlan<MODULUS> {
     /// convolution. Prefer [`Self::cyclic_convolution`] for a one-call product.
     ///
     /// This takes `O(N)` time and allocates nothing. It calls
-    /// [`PrimeField::mul_elements_assign`], whose runtime AVX2 dispatch is
-    /// independent of the transform backend.
+    /// [`PrimeField::mul_elements_assign`], the field's bulk Montgomery kernel.
     ///
     /// # Errors
     ///

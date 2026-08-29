@@ -1,40 +1,6 @@
-use std::alloc::{GlobalAlloc, Layout, System};
-use std::cell::Cell;
-use std::sync::atomic::{AtomicUsize, Ordering};
-
 use prime_field_layer::{
     ExtensionField, ExtensionFieldError, FieldError, PolynomialAlgorithm, PolynomialReductionPlan,
 };
-
-struct CountingAllocator;
-
-thread_local! {
-    static COUNT_ALLOCATIONS: Cell<bool> = const { Cell::new(false) };
-}
-
-static ALLOCATIONS: AtomicUsize = AtomicUsize::new(0);
-
-// SAFETY: every allocation and deallocation is forwarded to `System` unchanged;
-// the wrapper only increments a thread-local test counter before allocation.
-unsafe impl GlobalAlloc for CountingAllocator {
-    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        COUNT_ALLOCATIONS.with(|enabled| {
-            if enabled.get() {
-                let _ = ALLOCATIONS.fetch_add(1, Ordering::Relaxed);
-            }
-        });
-        // SAFETY: forwarding the allocator contract and layout unchanged.
-        unsafe { System.alloc(layout) }
-    }
-
-    unsafe fn dealloc(&self, pointer: *mut u8, layout: Layout) {
-        // SAFETY: the pointer came from `System` with this layout above.
-        unsafe { System.dealloc(pointer, layout) };
-    }
-}
-
-#[global_allocator]
-static ALLOCATOR: CountingAllocator = CountingAllocator;
 
 fn canonical(value: u32, modulus: u32) -> u32 {
     (u64::from(value) % u64::from(modulus)) as u32
@@ -120,13 +86,13 @@ fn checked_extension_arithmetic_matches_independent_oracle() {
     assert_eq!(square, oracle_mul(k, MODULUS, &modulus, &lhs, &lhs));
 
     {
-        let mut lhs_copy = lhs.clone();
+        let mut lhs_copy = lhs;
         extension.add_assign(&mut lhs_copy, &rhs).unwrap();
         assert_eq!(lhs_copy, [16, 15, 0, 16]);
     }
 
     {
-        let mut lhs_copy = lhs.clone();
+        let mut lhs_copy = lhs;
         extension.sub_assign(&mut lhs_copy, &rhs).unwrap();
         assert_eq!(lhs_copy, [1, 2, 2, 16]);
     }
@@ -271,14 +237,13 @@ fn caller_scratch_reuses_all_allocations() {
     extension
         .mul(&lhs, &rhs, &mut output, &mut scratch)
         .unwrap();
-    ALLOCATIONS.store(0, Ordering::Relaxed);
-    COUNT_ALLOCATIONS.with(|enabled| enabled.set(true));
-    for _ in 0..8 {
-        extension
-            .mul(&lhs, &rhs, &mut output, &mut scratch)
-            .unwrap();
-        extension.square(&lhs, &mut output, &mut scratch).unwrap();
-    }
-    COUNT_ALLOCATIONS.with(|enabled| enabled.set(false));
-    assert_eq!(ALLOCATIONS.load(Ordering::Relaxed), 0);
+    let allocations = allocation_counter::measure(|| {
+        for _ in 0..8 {
+            extension
+                .mul(&lhs, &rhs, &mut output, &mut scratch)
+                .unwrap();
+            extension.square(&lhs, &mut output, &mut scratch).unwrap();
+        }
+    });
+    assert_eq!(allocations.count_total, 0);
 }

@@ -1,57 +1,10 @@
 use super::*;
 
 #[test]
-#[cfg(target_arch = "x86_64")]
-fn forced_avx2_matches_forced_scalar() {
-    fn check<const MODULUS: u32>() {
-        let scalar = NttPlan::<MODULUS>::new_scalar(256).unwrap();
-        let avx2 = NttPlan::<MODULUS>::new_avx2(256).unwrap();
-        let boundaries = [0, 1, MODULUS / 2, MODULUS - 2, MODULUS - 1];
-        let input: Vec<_> = (0_u64..256)
-            .map(|index| {
-                if index < boundaries.len() as u64 {
-                    boundaries[index as usize]
-                } else {
-                    ((index * 2_654_435_761 + 97) % u64::from(MODULUS)) as u32
-                }
-            })
-            .collect();
-        let mut scalar_values = scalar.elements(&input);
-        let mut avx2_values = avx2.elements(&input);
-        scalar.forward(&mut scalar_values).unwrap();
-        avx2.forward(&mut avx2_values).unwrap();
-        assert_eq!(avx2_values, scalar_values);
-
-        let scalar_rhs = scalar_values.clone();
-        let avx2_rhs = avx2_values.clone();
-        scalar
-            .pointwise_mul_assign(&mut scalar_values, &scalar_rhs)
-            .unwrap();
-        avx2.pointwise_mul_assign(&mut avx2_values, &avx2_rhs)
-            .unwrap();
-        assert_eq!(avx2_values, scalar_values);
-        scalar.inverse(&mut scalar_values).unwrap();
-        avx2.inverse(&mut avx2_values).unwrap();
-        assert_eq!(avx2_values, scalar_values);
-    }
-
-    if !std::arch::is_x86_feature_detected!("avx2") {
-        return;
-    }
-    check::<998_244_353>();
-    check::<2_013_265_921>();
-}
-
-#[test]
-#[cfg(target_arch = "x86_64")]
-fn avx2_lazy_boundaries_match_scalar_and_normalize_output() {
+fn lazy_boundaries_round_trip_and_normalize_output() {
     const MODULUS: u32 = 998_244_353;
 
-    if !std::arch::is_x86_feature_detected!("avx2") {
-        return;
-    }
-    let scalar = NttPlan::<MODULUS>::new_scalar(256).unwrap();
-    let avx2 = NttPlan::<MODULUS>::new_avx2(256).unwrap();
+    let plan = NttPlan::<MODULUS>::new_scalar(256).unwrap();
     // Every endpoint of the [0, 4p) forward lazy interval, plus the
     // interior boundaries at p and 3p.
     let boundaries = [
@@ -67,8 +20,8 @@ fn avx2_lazy_boundaries_match_scalar_and_normalize_output() {
         4 * MODULUS - 1,
     ];
     let mut state = 0xd1b5_4a32_d192_ed03u64;
-    let mut scalar_values = vec![scalar.field.element(0); 256];
-    for (index, value) in scalar_values.iter_mut().enumerate() {
+    let mut values = vec![plan.field.element(0); 256];
+    for (index, value) in values.iter_mut().enumerate() {
         state ^= state << 7;
         state ^= state >> 9;
         let raw = if index < boundaries.len() {
@@ -78,33 +31,30 @@ fn avx2_lazy_boundaries_match_scalar_and_normalize_output() {
         };
         value.set_montgomery(raw);
     }
-    let mut avx2_values = scalar_values.clone();
-    scalar.forward(&mut scalar_values).unwrap();
-    avx2.forward(&mut avx2_values).unwrap();
-    assert_eq!(avx2_values, scalar_values);
-    assert!(avx2_values.iter().all(|value| value.montgomery() < MODULUS));
-    scalar.inverse(&mut scalar_values).unwrap();
-    avx2.inverse(&mut avx2_values).unwrap();
-    assert_eq!(avx2_values, scalar_values);
-    assert!(avx2_values.iter().all(|value| value.montgomery() < MODULUS));
+    // forward∘inverse is the identity on field elements, so a planted raw
+    // Montgomery word `w` (representing `w * R^-1 mod p`) comes back as the
+    // canonical word `w mod p`.
+    let expected: Vec<_> = values.iter().map(|v| v.montgomery() % MODULUS).collect();
+    plan.forward(&mut values).unwrap();
+    assert!(values.iter().all(|value| value.montgomery() < MODULUS));
+    plan.inverse(&mut values).unwrap();
+    assert_eq!(
+        values.iter().map(|v| v.montgomery()).collect::<Vec<_>>(),
+        expected
+    );
 }
 
 #[test]
-#[cfg(target_arch = "x86_64")]
-fn avx2_lazy_inverse_boundaries_match_scalar_and_normalize_output() {
+fn lazy_inverse_boundaries_round_trip_and_normalize_output() {
     const MODULUS: u32 = 998_244_353;
 
-    if !std::arch::is_x86_feature_detected!("avx2") {
-        return;
-    }
-    let scalar = NttPlan::<MODULUS>::new_scalar(256).unwrap();
-    let avx2 = NttPlan::<MODULUS>::new_avx2(256).unwrap();
+    let plan = NttPlan::<MODULUS>::new_scalar(256).unwrap();
     // Endpoints of the [0, 2p) inverse lazy interval, seeded directly
     // into the inverse transform without a prior forward pass.
     let boundaries = [0, 1, MODULUS - 1, MODULUS, 2 * MODULUS - 2, 2 * MODULUS - 1];
     let mut state = 0x9e37_79b9_7f4a_7c15u64;
-    let mut scalar_values = vec![scalar.field.element(0); 256];
-    for (index, value) in scalar_values.iter_mut().enumerate() {
+    let mut values = vec![plan.field.element(0); 256];
+    for (index, value) in values.iter_mut().enumerate() {
         state ^= state << 7;
         state ^= state >> 9;
         state ^= state << 8;
@@ -115,11 +65,18 @@ fn avx2_lazy_inverse_boundaries_match_scalar_and_normalize_output() {
         };
         value.set_montgomery(raw);
     }
-    let mut avx2_values = scalar_values.clone();
-    scalar.inverse(&mut scalar_values).unwrap();
-    avx2.inverse(&mut avx2_values).unwrap();
-    assert_eq!(avx2_values, scalar_values);
-    assert!(avx2_values.iter().all(|value| value.montgomery() < MODULUS));
+    // The first inverse stage consumes the planted lazy words directly from
+    // `[0, 2p)`, then forward∘inverse returns the identity, so a raw
+    // Montgomery word `w` (representing `w * R^-1 mod p`) comes back as the
+    // canonical word `w mod p`.
+    let expected: Vec<_> = values.iter().map(|v| v.montgomery() % MODULUS).collect();
+    plan.inverse(&mut values).unwrap();
+    assert!(values.iter().all(|value| value.montgomery() < MODULUS));
+    plan.forward(&mut values).unwrap();
+    assert_eq!(
+        values.iter().map(|v| v.montgomery()).collect::<Vec<_>>(),
+        expected
+    );
 }
 
 #[test]

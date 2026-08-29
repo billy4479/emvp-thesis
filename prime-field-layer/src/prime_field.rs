@@ -11,7 +11,6 @@ pub enum FieldError {
     UnsupportedTransformLength(usize),
     PlanTooSmall { required: usize, available: usize },
     ConvolutionLengthOverflow,
-    Avx2Unavailable,
 }
 
 impl fmt::Display for FieldError {
@@ -34,9 +33,6 @@ impl fmt::Display for FieldError {
             ),
             Self::ConvolutionLengthOverflow => formatter
                 .write_str("convolution result or required transform length does not fit in usize"),
-            Self::Avx2Unavailable => {
-                formatter.write_str("AVX2 NTT butterflies are unavailable for this plan")
-            }
         }
     }
 }

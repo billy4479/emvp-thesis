@@ -66,6 +66,13 @@ impl<const MODULUS: u32> NttPlan<MODULUS> {
         normalize(values);
     }
 
+    // Reduced Shoup butterflies for the `2^30 <= p < 2^31` tier, mirroring
+    // the portable kernel that previously served the AVX2 backend. Every
+    // operand and sum fits a `u32`: inputs are canonical, the uncorrected
+    // Shoup product lies in `[0, 2p)`, and `lhs + product` and
+    // `lhs + p - product` stay below `2p < 2^32`. Each result therefore needs
+    // exactly one masked `reduce_once`, avoiding the wide `add_mod` and
+    // `sub_mod` helpers whose inline assembly would block loop vectorization.
     pub(super) fn forward_shoup(&self, values: &mut [FieldElement<MODULUS>]) {
         for stage in self.stages.iter() {
             for (block, &twiddle) in stage.forward.iter().enumerate() {
@@ -78,8 +85,11 @@ impl<const MODULUS: u32> NttPlan<MODULUS> {
                         shoup_mul_lazy_for::<MODULUS>(rhs_value.montgomery(), twiddle),
                         MODULUS,
                     );
-                    lhs_value.set_montgomery(add_mod::<MODULUS>(lhs, product));
-                    rhs_value.set_montgomery(sub_mod::<MODULUS>(lhs, product));
+                    lhs_value.set_montgomery(reduce_once(lhs.wrapping_add(product), MODULUS));
+                    rhs_value.set_montgomery(reduce_once(
+                        lhs.wrapping_add(MODULUS).wrapping_sub(product),
+                        MODULUS,
+                    ));
                 }
             }
         }
@@ -94,9 +104,9 @@ impl<const MODULUS: u32> NttPlan<MODULUS> {
                 for (lhs_value, rhs_value) in lhs_values.iter_mut().zip(rhs_values) {
                     let lhs = lhs_value.montgomery();
                     let rhs = rhs_value.montgomery();
-                    lhs_value.set_montgomery(add_mod::<MODULUS>(lhs, rhs));
+                    lhs_value.set_montgomery(reduce_once(lhs.wrapping_add(rhs), MODULUS));
                     rhs_value.set_montgomery(shoup_mul::<MODULUS>(
-                        sub_mod::<MODULUS>(lhs, rhs),
+                        reduce_once(lhs.wrapping_add(MODULUS).wrapping_sub(rhs), MODULUS),
                         twiddle,
                     ));
                 }

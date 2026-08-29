@@ -27,18 +27,18 @@ fn boundary_values(modulus: u32) -> Vec<u32> {
 }
 
 fn check_pair<const MODULUS: u32>(field: PrimeField<MODULUS>, lhs: u32, rhs: u32) {
-    let modulus = MODULUS as u64;
+    let modulus = u64::from(MODULUS);
     assert_eq!(
         field.add_canonical(lhs, rhs),
-        ((lhs as u64 + rhs as u64) % modulus) as u32
+        ((u64::from(lhs) + u64::from(rhs)) % modulus) as u32
     );
     assert_eq!(
         field.sub_canonical(lhs, rhs),
-        ((lhs as u64 + modulus - rhs as u64) % modulus) as u32
+        ((u64::from(lhs) + modulus - u64::from(rhs)) % modulus) as u32
     );
     assert_eq!(
         field.mul(lhs, rhs),
-        (lhs as u64 * rhs as u64 % modulus) as u32
+        (u64::from(lhs) * u64::from(rhs) % modulus) as u32
     );
 }
 
@@ -90,14 +90,14 @@ fn check_reduction<const MODULUS: u32>() {
     let values = [
         0,
         1,
-        MODULUS as u64 - 1,
-        MODULUS as u64,
-        MODULUS as u64 + 1,
-        u32::MAX as u64,
+        u64::from(MODULUS) - 1,
+        u64::from(MODULUS),
+        u64::from(MODULUS) + 1,
+        u64::from(u32::MAX),
         u64::MAX,
     ];
     for value in values {
-        assert_eq!(field.reduce_u64(value), (value % MODULUS as u64) as u32);
+        assert_eq!(field.reduce_u64(value), (value % u64::from(MODULUS)) as u32);
     }
 }
 
@@ -112,7 +112,19 @@ fn reduction_handles_full_u64_range() {
 
 fn check_exponentiation<const MODULUS: u32>() {
     let field = PrimeField::<MODULUS>::new();
-    let exponents = [0, 1, 2, 3, 15, 16, 31, 32, 1_000, u32::MAX as u64, u64::MAX];
+    let exponents = [
+        0,
+        1,
+        2,
+        3,
+        15,
+        16,
+        31,
+        32,
+        1_000,
+        u64::from(u32::MAX),
+        u64::MAX,
+    ];
     for base in boundary_values(MODULUS) {
         for exponent in exponents {
             assert_eq!(
@@ -202,19 +214,20 @@ fn full_width_raw_operations_documented_as_reducing_match_the_oracle() {
 
 fn check_random<const MODULUS: u32>(lhs: u32, rhs: u32, exponent: u32) {
     let field = PrimeField::<MODULUS>::new();
-    let lhs = (lhs as u64 % MODULUS as u64) as u32;
-    let rhs = (rhs as u64 % MODULUS as u64) as u32;
-    let expected_add = ((lhs as u64 + rhs as u64) % MODULUS as u64) as u32;
-    let expected_sub = ((lhs as u64 + MODULUS as u64 - rhs as u64) % MODULUS as u64) as u32;
-    let expected_mul = (lhs as u64 * rhs as u64 % MODULUS as u64) as u32;
+    let lhs = (u64::from(lhs) % u64::from(MODULUS)) as u32;
+    let rhs = (u64::from(rhs) % u64::from(MODULUS)) as u32;
+    let expected_add = ((u64::from(lhs) + u64::from(rhs)) % u64::from(MODULUS)) as u32;
+    let expected_sub =
+        ((u64::from(lhs) + u64::from(MODULUS) - u64::from(rhs)) % u64::from(MODULUS)) as u32;
+    let expected_mul = (u64::from(lhs) * u64::from(rhs) % u64::from(MODULUS)) as u32;
 
     assert_eq!(field.add_canonical(lhs, rhs), expected_add);
     assert_eq!(field.sub_canonical(lhs, rhs), expected_sub);
     assert_eq!(field.mul(lhs, rhs), expected_mul);
     assert_eq!(field.square(lhs), field.mul(lhs, lhs));
     assert_eq!(
-        field.pow(lhs, exponent as u64),
-        oracle_pow(lhs, exponent as u64, MODULUS)
+        field.pow(lhs, u64::from(exponent)),
+        oracle_pow(lhs, u64::from(exponent), MODULUS)
     );
 }
 

@@ -1,4 +1,4 @@
-use crate::constant_time::{add_with_carry_shr_32, reduce_once_u64};
+use crate::constant_time::reduce_once_u64;
 
 use super::{FieldError, PrimeField};
 
@@ -48,6 +48,21 @@ impl<const MODULUS: u32> PrimeField<MODULUS> {
         self.mul(value, value)
     }
 
+    /// Branchless Montgomery multiplication without inline assembly.
+    ///
+    /// The inline-assembly helpers in `constant_time` are opaque to LLVM and
+    /// prevent loop vectorization, so this REDC uses portable wrapping
+    /// arithmetic and mask selections instead. Scalar code lowers it to the
+    /// same `add`/`sbb` and `sub`/`cmov` sequences as the assembly version,
+    /// while auto-vectorized loops can schedule the whole body with vector
+    /// compares and multiplies. Callers ensure `MODULUS != 2`.
+    ///
+    /// Bounds: for Montgomery operands `lhs`, `rhs` below `R = 2^32`, the
+    /// product is below `R * p` and the correction `m * p` below `R * p`, so
+    /// the wrapping sum is below `2 * R * p`. The carry out of bit 63 therefore
+    /// belongs in bit 32 of the shifted result, matching an `add`/`sbb`
+    /// sequence, and the shifted value is below `2p`, so one masked
+    /// subtraction restores `[0, p)`.
     #[inline(always)]
     pub(crate) fn montgomery_mul(lhs: u32, rhs: u32) -> u32 {
         if MODULUS == 2 {
@@ -56,9 +71,10 @@ impl<const MODULUS: u32> PrimeField<MODULUS> {
 
         let product = u64::from(lhs) * u64::from(rhs);
         let adjustment = (product as u32).wrapping_mul(Self::MONTGOMERY_NEG_INV);
-        let reduced = add_with_carry_shr_32(product, u64::from(adjustment) * Self::MODULUS_U64);
-
-        reduce_once_u64(reduced, Self::MODULUS_U64) as u32
+        let sum = product.wrapping_add(u64::from(adjustment) * u64::from(MODULUS));
+        let carry = u64::from(sum < product) << 32;
+        let reduced = (sum >> 32) | carry;
+        reduced.wrapping_sub(u64::from(reduced >= u64::from(MODULUS)) * u64::from(MODULUS)) as u32
     }
 
     #[inline(always)]

@@ -12,8 +12,7 @@ This code will be used for cryptography purposes, so prefer constant-time whenev
 
 Benchmarks live in `prime-field-layer/benches`, split by purpose: 
 - `field` (field arithmetic)
-- `ntt` (auto-dispatch NTT plans)
-- `backends` (forced scalar vs AVX2)
+- `ntt` (NTT plans)
 - `crossover` (schoolbook/NTT dispatch crossover)
 
 Always benchmark your changes. If no suitable benchmark exist write a new one.

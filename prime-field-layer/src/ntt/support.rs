@@ -1,66 +1,31 @@
 use super::{
-    FieldElement, FieldError, NttBackend, NttPerformanceWarning, PrimeField, Twiddle,
-    reduce_once_u64,
+    FieldElement, NttBackend, NttPerformanceWarning, PrimeField, Twiddle, reduce_once_u64,
 };
 
 #[derive(Clone, Copy)]
 pub(super) enum BackendPreference {
     Auto,
     Scalar,
-    Avx2,
 }
 pub(super) fn select_backend<const MODULUS: u32>(
-    length: usize,
     preference: BackendPreference,
-) -> Result<(NttBackend, Option<NttPerformanceWarning>), FieldError> {
-    if matches!(preference, BackendPreference::Avx2) && MODULUS >= 1 << 31 {
-        return Err(FieldError::Avx2Unavailable);
-    }
+) -> (NttBackend, Option<NttPerformanceWarning>) {
     if MODULUS >= 1 << 31 {
-        return Ok((
+        return (
             NttBackend::ScalarMontgomery,
             Some(NttPerformanceWarning::MontgomeryFallback),
-        ));
+        );
     }
-    let scalar_backend = if MODULUS < 1 << 30 {
+    let backend = if MODULUS < 1 << 30 {
         NttBackend::ScalarShoupLazy
     } else {
         NttBackend::ScalarShoup
     };
-    let avx2_backend = if MODULUS < 1 << 30 {
-        NttBackend::Avx2ShoupLazy
-    } else {
-        NttBackend::Avx2Shoup
+    let warning = match preference {
+        BackendPreference::Auto => None,
+        BackendPreference::Scalar => Some(NttPerformanceWarning::ScalarRequested),
     };
-    if matches!(preference, BackendPreference::Scalar) {
-        return Ok((scalar_backend, Some(NttPerformanceWarning::ScalarRequested)));
-    }
-    #[cfg(target_arch = "x86_64")]
-    {
-        if matches!(preference, BackendPreference::Avx2) {
-            return if std::arch::is_x86_feature_detected!("avx2") {
-                Ok((avx2_backend, None))
-            } else {
-                Err(FieldError::Avx2Unavailable)
-            };
-        }
-        if std::arch::is_x86_feature_detected!("avx2") && length >= 16 {
-            return Ok((avx2_backend, None));
-        }
-    }
-    #[cfg(not(target_arch = "x86_64"))]
-    if matches!(preference, BackendPreference::Avx2) {
-        return Err(FieldError::Avx2Unavailable);
-    }
-    #[cfg(target_arch = "x86_64")]
-    let warning = if length < 16 {
-        NttPerformanceWarning::TransformTooShortForAvx2
-    } else {
-        NttPerformanceWarning::Avx2Unavailable
-    };
-    #[cfg(not(target_arch = "x86_64"))]
-    let warning = NttPerformanceWarning::Avx2Unavailable;
-    Ok((scalar_backend, Some(warning)))
+    (backend, warning)
 }
 pub(super) fn make_twiddle<const MODULUS: u32>(
     field: PrimeField<MODULUS>,
@@ -149,9 +114,20 @@ pub(super) fn halve_interval(value: u32, two_p: u32) -> u32 {
     value.min(value.wrapping_sub(two_p))
 }
 
+/// Subtracts `modulus` from a value in `[0, 2 * modulus)` with one mask.
+///
+/// The wrapping difference `value - modulus` underflows exactly when
+/// `value < modulus`; `0u32.wrapping_sub(borrow)` then materializes either
+/// all ones or zero, so the expression returns `value - modulus` or `value`
+/// unchanged with no coefficient-dependent branch. This is deliberately
+/// portable Rust rather than the inline assembly of `constant_time`:
+/// assembly is opaque to LLVM and blocks loop vectorization, while this form
+/// lowers to the same `sub`/`cmov` sequence in scalar code and to vector
+/// compares and selects inside auto-vectorized loops.
 #[inline(always)]
-pub(super) fn reduce_once(value: u32, modulus: u32) -> u32 {
-    reduce_once_u64(u64::from(value), u64::from(modulus)) as u32
+pub(super) const fn reduce_once(value: u32, modulus: u32) -> u32 {
+    let (reduced, borrow) = value.overflowing_sub(modulus);
+    reduced.wrapping_add(modulus & 0u32.wrapping_sub(borrow as u32))
 }
 
 #[inline(always)]

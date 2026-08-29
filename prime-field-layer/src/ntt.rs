@@ -79,8 +79,6 @@ use std::{fmt, sync::Arc};
 
 use crate::{FieldElement, FieldError, PrimeField, constant_time::reduce_once_u64};
 
-#[cfg(target_arch = "x86_64")]
-mod avx2;
 mod convolution;
 mod plan;
 mod scalar;
@@ -95,72 +93,48 @@ use support::{
 
 pub use convolution::linear_convolution;
 
-/// Arithmetic and instruction-set implementation selected for an [`NttPlan`].
+/// Arithmetic implementation selected for an [`NttPlan`].
 ///
 /// Selection occurs once during construction. Inspect this value for
 /// diagnostics or benchmarking, not to infer transform ordering or results:
 /// all variants implement the same field transform. This describes butterfly
-/// dispatch only; pointwise products and inverse normalization dispatch through
-/// [`PrimeField`] independently.
+/// selection only; pointwise products and inverse normalization go through
+/// [`PrimeField`].
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum NttBackend {
-    /// Scalar lazy Harvey Shoup butterflies with one correction per butterfly.
+    /// Lazy Harvey Shoup butterflies with one correction per butterfly.
     ///
     /// Forward stages keep residues in `[0, 4p)` and inverse stages in
     /// `[0, 2p)`, so each butterfly needs a single conditional halving and the
-    /// lazy products absorb unreduced inputs. Used for `p < 2^30` when scalar
-    /// transforms are requested or AVX2 is not selected. Public transform
-    /// outputs are normalized to Montgomery residues in `[0, p)`.
+    /// lazy products absorb unreduced inputs. Used for `p < 2^30`. Public
+    /// transform outputs are normalized to Montgomery residues in `[0, p)`.
     ScalarShoupLazy,
-    /// Scalar Shoup butterflies reduced to `[0, p)` after each butterfly.
+    /// Shoup butterflies reduced to `[0, p)` after each butterfly.
     ///
     /// Used for `2^30 <= p < 2^31`, where the lazy kernel's bounds do not fit.
     ScalarShoup,
-    /// Scalar Montgomery butterflies for moduli at least `2^31`.
+    /// Montgomery butterflies for moduli at least `2^31`.
     ///
     /// This general fallback supports wide `u32` primes but does not use the
-    /// Shoup or AVX2 transform kernels.
+    /// Shoup transform kernels.
     ScalarMontgomery,
-    /// LLVM-vectorized AVX2 lazy Harvey Shoup butterflies, one correction per
-    /// butterfly, with the same `[0, 4p)` forward and `[0, 2p)` inverse lazy
-    /// intervals as [`NttBackend::ScalarShoupLazy`].
-    ///
-    /// Available only on x86-64 after runtime AVX2 detection, for
-    /// `p < 2^30`. Public transform outputs are normalized to `[0, p)`.
-    Avx2ShoupLazy,
-    /// LLVM-vectorized AVX2 Shoup butterflies reduced to `[0, p)` after each
-    /// butterfly.
-    ///
-    /// Available only on x86-64 after runtime AVX2 detection, for
-    /// `2^30 <= p < 2^31`.
-    Avx2Shoup,
 }
 
-/// A typed explanation for scalar-transform fallback or explicit selection.
+/// A typed explanation for a slower-than-ideal transform configuration.
 ///
 /// [`NttPlan::performance_warning`] reports at most one construction-time
-/// reason. `None` means the selected automatic or forced backend has no warning;
-/// it does not guarantee that every operation is vectorized.
+/// reason. `None` means the selected plan has no warning.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum NttPerformanceWarning {
-    /// Runtime AVX2 detection failed, or the target architecture has no AVX2
-    /// backend.
-    Avx2Unavailable,
-    /// The transform has fewer than 16 elements, below automatic AVX2 use.
-    TransformTooShortForAvx2,
-    /// [`NttPlan::new_scalar`] explicitly requested a portable scalar backend.
+    /// [`NttPlan::new_scalar`] explicitly requested the portable kernel.
     ScalarRequested,
-    /// The modulus is at least `2^31`, requiring scalar Montgomery butterflies.
+    /// The modulus is at least `2^31`, requiring Montgomery butterflies.
     MontgomeryFallback,
 }
 
 impl fmt::Display for NttPerformanceWarning {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Avx2Unavailable => formatter.write_str("AVX2 Shoup butterflies are unavailable"),
-            Self::TransformTooShortForAvx2 => {
-                formatter.write_str("the transform is too short for AVX2 dispatch")
-            }
             Self::ScalarRequested => formatter.write_str("the scalar backend was requested"),
             Self::MontgomeryFallback => {
                 formatter.write_str("the modulus requires scalar Montgomery butterflies")
@@ -186,7 +160,7 @@ struct Stage {
 /// A reusable power-of-two NTT and convolution plan.
 ///
 /// A plan fixes the prime modulus, length, roots, inverse normalization, and
-/// runtime-selected [`NttBackend`]. Construction allocates and retains `O(N)`
+/// selected [`NttBackend`]. Construction allocates and retains `O(N)`
 /// stage-ordered twiddles and takes `O(N + log MODULUS)` field operations.
 /// Clones share those immutable tables through reference counting. Reusing one
 /// avoids setup for subsequent `O(N log N)` transforms and convolutions.

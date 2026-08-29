@@ -17,8 +17,8 @@ pub fn oracle_dft<const MODULUS: u32>(input: &[u32], root: u32) -> Vec<u32> {
     (0..input.len())
         .map(|frequency| {
             input.iter().enumerate().fold(0u64, |sum, (index, &value)| {
-                (sum + value as u64 * oracle_pow(root, index * frequency, MODULUS) as u64)
-                    % MODULUS as u64
+                (sum + u64::from(value) * u64::from(oracle_pow(root, index * frequency, MODULUS)))
+                    % u64::from(MODULUS)
             }) as u32
         })
         .collect()
@@ -52,8 +52,9 @@ pub fn oracle_cyclic<const MODULUS: u32>(lhs: &[u32], rhs: &[u32]) -> Vec<u32> {
     for (lhs_index, &lhs_value) in lhs.iter().enumerate() {
         for (rhs_index, &rhs_value) in rhs.iter().enumerate() {
             let index = (lhs_index + rhs_index) % lhs.len();
-            result[index] = ((result[index] as u64 + lhs_value as u64 * rhs_value as u64)
-                % MODULUS as u64) as u32;
+            result[index] = ((u64::from(result[index])
+                + u64::from(lhs_value) * u64::from(rhs_value))
+                % u64::from(MODULUS)) as u32;
         }
     }
     result
@@ -64,7 +65,7 @@ pub fn oracle_negacyclic<const MODULUS: u32>(lhs: &[u32], rhs: &[u32]) -> Vec<u3
     for (lhs_index, &lhs_value) in lhs.iter().enumerate() {
         for (rhs_index, &rhs_value) in rhs.iter().enumerate() {
             let degree = lhs_index + rhs_index;
-            let product = lhs_value as i128 * rhs_value as i128;
+            let product = i128::from(lhs_value) * i128::from(rhs_value);
             if degree < lhs.len() {
                 result[degree] += product;
             } else {
@@ -74,14 +75,14 @@ pub fn oracle_negacyclic<const MODULUS: u32>(lhs: &[u32], rhs: &[u32]) -> Vec<u3
     }
     result
         .into_iter()
-        .map(|value| value.rem_euclid(MODULUS as i128) as u32)
+        .map(|value| value.rem_euclid(i128::from(MODULUS)) as u32)
         .collect()
 }
 
 pub fn check_round_trip<const MODULUS: u32>(length: usize) {
     let plan = NttPlan::<MODULUS>::new(length).unwrap();
     let input: Vec<_> = (0..length)
-        .map(|index| ((index as u64 * 2_654_435_761 + 97) % MODULUS as u64) as u32)
+        .map(|index| ((index as u64 * 2_654_435_761 + 97) % u64::from(MODULUS)) as u32)
         .collect();
     let mut values = plan.elements(&input);
     plan.forward(&mut values).unwrap();

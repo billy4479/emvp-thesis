@@ -69,7 +69,7 @@ fn incremental_twiddles_match_randomized_wide_prime_dfts() {
                 state ^= state << 7;
                 state ^= state >> 9;
                 state ^= state << 8;
-                (state % MODULUS as u64) as u32
+                (state % u64::from(MODULUS)) as u32
             })
             .collect();
         let natural = oracle_dft::<MODULUS>(&input, root);

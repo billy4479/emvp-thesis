@@ -353,8 +353,8 @@ impl<const MODULUS: u32> NegacyclicPlan<MODULUS> {
 /// small products. Reuse [`NttPlan::linear_convolution`] when many products fit
 /// one transform length; that method always uses its existing NTT plan.
 ///
-/// Dispatch depends on public input lengths, modulus, architecture, and runtime
-/// AVX2 support, not coefficient values. The arithmetic kernels are designed
+/// Dispatch depends on public input lengths and modulus, not coefficient
+/// values. The arithmetic kernels are designed
 /// without coefficient-dependent branches but have not been formally audited
 /// as constant-time. Invalid compile-time moduli fail to compile, including on
 /// the schoolbook and empty-input paths.

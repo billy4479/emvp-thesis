@@ -432,6 +432,7 @@ dependencies = [
 name = "prime-field-layer"
 version = "0.1.0"
 dependencies = [
+ "allocation-counter",
  "bench-common",
  "criterion",
  "proptest",

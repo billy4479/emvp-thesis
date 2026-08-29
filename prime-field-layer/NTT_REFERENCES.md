@@ -32,10 +32,10 @@ metadata:
   optimization using an extended Harvey butterfly," IACR ePrint
   [2021/1396](https://eprint.iacr.org/2021/1396). Its Theorem 2 analyzes the
   wide-input lazy Shoup product on 32-bit SIMD lanes with planted offsets in
-  the multiplicand, which is the setting used by the AVX2 kernels here; the
+  the multiplicand, which is the setting used by the Shoup kernels here; the
   bound is derived independently in the `shoup_mul_lazy_for` comments.
-  The reduced AVX2 Shoup kernel uses the same quotient estimate with canonical
-  inputs for `2^30 <= p < 2^31`. Its uncorrected product is in `[0, 2p)`, then
+  The reduced Shoup kernel for `2^30 <= p < 2^31` uses the same quotient
+  estimate with canonical inputs. Its uncorrected product is in `[0, 2p)`, then
   one correction keeps every butterfly input and output in `[0, p)`.
 - Joris van der Hoeven and Grégoire Lecerf, HAL
   [hal-04841449](https://hal.science/hal-04841449).

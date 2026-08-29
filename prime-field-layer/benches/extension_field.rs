@@ -1,6 +1,5 @@
 #![expect(
     clippy::unwrap_used,
-    clippy::significant_drop_tightening,
     reason = "benchmarks use fixed valid fields and keep paired measurements together"
 )]
 
