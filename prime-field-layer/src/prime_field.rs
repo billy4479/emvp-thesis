@@ -1,6 +1,8 @@
 use std::fmt;
 
 mod bulk;
+#[cfg(target_arch = "x86_64")]
+mod dot_avx2;
 mod scalar;
 
 /// Errors caused by invalid field parameters or operands.

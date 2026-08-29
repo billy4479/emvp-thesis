@@ -90,6 +90,10 @@ impl<const MODULUS: u32> PrimeField<MODULUS> {
     /// Computes the dot product of two canonical-residue slices.
     ///
     /// Every input must be less than `MODULUS`. The result is canonical.
+    /// On x86-64 with AVX2, exact `u64` accumulation uses eight-element SIMD;
+    /// `MODULUS = 2^32 - 5` instead folds each product with
+    /// `2^32 = 5 (mod MODULUS)` in bounded SIMD chunks. Other cases use the
+    /// portable exact wide accumulator.
     ///
     /// # Errors
     ///
@@ -99,8 +103,20 @@ impl<const MODULUS: u32> PrimeField<MODULUS> {
             return Err(FieldError::LengthMismatch);
         }
 
+        #[cfg(target_arch = "x86_64")]
+        if MODULUS == super::dot_avx2::PSEUDO_MERSENNE_32_MODULUS
+            && let Some(result) = super::dot_avx2::dot_pseudo_mersenne_32(lhs, rhs)
+        {
+            return Ok(result);
+        }
+
         let max_product = u64::from(MODULUS - 1) * u64::from(MODULUS - 1);
         if lhs.len() as u128 * u128::from(max_product) <= u128::from(u64::MAX) {
+            #[cfg(target_arch = "x86_64")]
+            if let Some(sum) = super::dot_avx2::dot_u64(lhs, rhs) {
+                return Ok(self.reduce_u64(sum));
+            }
+
             let mut sums = [0u64; 4];
             for (lhs, rhs) in lhs.chunks_exact(4).zip(rhs.chunks_exact(4)) {
                 sums[0] += u64::from(lhs[0]) * u64::from(rhs[0]);
@@ -176,7 +192,7 @@ impl<const MODULUS: u32> PrimeField<MODULUS> {
             if value == 0 {
                 return Err(FieldError::DivisionByZero);
             }
-            product = Self::montgomery_mul(product, value);
+            product = Self::montgomery_mul_scalar(product, value);
             prefixes.push(product);
         }
 
@@ -188,8 +204,8 @@ impl<const MODULUS: u32> PrimeField<MODULUS> {
                 prefixes[index - 1]
             };
             let value = Self::to_montgomery(values[index]);
-            values[index] = Self::from_montgomery(Self::montgomery_mul(inverse, previous));
-            inverse = Self::montgomery_mul(inverse, value);
+            values[index] = Self::from_montgomery(Self::montgomery_mul_scalar(inverse, previous));
+            inverse = Self::montgomery_mul_scalar(inverse, value);
         }
         Ok(())
     }

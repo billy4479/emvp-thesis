@@ -5,6 +5,8 @@
 
 use prime_field_layer::{FieldError, PrimeField};
 
+const PSEUDO_MERSENNE_32_MODULUS: u32 = 4_294_967_291;
+
 const LENGTHS: [usize; 18] = [
     0, 1, 2, 3, 4, 7, 8, 15, 16, 17, 31, 32, 33, 63, 64, 65, 127, 129,
 ];
@@ -110,7 +112,80 @@ fn check_dot<const MODULUS: u32>() {
 fn dot_product_matches_a_reduced_oracle() {
     check_dot::<17>();
     check_dot::<65_537>();
-    check_dot::<4_294_967_291>();
+    check_dot::<PSEUDO_MERSENNE_32_MODULUS>();
+}
+
+fn dot_oracle(lhs: &[u32], rhs: &[u32], modulus: u32) -> u32 {
+    lhs.iter().zip(rhs).fold(0u128, |sum, (&lhs, &rhs)| {
+        (sum + u128::from(lhs) * u128::from(rhs)) % u128::from(modulus)
+    }) as u32
+}
+
+#[test]
+fn dot_product_handles_avx2_tails_and_chunk_boundaries() {
+    const LENGTHS: [usize; 27] = [
+        0, 1, 7, 8, 9, 15, 16, 17, 31, 32, 33, 63, 64, 65, 127, 128, 129, 257, 1_015, 1_016, 1_023,
+        1_024, 1_025, 1_031, 1_032, 2_048, 2_049,
+    ];
+
+    fn check<const MODULUS: u32>() {
+        let field = PrimeField::<MODULUS>::new();
+        let boundaries = [0, 1, 2, MODULUS / 2, MODULUS - 2, MODULUS - 1];
+        for length in LENGTHS {
+            let lhs: Vec<_> = (0..length)
+                .map(|index| boundaries[index % boundaries.len()])
+                .collect();
+            let rhs: Vec<_> = (0..length)
+                .map(|index| boundaries[(index * 5 + 3) % boundaries.len()])
+                .collect();
+            assert_eq!(
+                field.dot_canonical(&lhs, &rhs).unwrap(),
+                dot_oracle(&lhs, &rhs, MODULUS),
+                "mixed boundaries, modulus {MODULUS}, length {length}"
+            );
+
+            let maximal = vec![MODULUS - 1; length];
+            assert_eq!(
+                field.dot_canonical(&maximal, &maximal).unwrap(),
+                dot_oracle(&maximal, &maximal, MODULUS),
+                "maximal operands, modulus {MODULUS}, length {length}"
+            );
+        }
+    }
+
+    check::<65_537>();
+    check::<PSEUDO_MERSENNE_32_MODULUS>();
+}
+
+#[test]
+fn pseudo_mersenne_dot_matches_randomized_widened_oracle() {
+    let field = PrimeField::<PSEUDO_MERSENNE_32_MODULUS>::new();
+    let mut state = 0x6a09_e667_f3bc_c909u64;
+
+    for case in 0..128 {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        let length = state as usize % 5_000;
+        let mut lhs = Vec::with_capacity(length);
+        let mut rhs = Vec::with_capacity(length);
+        for _ in 0..length {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            lhs.push((state as u32) % PSEUDO_MERSENNE_32_MODULUS);
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            rhs.push((state as u32) % PSEUDO_MERSENNE_32_MODULUS);
+        }
+
+        assert_eq!(
+            field.dot_canonical(&lhs, &rhs).unwrap(),
+            dot_oracle(&lhs, &rhs, PSEUDO_MERSENNE_32_MODULUS),
+            "random case {case}, length {length}"
+        );
+    }
 }
 
 fn check_montgomery_bulk<const MODULUS: u32>() {

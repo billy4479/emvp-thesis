@@ -18,7 +18,7 @@ proptest = "1"
 rand_chacha = { version = "0.10", default-features = false }
 
 [workspace.lints.rust]
-unsafe_code = "forbid"
+unsafe_code = "deny"
 
 [workspace.lints.clippy]
 pedantic = { level = "deny", priority = -1 }

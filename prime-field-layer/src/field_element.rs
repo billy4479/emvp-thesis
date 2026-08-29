@@ -61,7 +61,7 @@ impl<const MODULUS: u32> FieldElement<MODULUS> {
     #[must_use]
     #[inline(always)]
     pub fn square(self) -> Self {
-        Self::from_montgomery(PrimeField::<MODULUS>::montgomery_mul(
+        Self::from_montgomery(PrimeField::<MODULUS>::montgomery_mul_scalar(
             self.montgomery,
             self.montgomery,
         ))
@@ -180,7 +180,7 @@ impl<const MODULUS: u32> Mul for FieldElement<MODULUS> {
 
     #[inline(always)]
     fn mul(self, rhs: Self) -> Self::Output {
-        Self::from_montgomery(PrimeField::<MODULUS>::montgomery_mul(
+        Self::from_montgomery(PrimeField::<MODULUS>::montgomery_mul_scalar(
             self.montgomery,
             rhs.montgomery,
         ))
