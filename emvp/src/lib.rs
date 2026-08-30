@@ -16,6 +16,8 @@
 //!
 //! [`trapdoor_matrices`]: trapdoor_matrices
 
+pub mod code;
 pub mod prf;
 
+pub use code::{CyclicCodeScratch, CyclicDualCode, CodeError};
 pub use prf::{purpose, Prf, PrfError};
