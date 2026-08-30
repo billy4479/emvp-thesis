@@ -54,7 +54,8 @@ fn derive_toeplitz(
     ell: usize,
     key: u8,
 ) -> DerivedState<MODULUS, ToeplitzFastProduct<MODULUS>> {
-    SecretKey::<MODULUS>::new(test_params(ell), [key; 32])
+    SecretKey::<MODULUS>::new_insecure(test_params(ell), [key; 32])
+        .unwrap()
         .derive(rows, toeplitz_block)
         .unwrap()
 }
@@ -105,7 +106,8 @@ fn end_to_end_matches_plaintext_product() {
 fn end_to_end_works_with_raa_mask() {
     let mut rng = ChaCha20Rng::seed_from_u64(3);
     let (rows, ell) = (7_usize, 8_usize);
-    let mut state = SecretKey::<MODULUS>::new(test_params(ell), [4; 32])
+    let mut state = SecretKey::<MODULUS>::new_insecure(test_params(ell), [4; 32])
+        .unwrap()
         .derive(rows, raa_block)
         .unwrap();
     let matrix = random_vector(rows * ell, &mut rng);
@@ -116,14 +118,17 @@ fn end_to_end_works_with_raa_mask() {
 }
 
 #[test]
-fn encrypt_is_deterministic() {
+fn matrix_mask_can_only_be_used_once() {
     let mut rng = ChaCha20Rng::seed_from_u64(5);
     let (rows, ell) = (5_usize, 8_usize);
     let mut state = derive_toeplitz(rows, ell, 6);
     let matrix = random_vector(rows * ell, &mut rng);
     let first = encrypt(&mut state, &matrix).unwrap();
-    let second = encrypt(&mut state, &matrix).unwrap();
-    assert_eq!(first, second);
+    assert_eq!(first.rows(), rows);
+    assert_eq!(
+        encrypt(&mut state, &matrix),
+        Err(ProtocolError::AlreadyEncrypted)
+    );
 }
 
 #[test]
@@ -195,7 +200,7 @@ fn naive_encrypt_gathered(
 ) -> EncryptedMatrix<MODULUS> {
     let params = state.params();
     let code_dim = params.k;
-    let width = params.n();
+    let width = params.n().unwrap();
     let multiplier: Vec<u32> = state
         .code()
         .multiplier()
@@ -253,7 +258,7 @@ fn permutation_direction_is_pinned_by_naive_oracle() {
     let mut state = derive_toeplitz(rows, ell, 18);
     let params = state.params();
     let code_dim = params.k;
-    let width = params.n();
+    let width = params.n().unwrap();
     let block_len = params.block_size();
     let matrix = random_vector(rows * ell, &mut rng);
     let query_vector = random_vector(ell, &mut rng);
@@ -340,7 +345,7 @@ fn length_errors_are_rejected_before_mutation() {
     let mut rng = ChaCha20Rng::seed_from_u64(19);
     let (rows, ell) = (5_usize, 8_usize);
     let mut state = derive_toeplitz(rows, ell, 20);
-    let n = state.params().n();
+    let n = state.params().n().unwrap();
     let q = random_vector(ell, &mut rng);
 
     let short_matrix = random_vector(rows * ell - 1, &mut rng);
@@ -366,16 +371,75 @@ fn length_errors_are_rejected_before_mutation() {
     ));
 
     let short_key = DecodingKey::from_parts(
-        decoding_key.p_prime()[..state.params().blocks() - 1].to_vec(),
+        decoding_key.p_prime()[..state.params().blocks().unwrap() - 1].to_vec(),
         decoding_key.r_prime().to_vec(),
     );
     let sentinel = AnswerMatrix::from_parts(
         answer_matrix.values().to_vec(),
         rows,
-        state.params().blocks(),
+        state.params().blocks().unwrap(),
     );
     assert!(matches!(
         decode(&sentinel, &short_key),
         Err(ProtocolError::LengthMismatch { .. })
     ));
+}
+
+#[test]
+fn derive_rejects_a_mask_with_the_wrong_protocol_width() {
+    let key = SecretKey::<MODULUS>::new_insecure(test_params(8), [21; 32]).unwrap();
+    let result = key.derive(1, |stream, _index| {
+        Ok(ToeplitzFastProduct::sample(8, stream)?)
+    });
+    assert!(matches!(
+        result,
+        Err(ProtocolError::LengthMismatch {
+            name: "mask columns",
+            expected: 16,
+            actual: 8,
+        })
+    ));
+}
+
+#[test]
+fn binary_field_is_rejected() {
+    assert!(matches!(
+        SecretKey::<2>::new_insecure(test_params(8), [22; 32]),
+        Err(ProtocolError::UnsupportedField { modulus: 2 })
+    ));
+}
+
+#[test]
+fn answer_rejects_malformed_block_dimensions() {
+    let zero = field().element_u32(0);
+    let matrix = EncryptedMatrix::from_parts(1, 16, vec![zero; 16]).unwrap();
+    let encrypted_query = EncryptedQuery::from_parts(vec![zero; 16]);
+
+    for b in [0, 3] {
+        let malformed = EmvpParams {
+            k: 8,
+            ell: 8,
+            b,
+            lambda: 7,
+        };
+        assert!(matches!(
+            answer(&malformed, &matrix, &encrypted_query),
+            Err(ProtocolError::Params(_))
+        ));
+    }
+}
+
+#[test]
+fn decoding_key_debug_is_redacted() {
+    let field = field();
+    let key = DecodingKey::from_parts(
+        vec![field.element_u32(123_456)],
+        vec![field.element_u32(654_321)],
+    );
+    let rendered = format!("{key:?}");
+    assert!(!rendered.contains("p_prime"));
+    assert!(!rendered.contains("r_prime"));
+    assert!(!rendered.contains("FieldElement"));
+    assert!(rendered.contains("blocks: 1"));
+    assert!(rendered.contains("rows: 1"));
 }

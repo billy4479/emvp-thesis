@@ -8,8 +8,8 @@
 //! so a rectangular `m x n` mask is assembled from independent square
 //! blocks stacked along the rows: block `i` multiplies the full `n`-element
 //! input and supplies rows `[i n, (i + 1) n)` of the product. When `m` is
-//! not a multiple of `n`, the final block keeps only its top `m mod n`
-//! rows and its surplus rows are discarded.
+//! not a multiple of `n`, the final block materializes only its top `m mod n`
+//! rows when the block implementation supports efficient row prefixes.
 //!
 //! [`TdmMask`] abstracts one square trapdoored matrix, and
 //! [`RowStackMask`] turns any stack of equally sized blocks into a single
@@ -133,6 +133,52 @@ pub trait TdmMask<const MODULUS: u32> {
     ///
     /// Returns an error if dense dimensions overflow or evaluation fails.
     fn materialize(&self) -> Result<DenseMatrix<MODULUS>, MaskError>;
+
+    /// Materializes the first `rows` rows in row-major form.
+    ///
+    /// Implementations may override this to make work proportional to the
+    /// requested rows. The default avoids a full dense allocation and uses
+    /// structured evaluation once per column.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `rows` is zero, exceeds the reported row count,
+    /// dimensions overflow, or evaluation fails.
+    fn materialize_top_rows(&self, rows: usize) -> Result<DenseMatrix<MODULUS>, MaskError> {
+        let (full_rows, columns) = self.dims();
+        if rows == 0 {
+            return Err(MaskError::Tdm(TdmError::ZeroDimension("materialized rows")));
+        }
+        if rows > full_rows {
+            return Err(MaskError::LengthMismatch {
+                name: "materialized rows",
+                expected: full_rows,
+                actual: rows,
+            });
+        }
+        if rows == full_rows {
+            return self.materialize();
+        }
+
+        let length = rows
+            .checked_mul(columns)
+            .ok_or(MaskError::DimensionOverflow)?;
+        let zero = PrimeField::<MODULUS>::new().element_u32(0);
+        let one = PrimeField::<MODULUS>::new().element_u32(1);
+        let mut values = vec![zero; length];
+        let mut input = vec![zero; columns];
+        let mut output = vec![zero; full_rows];
+        let mut scratch = self.scratch();
+        for column in 0..columns {
+            input.fill(zero);
+            input[column] = one;
+            self.apply(&input, &mut output, &mut scratch)?;
+            for row in 0..rows {
+                values[row * columns + column] = output[row];
+            }
+        }
+        Ok(DenseMatrix::new(rows, columns, values)?)
+    }
 }
 
 impl<const MODULUS: u32> TdmMask<MODULUS> for IrreducibleRingLpn<MODULUS> {
@@ -188,6 +234,10 @@ impl<const MODULUS: u32> TdmMask<MODULUS> for ToeplitzFastProduct<MODULUS> {
     fn materialize(&self) -> Result<DenseMatrix<MODULUS>, MaskError> {
         Ok(self.materialize()?)
     }
+
+    fn materialize_top_rows(&self, rows: usize) -> Result<DenseMatrix<MODULUS>, MaskError> {
+        Ok(Self::materialize_top_rows(self, rows)?)
+    }
 }
 
 impl<const MODULUS: u32> TdmMask<MODULUS> for RaaWeightedProduct<MODULUS> {
@@ -221,8 +271,8 @@ impl<const MODULUS: u32> TdmMask<MODULUS> for RaaWeightedProduct<MODULUS> {
 /// `n`-element input and supplies rows `[i n, (i + 1) n)` of the product, as
 /// in Section 5 of IACR ePrint 2025/858. If `total_rows` is not a multiple
 /// of `n`, the last block contributes only its top `total_rows mod n` rows;
-/// its surplus rows are computed and then discarded. All blocks must share
-/// the square dimensions `(n, n)`.
+/// only its top rows are materialized. All blocks must share the square
+/// dimensions `(n, n)`.
 ///
 /// The secret block state is not zeroized on drop.
 pub struct RowStackMask<M: TdmMask<MODULUS>, const MODULUS: u32> {
@@ -324,14 +374,20 @@ impl<M: TdmMask<MODULUS>, const MODULUS: u32> RowStackMask<M, MODULUS> {
 }
 
 impl<M: TdmMask<MODULUS>, const MODULUS: u32> TdmMask<MODULUS> for RowStackMask<M, MODULUS> {
-    type Scratch = Vec<M::Scratch>;
+    type Scratch = (Vec<M::Scratch>, Vec<FieldElement<MODULUS>>);
 
     fn dims(&self) -> (usize, usize) {
         (self.total_rows, self.block_rows)
     }
 
     fn scratch(&self) -> Self::Scratch {
-        self.blocks.iter().map(M::scratch).collect()
+        let block_scratch = self.blocks.iter().map(M::scratch).collect();
+        let tail = if self.total_rows.is_multiple_of(self.block_rows) {
+            Vec::new()
+        } else {
+            vec![PrimeField::<MODULUS>::new().element_u32(0); self.block_rows]
+        };
+        (block_scratch, tail)
     }
 
     /// Computes `output = self * input`.
@@ -357,27 +413,33 @@ impl<M: TdmMask<MODULUS>, const MODULUS: u32> TdmMask<MODULUS> for RowStackMask<
         let block_rows = self.block_rows;
         check_len("mask input", block_rows, input.len())?;
         check_len("mask output", self.total_rows, output.len())?;
-        check_len("mask scratch blocks", self.blocks.len(), scratch.len())?;
+        check_len("mask scratch blocks", self.blocks.len(), scratch.0.len())?;
+        let expected_tail = if self.total_rows.is_multiple_of(block_rows) {
+            0
+        } else {
+            block_rows
+        };
+        check_len("mask scratch tail", expected_tail, scratch.1.len())?;
 
         let last = self.blocks.len() - 1;
         for (index, block) in self.blocks[..last].iter().enumerate() {
             block.apply(
                 input,
                 &mut output[index * block_rows..(index + 1) * block_rows],
-                &mut scratch[index],
+                &mut scratch.0[index],
             )?;
         }
 
         let tail_rows = self.total_rows - last * block_rows;
         if tail_rows == block_rows {
-            self.blocks[last].apply(input, &mut output[last * block_rows..], &mut scratch[last])?;
+            self.blocks[last].apply(
+                input,
+                &mut output[last * block_rows..],
+                &mut scratch.0[last],
+            )?;
         } else {
-            // The last block computes all `n` rows, so the surplus rows need
-            // a temporary buffer before the truncation into the output tail.
-            let zero = PrimeField::<MODULUS>::new().element_u32(0);
-            let mut buffer = vec![zero; block_rows];
-            self.blocks[last].apply(input, &mut buffer, &mut scratch[last])?;
-            output[last * block_rows..].copy_from_slice(&buffer[..tail_rows]);
+            self.blocks[last].apply(input, &mut scratch.1, &mut scratch.0[last])?;
+            output[last * block_rows..].copy_from_slice(&scratch.1[..tail_rows]);
         }
         Ok(())
     }
@@ -399,14 +461,28 @@ impl<M: TdmMask<MODULUS>, const MODULUS: u32> TdmMask<MODULUS> for RowStackMask<
 
         let last = self.blocks.len() - 1;
         for block in &self.blocks[..last] {
-            values.extend_from_slice(block.materialize()?.values());
+            let matrix = block.materialize()?;
+            check_len("materialized block rows", block_rows, matrix.rows())?;
+            check_len("materialized block columns", block_rows, matrix.columns())?;
+            values.extend_from_slice(matrix.values());
         }
         let tail_rows = self.total_rows - last * block_rows;
         let tail_length = tail_rows
             .checked_mul(block_rows)
             .ok_or(MaskError::DimensionOverflow)?;
-        let last_matrix = self.blocks[last].materialize()?;
-        values.extend_from_slice(&last_matrix.values()[..tail_length]);
+        let last_matrix = self.blocks[last].materialize_top_rows(tail_rows)?;
+        check_len("materialized tail rows", tail_rows, last_matrix.rows())?;
+        check_len(
+            "materialized tail columns",
+            block_rows,
+            last_matrix.columns(),
+        )?;
+        check_len(
+            "materialized tail values",
+            tail_length,
+            last_matrix.values().len(),
+        )?;
+        values.extend_from_slice(last_matrix.values());
 
         Ok(DenseMatrix::new(self.total_rows, block_rows, values)?)
     }

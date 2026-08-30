@@ -78,6 +78,26 @@ fn zeros(length: usize) -> Vec<FieldElement<MODULUS>> {
 }
 
 #[test]
+fn direct_cyclic_ntt_works_when_linear_fallback_is_unsupported() {
+    let field = PrimeField::<17>::new();
+    let zero = field.element_u32(0);
+    let mut multiplier = vec![zero; 16];
+    multiplier[0] = field.element_u32(1);
+    let code = CyclicDualCode::<17>::new(16, multiplier).unwrap();
+    let row: Vec<_> = (1..=16).map(|value| field.element_u32(value)).collect();
+    let mut output = vec![zero; 32];
+    let mut scratch = code.scratch();
+
+    code.dual_encode_row(&row, &mut output, &mut scratch)
+        .unwrap();
+
+    for index in 0..16 {
+        assert_eq!(output[index], -row[index]);
+    }
+    assert_eq!(&output[16..], row);
+}
+
+#[test]
 fn codeword_image_matches_both_transpose_conventions() {
     for k in [1, 2, 5, 8, 17] {
         let code = sample_code(k, 0x1000 + k as u64);
@@ -208,6 +228,11 @@ fn invalid_inputs_are_rejected_without_mutating_outputs() {
             expected: 3,
             actual: 2
         })
+    ));
+    let mut oversized_rng = ChaCha20Rng::seed_from_u64(0x7fff);
+    assert!(matches!(
+        CyclicDualCode::<MODULUS>::sample(usize::MAX, &mut oversized_rng),
+        Err(CodeError::DimensionOverflow)
     ));
 
     let code = sample_code(4, 0x8000);

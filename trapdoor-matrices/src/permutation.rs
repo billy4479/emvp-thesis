@@ -81,6 +81,20 @@ impl Permutation {
         }
         Ok(())
     }
+
+    /// Applies the transpose of this gather permutation as a scatter.
+    pub(crate) fn apply_transpose<T: Copy>(
+        &self,
+        input: &[T],
+        output: &mut [T],
+    ) -> Result<(), TdmError> {
+        super::error::check_len("permutation transpose input", self.len(), input.len())?;
+        super::error::check_len("permutation transpose output", self.len(), output.len())?;
+        for (&value, &index) in input.iter().zip(&self.indices) {
+            output[index] = value;
+        }
+        Ok(())
+    }
 }
 
 pub fn sample_below<R: CryptoRng + ?Sized>(

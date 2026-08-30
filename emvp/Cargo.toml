@@ -13,6 +13,7 @@ rand_core = { workspace = true }
 trapdoor-matrices = { path = "../trapdoor-matrices" }
 
 [dev-dependencies]
+allocation-counter = { workspace = true }
 criterion = { workspace = true }
 proptest = { workspace = true }
 

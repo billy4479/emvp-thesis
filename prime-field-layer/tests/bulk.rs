@@ -305,6 +305,51 @@ fn batch_inverse_reduces_noncanonical_nonzero_values() {
     assert_eq!(values, expected);
 }
 
+fn check_element_batch_inverse<const MODULUS: u32>() {
+    let field = PrimeField::<MODULUS>::new();
+    let values: Vec<_> = (1_u32..=64)
+        .map(|value| field.element_u32((value % MODULUS).max(1)))
+        .collect();
+    let expected: Vec<_> = values.iter().map(|value| value.inv().unwrap()).collect();
+    let mut output = vec![field.element_u32(0); values.len()];
+
+    field.batch_inv_elements(&values, &mut output).unwrap();
+    assert_eq!(output, expected);
+}
+
+#[test]
+fn element_batch_inverse_matches_scalar_inversion() {
+    check_element_batch_inverse::<2>();
+    check_element_batch_inverse::<17>();
+    check_element_batch_inverse::<65_537>();
+    check_element_batch_inverse::<998_244_353>();
+}
+
+#[test]
+fn element_batch_inverse_validates_before_mutation() {
+    let field = PrimeField::<17>::new();
+    let sentinel = field.element_u32(9);
+    let mut output = [sentinel; 3];
+    assert_eq!(
+        field.batch_inv_elements(&[field.element_u32(1); 2], &mut output),
+        Err(FieldError::LengthMismatch)
+    );
+    assert_eq!(output, [sentinel; 3]);
+
+    let values = [
+        field.element_u32(1),
+        field.element_u32(0),
+        field.element_u32(2),
+    ];
+    assert_eq!(
+        field.batch_inv_elements(&values, &mut output),
+        Err(FieldError::DivisionByZero)
+    );
+    assert_eq!(output, [sentinel; 3]);
+
+    field.batch_inv_elements(&[], &mut []).unwrap();
+}
+
 #[test]
 fn binary_kernels_reject_mismatched_lengths() {
     let field = PrimeField::<65_537>::new();

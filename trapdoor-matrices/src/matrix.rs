@@ -68,6 +68,12 @@ impl<const MODULUS: u32> DenseMatrix<MODULUS> {
         &self.values
     }
 
+    /// Consumes the matrix and returns its row-major entries.
+    #[must_use]
+    pub fn into_values(self) -> Vec<FieldElement<MODULUS>> {
+        self.values
+    }
+
     /// Multiplies the dense matrix by a vector.
     ///
     /// # Errors

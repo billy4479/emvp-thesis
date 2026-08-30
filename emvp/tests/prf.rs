@@ -97,3 +97,16 @@ fn sibling_slots_are_disjoint() {
         );
     }
 }
+
+#[test]
+fn sibling_streams_do_not_overlap_after_the_seed_slot() {
+    let low = derived_bytes(KEY, purpose::TDM, 5, 64);
+    let high = derived_bytes(KEY, purpose::TDM, 6, 32);
+    assert_ne!(&low[32..], high);
+}
+
+#[test]
+fn derived_stream_does_not_expose_the_root_key() {
+    let stream = Prf::new(KEY).stream(purpose::TDM, 0).unwrap();
+    assert_ne!(stream.get_seed(), KEY);
+}

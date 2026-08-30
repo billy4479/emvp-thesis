@@ -22,6 +22,7 @@ pub struct ToeplitzMap<const MODULUS: u32> {
     diagonals: Vec<FieldElement<MODULUS>>,
     plan: NttPlan<MODULUS>,
     spectrum: Vec<FieldElement<MODULUS>>,
+    transpose_spectrum: Vec<FieldElement<MODULUS>>,
 }
 
 impl<const MODULUS: u32> ToeplitzMap<MODULUS> {
@@ -62,7 +63,13 @@ impl<const MODULUS: u32> ToeplitzMap<MODULUS> {
         for offset in 0..columns - 1 {
             spectrum[transform_length - 1 - offset] = diagonals[rows + offset];
         }
+        let mut transpose_spectrum = vec![zero; transform_length];
+        transpose_spectrum[0] = spectrum[0];
+        for index in 1..transform_length {
+            transpose_spectrum[index] = spectrum[transform_length - index];
+        }
         plan.forward(&mut spectrum)?;
+        plan.forward(&mut transpose_spectrum)?;
 
         Ok(Self {
             rows,
@@ -70,6 +77,7 @@ impl<const MODULUS: u32> ToeplitzMap<MODULUS> {
             diagonals,
             plan,
             spectrum,
+            transpose_spectrum,
         })
     }
 
@@ -157,6 +165,34 @@ impl<const MODULUS: u32> ToeplitzMap<MODULUS> {
         self.plan.pointwise_mul_assign(transform, &self.spectrum)?;
         self.plan.inverse(transform)?;
         output.copy_from_slice(&transform[..self.rows]);
+        Ok(())
+    }
+
+    fn apply_transpose_with_transform(
+        &self,
+        input: &[FieldElement<MODULUS>],
+        output: &mut [FieldElement<MODULUS>],
+        transform: &mut [FieldElement<MODULUS>],
+    ) -> Result<(), TdmError> {
+        check_len("Toeplitz transpose input", self.rows, input.len())?;
+        check_len("Toeplitz transpose output", self.columns, output.len())?;
+        if transform.len() < self.transform_length() {
+            return Err(TdmError::LengthMismatch {
+                name: "Toeplitz transpose scratch transform",
+                expected: self.transform_length(),
+                actual: transform.len(),
+            });
+        }
+
+        let transform = &mut transform[..self.transform_length()];
+        let zero = PrimeField::<MODULUS>::new().element_u32(0);
+        transform.fill(zero);
+        transform[..self.rows].copy_from_slice(input);
+        self.plan.forward(transform)?;
+        self.plan
+            .pointwise_mul_assign(transform, &self.transpose_spectrum)?;
+        self.plan.inverse(transform)?;
+        output.copy_from_slice(&transform[..self.columns]);
         Ok(())
     }
 }
@@ -374,27 +410,94 @@ impl<const MODULUS: u32> ToeplitzFastProduct<MODULUS> {
             .apply_with_transform(&scratch.stage_b, output, &mut scratch.transform)
     }
 
+    fn apply_transpose(
+        &self,
+        input: &[FieldElement<MODULUS>],
+        output: &mut [FieldElement<MODULUS>],
+        scratch: &mut ToeplitzScratch<MODULUS>,
+    ) -> Result<(), TdmError> {
+        let expanded = self.middle.rows();
+        check_len("fast-product transpose input", self.k, input.len())?;
+        check_len("fast-product transpose output", self.k, output.len())?;
+        check_len(
+            "fast-product transpose scratch stage A",
+            expanded,
+            scratch.stage_a.len(),
+        )?;
+        check_len(
+            "fast-product transpose scratch stage B",
+            expanded,
+            scratch.stage_b.len(),
+        )?;
+
+        self.s_left.apply_transpose_with_transform(
+            input,
+            &mut scratch.stage_a,
+            &mut scratch.transform,
+        )?;
+        self.pi_left
+            .apply_transpose(&scratch.stage_a, &mut scratch.stage_b)?;
+        self.middle.apply_transpose_with_transform(
+            &scratch.stage_b,
+            &mut scratch.stage_a,
+            &mut scratch.transform,
+        )?;
+        self.pi_right
+            .apply_transpose(&scratch.stage_a, &mut scratch.stage_b)?;
+        self.s_right.apply_transpose_with_transform(
+            &scratch.stage_b,
+            output,
+            &mut scratch.transform,
+        )
+    }
+
     /// Materializes this product as a row-major `K x K` dense matrix.
     ///
     /// # Errors
     ///
     /// Returns an error if matrix-size arithmetic overflows or evaluation fails.
     pub fn materialize(&self) -> Result<DenseMatrix<MODULUS>, TdmError> {
+        self.materialize_top_rows(self.k)
+    }
+
+    /// Materializes the first `rows` rows of this product.
+    ///
+    /// This applies the transposed product to `rows` basis vectors, so work
+    /// and output storage scale with the requested row count rather than `K`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `rows` is zero, exceeds `K`, matrix-size arithmetic
+    /// overflows, or transposed evaluation fails.
+    pub fn materialize_top_rows(&self, rows: usize) -> Result<DenseMatrix<MODULUS>, TdmError> {
+        if rows == 0 {
+            return Err(TdmError::ZeroDimension("materialized rows"));
+        }
+        if rows > self.k {
+            return Err(TdmError::LengthMismatch {
+                name: "materialized rows",
+                expected: self.k,
+                actual: rows,
+            });
+        }
         let field = PrimeField::<MODULUS>::new();
         let zero = field.element_u32(0);
         let one = field.element_u32(1);
-        let mut matrix = DenseMatrix::zero(self.k, self.k)?;
+        let mut values = Vec::with_capacity(
+            rows.checked_mul(self.k)
+                .ok_or(TdmError::DimensionOverflow)?,
+        );
         let mut input = vec![zero; self.k].into_boxed_slice();
         let mut output = vec![zero; self.k].into_boxed_slice();
         let mut scratch = self.scratch();
 
-        for column in 0..self.k {
+        for row in 0..rows {
             input.fill(zero);
-            input[column] = one;
-            self.apply(&input, &mut output, &mut scratch)?;
-            matrix.set_column(column, &output);
+            input[row] = one;
+            self.apply_transpose(&input, &mut output, &mut scratch)?;
+            values.extend_from_slice(&output);
         }
-        Ok(matrix)
+        DenseMatrix::new(rows, self.k, values)
     }
 }
 

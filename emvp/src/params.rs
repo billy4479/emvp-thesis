@@ -6,11 +6,10 @@
 //! above the target work `2^lambda`:
 //!
 //! - Algebraic annihilating-polynomial attack (ePrint 2025/858, Sections
-//!   7.1.2 and 7.4.1). With a public permutation decorrelating the cyclic
-//!   code from the block grid, the relevant bound is the random-partition
-//!   one: the attack degree is `d = ceil(k / (b - 1))` and the cost is
-//!   essentially `(k + 1)^d`, so we require `(k + 1)^d >= 2^lambda`. This is
-//!   the constraint behind the "Random block partition" rows of Table 1.
+//!   7.1.2 and 7.4.1). The public permutation is sampled once, so it defines a
+//!   fixed partition across queries. For `d = ceil(k / (b - 1))`, the attack
+//!   costs `b^(d - 1) * min(b, d)`, which must be at least `2^lambda`. The
+//!   stronger `(k + 1)^d` bound requires a fresh partition for every query.
 //! - Inclusion/exclusion attack (Section 7.3.2): `(n / b + 1) * k > n +
 //!   lambda` keeps the space-unions attack infeasible.
 //! - Structural constraints of the cyclic instantiation: records of length
@@ -54,28 +53,39 @@ const SEARCH_RANK_BUDGET: usize = 10_000_000;
 /// `lambda > 4096` returns `false` by contract; [`EmvpParams::validate`]
 /// rejects such security levels before calling this function.
 ///
-/// The paper needs this comparison for the algebraic-attack bound
-/// `(k + 1)^d >= 2^lambda`; exactness matters because a rounded comparison
-/// would silently move the claimed security level.
+/// Parameter validation uses the same exact comparison for its
+/// algebraic-attack bound; rounded comparisons could silently move the
+/// claimed security level.
 #[must_use]
 pub fn pow_ge_pow2(base: u64, exp: u64, lambda: u32) -> bool {
+    scaled_pow_ge_pow2(base, exp, 1, lambda)
+}
+
+/// An exact integer comparison `factor * base^exp >= 2^lambda`.
+fn scaled_pow_ge_pow2(base: u64, exp: u64, factor: u64, lambda: u32) -> bool {
     const MAX_LAMBDA: u32 = 4096;
     if lambda == 0 {
         return true;
     }
-    if exp == 0 || base < 2 || lambda > MAX_LAMBDA {
+    if factor == 0 || lambda > MAX_LAMBDA {
         return false;
+    }
+    if base < 2 {
+        if base == 0 && exp > 0 {
+            return false;
+        }
+        return u64::from(u64::BITS - factor.leading_zeros()) > u64::from(lambda);
     }
     let lambda_u = u64::from(lambda);
     // Little-endian limbs with capacity for one bit beyond 2^lambda.
     let limbs = lambda as usize / 64 + 2;
     let mut value = vec![0_u64; limbs];
-    value[0] = base;
+    value[0] = factor;
     let mut significant = 1_usize;
     let bitlen_base = u64::from(64 - base.leading_zeros());
     let base_lo = bitlen_base - 1; // base >= 2^base_lo
     let base_hi = bitlen_base; // base < 2^base_hi
-    let mut consumed: u64 = 1;
+    let mut consumed: u64 = 0;
     loop {
         let remaining = exp - consumed;
         if remaining == 0 {
@@ -211,7 +221,7 @@ impl fmt::Display for ParamsError {
             }
             Self::InsecureAgainstAlgebraicAttack { k, b, d, lambda } => write!(
                 formatter,
-                "(k+1)^d with k = {k}, d = {d} (block size {b}) stays below 2^{lambda}"
+                "b^(d-1) * min(b,d) with k = {k}, d = {d}, b = {b} stays below 2^{lambda}"
             ),
             Self::InsecureAgainstInclusionExclusion { n, k, b, lambda } => write!(
                 formatter,
@@ -252,15 +262,33 @@ pub struct EmvpParams {
 
 impl EmvpParams {
     /// The codeword length `n = 2k`.
-    #[must_use]
-    pub const fn n(&self) -> usize {
-        self.k * 2
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ParamsError::DimensionOverflow`] if `2k` does not fit in
+    /// `usize`.
+    pub const fn n(&self) -> Result<usize, ParamsError> {
+        match self.k.checked_mul(2) {
+            Some(n) => Ok(n),
+            None => Err(ParamsError::DimensionOverflow),
+        }
     }
 
     /// The number of blocks `s = n / b`.
-    #[must_use]
-    pub const fn blocks(&self) -> usize {
-        self.n() / self.b
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the dimensions overflow, `b < 2`, or `b` does not
+    /// divide `n`.
+    pub fn blocks(&self) -> Result<usize, ParamsError> {
+        if self.b < 2 {
+            return Err(ParamsError::BlockTooSmall { b: self.b });
+        }
+        let n = self.n()?;
+        if !n.is_multiple_of(self.b) {
+            return Err(ParamsError::BlockDoesNotDivideLength { b: self.b, n });
+        }
+        Ok(n / self.b)
     }
 
     /// The block size `b`.
@@ -275,27 +303,16 @@ impl EmvpParams {
     ///
     /// Returns the first violated constraint as a [`ParamsError`].
     pub fn validate(&self) -> Result<(), ParamsError> {
-        let Self { k, ell, b, lambda } = *self;
-        if ell == 0 {
-            return Err(ParamsError::ZeroEll);
-        }
+        let Self { k, b, lambda, .. } = *self;
         if lambda > POW_MAX_LAMBDA {
             return Err(ParamsError::LambdaOutOfScope { lambda });
         }
-        if ell > k {
-            return Err(ParamsError::EllExceedsRank { ell, k });
-        }
+        self.validate_dimensions()?;
         let floor = Self::rank_floor(lambda);
         if k < floor {
             return Err(ParamsError::RankBelowSecurityFloor { k, lambda });
         }
-        if b < 2 {
-            return Err(ParamsError::BlockTooSmall { b });
-        }
-        let n = k.checked_mul(2).ok_or(ParamsError::DimensionOverflow)?;
-        if n % b != 0 {
-            return Err(ParamsError::BlockDoesNotDivideLength { b, n });
-        }
+        let n = self.n()?;
         // d = ceil(k / (b - 1)); b >= 2 so the divisor is positive.
         let b_minus_one = u64::try_from(b - 1).map_err(ParamsError::from)?;
         let k_u64 = u64::try_from(k).map_err(ParamsError::from)?;
@@ -303,7 +320,8 @@ impl EmvpParams {
             .checked_add(b_minus_one - 1)
             .ok_or(ParamsError::DimensionOverflow)?
             / b_minus_one;
-        if !pow_ge_pow2(k_u64 + 1, d, lambda) {
+        let b_u64 = u64::try_from(b).map_err(ParamsError::from)?;
+        if !scaled_pow_ge_pow2(b_u64, d - 1, u64::min(b_u64, d), lambda) {
             return Err(ParamsError::InsecureAgainstAlgebraicAttack { k, b, d, lambda });
         }
         // (n / b + 1) * k > n + lambda, computed without truncation in u128.
@@ -320,6 +338,35 @@ impl EmvpParams {
             .ok_or(ParamsError::DimensionOverflow)?;
         if left <= right {
             return Err(ParamsError::InsecureAgainstInclusionExclusion { n, k, b, lambda });
+        }
+        Ok(())
+    }
+
+    /// Checks the dimensions required for protocol correctness without
+    /// claiming a concrete security level.
+    ///
+    /// This is intended for deliberately tiny research and test instances.
+    /// Production callers should use [`Self::validate`].
+    ///
+    /// # Errors
+    ///
+    /// Returns the first malformed dimension as a [`ParamsError`].
+    pub fn validate_dimensions(&self) -> Result<(), ParamsError> {
+        if self.ell == 0 {
+            return Err(ParamsError::ZeroEll);
+        }
+        if self.ell > self.k {
+            return Err(ParamsError::EllExceedsRank {
+                ell: self.ell,
+                k: self.k,
+            });
+        }
+        if self.b < 2 {
+            return Err(ParamsError::BlockTooSmall { b: self.b });
+        }
+        let n = self.n()?;
+        if !n.is_multiple_of(self.b) {
+            return Err(ParamsError::BlockDoesNotDivideLength { b: self.b, n });
         }
         Ok(())
     }

@@ -361,6 +361,19 @@ fn full_toeplitz_product_matches_hand_composition_materialization_and_linearity(
 }
 
 #[test]
+fn partial_toeplitz_materialization_matches_full_row_prefix() {
+    let product = explicit_fast_product();
+    let full = product.materialize().unwrap();
+    for rows in 1..=3 {
+        let partial = product.materialize_top_rows(rows).unwrap();
+        assert_eq!((partial.rows(), partial.columns()), (rows, 3));
+        assert_eq!(partial.values(), &full.values()[..rows * 3]);
+    }
+    product.materialize_top_rows(0).unwrap_err();
+    product.materialize_top_rows(4).unwrap_err();
+}
+
+#[test]
 fn full_toeplitz_product_length_errors_leave_output_unchanged() {
     let product = explicit_fast_product();
     let mut scratch = product.scratch();

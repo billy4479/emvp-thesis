@@ -78,17 +78,34 @@ fn pow_matches_bignum_reference() {
 
 #[test]
 fn validates_secure_parameter_sets() {
-    // d = ceil(162 / 2) = 81, 163^81 ~ 2^595; (324/3 + 1) * 162 = 17658 > 452.
+    // d = ceil(162 / 2) = 81, 3^81 > 2^128; (324/3 + 1) * 162 = 17658 > 452.
     params(162, 162, 3).validate().unwrap();
     // Records shorter than the rank are zero-padded.
     params(162, 100, 3).validate().unwrap();
-    // The rank floor is ceil(lambda / 4).
-    let floor = EmvpParams::rank_floor(LAMBDA);
-    params(floor, floor, 2).validate().unwrap();
+    // At b = 2, the fixed-partition attack requires k >= lambda.
+    params(128, 128, 2).validate().unwrap();
 }
 
 #[test]
 fn rejects_insecure_or_malformed_parameter_sets() {
+    assert_eq!(
+        EmvpParams {
+            k: usize::MAX,
+            ell: 1,
+            b: 2,
+            lambda: LAMBDA,
+        }
+        .n(),
+        Err(ParamsError::DimensionOverflow)
+    );
+    assert_eq!(
+        params(8, 8, 0).blocks(),
+        Err(ParamsError::BlockTooSmall { b: 0 })
+    );
+    assert_eq!(
+        params(8, 8, 3).blocks(),
+        Err(ParamsError::BlockDoesNotDivideLength { b: 3, n: 16 })
+    );
     assert_eq!(params(162, 0, 3).validate(), Err(ParamsError::ZeroEll));
     assert_eq!(
         params(162, 163, 3).validate(),
@@ -119,20 +136,32 @@ fn rejects_insecure_or_malformed_parameter_sets() {
             lambda: LAMBDA
         })
     );
-    // (4/2 + 1) * 2 = 6 <= 4 + 3, and 3^2 = 9 >= 2^3.
+    // A static random permutation remains a fixed partition across queries.
+    // The random-partition estimate 129^19 exceeds 2^128, but the applicable
+    // fixed-partition cost is only 8^19 = 2^57.
+    assert_eq!(
+        params(128, 128, 8).validate(),
+        Err(ParamsError::InsecureAgainstAlgebraicAttack {
+            k: 128,
+            b: 8,
+            d: 19,
+            lambda: LAMBDA,
+        })
+    );
+    // (4/2 + 1) * 2 = 6 <= 4 + 2, while the fixed-partition cost is 2^2.
     assert_eq!(
         EmvpParams {
             k: 2,
             ell: 2,
             b: 2,
-            lambda: 3
+            lambda: 2
         }
         .validate(),
         Err(ParamsError::InsecureAgainstInclusionExclusion {
             n: 4,
             k: 2,
             b: 2,
-            lambda: 3
+            lambda: 2
         })
     );
     // Security levels beyond the exact comparator range are rejected.
@@ -156,7 +185,7 @@ fn search_finds_minimal_rank_and_largest_block() {
     assert_eq!(found.k, 162, "search should settle on rank 162");
     // Within the winning rank the search must pick the largest feasible
     // divisor of 324; brute-force check both claims.
-    let n = found.n();
+    let n = found.n().unwrap();
     let feasible: Vec<usize> = (2..=n)
         .filter(|b| {
             n.is_multiple_of(*b)

@@ -22,7 +22,7 @@
 //!   `q_tilde = (0^k | q_pad) + c` for a fresh codeword `c`, so
 //!   `D q_tilde = q_pad`. The same gather as the matrix columns aligns the
 //!   query with them, `q_pi[i] = q_tilde[Pi[i]]`. The client computes the
-//!   mask share `r' = R q_pi` through the trapdoor
+//!   mask share `r' = R q_tilde` through the trapdoor
 //!   and hides each block of size `b` behind a fresh nonzero scalar:
 //!   `q_hat = (alpha_0 q_pi[0..b] | ... | alpha_{s-1} q_pi[(s-1)b..n])`,
 //!   keeping `p' = (alpha_0^{-1}, ..., alpha_{s-1}^{-1})` secret.
@@ -48,7 +48,7 @@ use trapdoor_matrices::{DenseMatrix, Permutation};
 
 use crate::code::{CodeError, CyclicCodeScratch, CyclicDualCode};
 use crate::mask::{MaskError, RowStackMask, TdmMask};
-use crate::params::EmvpParams;
+use crate::params::{EmvpParams, ParamsError};
 use crate::prf::{Prf, PrfError, purpose};
 
 /// A rejected protocol operation.
@@ -73,6 +73,16 @@ pub enum ProtocolError {
     Mask(MaskError),
     /// Field arithmetic failed.
     Field(FieldError),
+    /// Protocol parameters were malformed or did not meet the requested
+    /// security level.
+    Params(ParamsError),
+    /// 1D-SLSN is not meaningful over a field with fewer than three elements.
+    UnsupportedField {
+        /// The rejected field modulus.
+        modulus: u32,
+    },
+    /// The state's deterministic matrix mask was already consumed.
+    AlreadyEncrypted,
 }
 
 impl fmt::Display for ProtocolError {
@@ -91,6 +101,16 @@ impl fmt::Display for ProtocolError {
             Self::Code(error) => error.fmt(formatter),
             Self::Mask(error) => error.fmt(formatter),
             Self::Field(error) => error.fmt(formatter),
+            Self::Params(error) => error.fmt(formatter),
+            Self::UnsupportedField { modulus } => {
+                write!(
+                    formatter,
+                    "1D-SLSN requires a field larger than F_2, got modulus {modulus}"
+                )
+            }
+            Self::AlreadyEncrypted => formatter.write_str(
+                "derived state has already encrypted a matrix; derive a fresh key state",
+            ),
         }
     }
 }
@@ -102,6 +122,7 @@ impl std::error::Error for ProtocolError {
             Self::Code(error) => Some(error),
             Self::Mask(error) => Some(error),
             Self::Field(error) => Some(error),
+            Self::Params(error) => Some(error),
             _ => None,
         }
     }
@@ -128,6 +149,12 @@ impl From<MaskError> for ProtocolError {
 impl From<FieldError> for ProtocolError {
     fn from(error: FieldError) -> Self {
         Self::Field(error)
+    }
+}
+
+impl From<ParamsError> for ProtocolError {
+    fn from(error: ParamsError) -> Self {
+        Self::Params(error)
     }
 }
 
@@ -158,24 +185,43 @@ const fn check_len(
 /// It holds only the protocol parameters and the 32-byte PRF key; every
 /// long-term secret is re-derived from it. The PRF key is secret and the
 /// struct is not zeroized on drop.
-#[derive(Clone)]
 pub struct SecretKey<const MODULUS: u32> {
     params: EmvpParams,
     prf: Prf,
 }
 
 impl<const MODULUS: u32> SecretKey<MODULUS> {
-    /// Wraps validated parameters and a uniform 32-byte key.
+    /// Constructs a key from secure parameters and a uniform 32-byte key.
     ///
-    /// The parameters are not checked here: callers validate them once with
-    /// [`EmvpParams::validate`] at generation time. Research and test code
-    /// may deliberately pass tiny insecure parameter sets.
-    #[must_use]
-    pub const fn new(params: EmvpParams, key: [u8; 32]) -> Self {
-        Self {
+    /// # Errors
+    ///
+    /// Returns an error if parameter validation fails or `MODULUS <= 2`.
+    pub fn new(params: EmvpParams, key: [u8; 32]) -> Result<Self, ProtocolError> {
+        params.validate()?;
+        Self::new_with_dimensions(params, key)
+    }
+
+    /// Constructs a key for a deliberately insecure research instance.
+    ///
+    /// Structural dimensions and the field requirement are still enforced.
+    /// This bypasses only concrete attack-cost validation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if dimensions are malformed or `MODULUS <= 2`.
+    pub fn new_insecure(params: EmvpParams, key: [u8; 32]) -> Result<Self, ProtocolError> {
+        params.validate_dimensions()?;
+        Self::new_with_dimensions(params, key)
+    }
+
+    const fn new_with_dimensions(params: EmvpParams, key: [u8; 32]) -> Result<Self, ProtocolError> {
+        if MODULUS <= 2 {
+            return Err(ProtocolError::UnsupportedField { modulus: MODULUS });
+        }
+        Ok(Self {
             params,
             prf: Prf::new(key),
-        }
+        })
     }
 
     /// Returns the protocol parameters.
@@ -185,6 +231,9 @@ impl<const MODULUS: u32> SecretKey<MODULUS> {
     }
 
     /// Expands the short key into the long-term secrets.
+    ///
+    /// This consumes the matrix key so one key cannot accidentally derive two
+    /// states with the same deterministic mask.
     ///
     /// `rows` is the number of matrix rows to support; it determines how
     /// many square mask blocks are stacked. `build_block` constructs one
@@ -196,7 +245,7 @@ impl<const MODULUS: u32> SecretKey<MODULUS> {
     /// Returns errors from the PRF, the code and permutation sampling, the
     /// mask construction, or the closure itself.
     pub fn derive<M, F>(
-        &self,
+        self,
         rows: usize,
         mut build_block: F,
     ) -> Result<DerivedState<MODULUS, M>, ProtocolError>
@@ -205,7 +254,7 @@ impl<const MODULUS: u32> SecretKey<MODULUS> {
         F: FnMut(&mut ChaCha20Rng, usize) -> Result<M, ProtocolError>,
     {
         let k = self.params.k;
-        let n = self.params.n();
+        let n = self.params.n()?;
         if rows == 0 {
             return Err(ProtocolError::LengthMismatch {
                 name: "matrix rows",
@@ -227,6 +276,7 @@ impl<const MODULUS: u32> SecretKey<MODULUS> {
             blocks.push(build_block(&mut stream, block_index)?);
         }
         let mask = RowStackMask::new(blocks, rows)?;
+        check_len("mask columns", n, mask.dims().1)?;
         let code_scratch = code.scratch();
         let mask_scratch = mask.scratch();
 
@@ -237,11 +287,12 @@ impl<const MODULUS: u32> SecretKey<MODULUS> {
             mask,
             code_scratch,
             mask_scratch,
+            encrypted: false,
         })
     }
 }
 
-/// The expanded long-term secrets, reusable across encryptions and queries.
+/// The expanded long-term secrets for one matrix encryption and many queries.
 ///
 /// The code multiplier, its cached transform, the permutation, and the mask
 /// trapdoors are secret; none of them are zeroized on drop.
@@ -252,6 +303,7 @@ pub struct DerivedState<const MODULUS: u32, M: TdmMask<MODULUS>> {
     mask: RowStackMask<M, MODULUS>,
     code_scratch: CyclicCodeScratch<MODULUS>,
     mask_scratch: <RowStackMask<M, MODULUS> as TdmMask<MODULUS>>::Scratch,
+    encrypted: bool,
 }
 
 impl<const MODULUS: u32, M: TdmMask<MODULUS>> DerivedState<MODULUS, M> {
@@ -348,10 +400,20 @@ impl<const MODULUS: u32> EncryptedQuery<MODULUS> {
 }
 
 /// The client's decoding information `q' = (p', r')`.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq)]
 pub struct DecodingKey<const MODULUS: u32> {
     p_prime: Vec<FieldElement<MODULUS>>,
     r_prime: Vec<FieldElement<MODULUS>>,
+}
+
+impl<const MODULUS: u32> fmt::Debug for DecodingKey<MODULUS> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("DecodingKey")
+            .field("blocks", &self.p_prime.len())
+            .field("rows", &self.r_prime.len())
+            .finish_non_exhaustive()
+    }
 }
 
 impl<const MODULUS: u32> DecodingKey<MODULUS> {
@@ -421,51 +483,50 @@ impl<const MODULUS: u32> AnswerMatrix<MODULUS> {
 
 /// Encrypts a row-major `rows x ell` matrix for the server.
 ///
-/// The mask is materialized densely (offline, one `rows x n` allocation);
-/// each row then reuses the code scratch. This is the offline phase of the
-/// protocol.
+/// The mask is materialized into the `rows x n` ciphertext allocation and
+/// overwritten row by row after encoding and permutation. This is the offline
+/// phase of the protocol. A derived state can encrypt exactly one matrix.
 ///
 /// # Errors
 ///
-/// Returns an error before any output is produced if the matrix length
-/// differs from `rows * ell`, or if the code or mask operations fail.
+/// Returns an error before any output is produced if the state already
+/// encrypted a matrix, the matrix length differs from `rows * ell`, or a code
+/// or mask operation fails.
 pub fn encrypt<const MODULUS: u32, M: TdmMask<MODULUS>>(
     state: &mut DerivedState<MODULUS, M>,
     matrix: &[FieldElement<MODULUS>],
 ) -> Result<EncryptedMatrix<MODULUS>, ProtocolError> {
+    if state.encrypted {
+        return Err(ProtocolError::AlreadyEncrypted);
+    }
     let ell = state.params.ell;
-    let n = state.params.n();
+    let n = state.params.n()?;
     let rows = state.mask.dims().0;
     let expected = rows
         .checked_mul(ell)
         .ok_or(ProtocolError::DimensionOverflow)?;
     check_len("input matrix", expected, matrix.len())?;
 
-    let masked = state.mask.materialize()?;
-    let mask_values = masked.values();
+    let mut encoded = state.mask.materialize()?.into_values();
     let zero = PrimeField::<MODULUS>::new().element_u32(0);
-    let mut encoded = Vec::with_capacity(
-        rows.checked_mul(n)
-            .ok_or(ProtocolError::DimensionOverflow)?,
-    );
     let mut row = vec![zero; n];
-    let mut permuted = vec![zero; n];
     for row_index in 0..rows {
         state.code.dual_encode_row(
             &matrix[row_index * ell..(row_index + 1) * ell],
             &mut row,
             &mut state.code_scratch,
         )?;
-        let mask_row = &mask_values[row_index * n..(row_index + 1) * n];
-        for (slot, &masked) in row.iter_mut().zip(mask_row) {
+        let output_row = &mut encoded[row_index * n..(row_index + 1) * n];
+        for (slot, &masked) in row.iter_mut().zip(output_row.iter()) {
             *slot += masked;
         }
-        state.permutation.apply(&row, &mut permuted)?;
-        encoded.extend_from_slice(&permuted);
+        state.permutation.apply(&row, output_row)?;
     }
-    Ok(EncryptedMatrix {
+    let encrypted = EncryptedMatrix {
         matrix: DenseMatrix::new(rows, n, encoded)?,
-    })
+    };
+    state.encrypted = true;
+    Ok(encrypted)
 }
 
 /// Generates an encrypted query for `q` plus the client's decoding key.
@@ -485,9 +546,9 @@ pub fn query<const MODULUS: u32, M: TdmMask<MODULUS>, R: CryptoRng + ?Sized>(
 ) -> Result<(EncryptedQuery<MODULUS>, DecodingKey<MODULUS>), ProtocolError> {
     let code_dim = state.params.k;
     let ell = state.params.ell;
-    let width = state.params.n();
+    let width = state.params.n()?;
     let block_len = state.params.block_size();
-    let block_count = state.params.blocks();
+    let block_count = state.params.blocks()?;
     let rows = state.mask.dims().0;
     check_len("query vector", ell, q.len())?;
 
@@ -517,15 +578,15 @@ pub fn query<const MODULUS: u32, M: TdmMask<MODULUS>, R: CryptoRng + ?Sized>(
     // Hide each block behind a fresh nonzero scalar.
     let field = PrimeField::<MODULUS>::new();
     let mut q_hat = q_pi;
-    let mut p_prime = Vec::with_capacity(block_count);
+    let mut p_prime = vec![zero; block_count];
     for block in 0..block_count {
         let alpha = field.sample_uniform_nonzero(rng);
+        q_tilde[block] = alpha;
         for slot in &mut q_hat[block * block_len..(block + 1) * block_len] {
             *slot *= alpha;
         }
-        let inverse = alpha.inv()?;
-        p_prime.push(inverse);
     }
+    field.batch_inv_elements(&q_tilde[..block_count], &mut p_prime)?;
 
     Ok((
         EncryptedQuery { values: q_hat },
@@ -540,16 +601,17 @@ pub fn query<const MODULUS: u32, M: TdmMask<MODULUS>, R: CryptoRng + ?Sized>(
 ///
 /// # Errors
 ///
-/// Returns an error before producing output if the matrix columns differ
-/// from `n` or the query length differs from `n`.
+/// Returns an error before producing output if parameters are malformed, the
+/// matrix columns differ from `n`, or the query length differs from `n`.
 pub fn answer<const MODULUS: u32>(
     params: &EmvpParams,
     matrix: &EncryptedMatrix<MODULUS>,
     query: &EncryptedQuery<MODULUS>,
 ) -> Result<AnswerMatrix<MODULUS>, ProtocolError> {
-    let n = params.n();
+    params.validate_dimensions()?;
+    let n = params.n()?;
     let b = params.block_size();
-    let s = params.blocks();
+    let s = params.blocks()?;
     let rows = matrix.rows();
     check_len("encrypted matrix columns", n, matrix.columns())?;
     check_len("encrypted query", n, query.values.len())?;

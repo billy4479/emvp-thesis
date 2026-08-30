@@ -228,6 +228,7 @@ checksum = "9e5e8f6c15a24b9a3ee5efec809ccd006d3b30e8b3bb63c39af737c7f87daa1d"
 name = "emvp"
 version = "0.1.0"
 dependencies = [
+ "allocation-counter",
  "criterion",
  "prime-field-layer",
  "proptest",

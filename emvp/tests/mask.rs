@@ -164,6 +164,39 @@ impl TdmMask<MODULUS> for FixedBlock {
     }
 }
 
+struct BadMaterialization;
+
+impl TdmMask<MODULUS> for BadMaterialization {
+    type Scratch = ();
+
+    fn dims(&self) -> (usize, usize) {
+        (2, 2)
+    }
+
+    fn scratch(&self) {}
+
+    fn apply(
+        &self,
+        input: &[FieldElement<MODULUS>],
+        output: &mut [FieldElement<MODULUS>],
+        _scratch: &mut Self::Scratch,
+    ) -> Result<(), MaskError> {
+        if input.len() != 2 || output.len() != 2 {
+            return Err(MaskError::LengthMismatch {
+                name: "bad materialization apply",
+                expected: 2,
+                actual: usize::min(input.len(), output.len()),
+            });
+        }
+        output.copy_from_slice(input);
+        Ok(())
+    }
+
+    fn materialize(&self) -> Result<DenseMatrix<MODULUS>, MaskError> {
+        Ok(DenseMatrix::new(1, 1, zeros::<MODULUS>(1))?)
+    }
+}
+
 #[test]
 fn ring_lpn_adapter_matches_its_dense_materialization() {
     let instance = explicit_ring_lpn();
@@ -339,6 +372,19 @@ fn row_stack_rejects_bad_block_descriptors() {
 }
 
 #[test]
+fn row_stack_rejects_materialization_that_disagrees_with_dimensions() {
+    let stack = RowStackMask::new(vec![BadMaterialization], 2).unwrap();
+    assert!(matches!(
+        stack.materialize(),
+        Err(MaskError::LengthMismatch {
+            name: "materialized tail rows",
+            expected: 2,
+            actual: 1,
+        })
+    ));
+}
+
+#[test]
 fn row_stack_rejects_invalid_constructions() {
     // Real constructions with different block sizes are rejected too.
     let large = sample_toeplitz(5, 0x6601);
@@ -420,7 +466,7 @@ fn length_errors_leave_outputs_unchanged() {
     assert_eq!(field_values(&short_output), vec![0; 14]);
 
     let mut short_scratch = stack.scratch();
-    short_scratch.pop();
+    short_scratch.0.pop();
     assert!(matches!(
         stack.apply(&input, &mut output, &mut short_scratch),
         Err(MaskError::LengthMismatch {
@@ -468,6 +514,22 @@ fn length_errors_leave_outputs_unchanged() {
         }))
     ));
     assert_eq!(field_values(&short_adapter_output), vec![0; 4]);
+}
+
+#[test]
+fn partial_row_stack_apply_allocates_nothing_after_scratch_creation() {
+    let stack = toeplitz_stack(3, 13, 0x6810);
+    let input = elements::<MODULUS>(&[1, 2, 3, 4, 5]);
+    let mut output = zeros::<MODULUS>(13);
+    let mut scratch = stack.scratch();
+    stack.apply(&input, &mut output, &mut scratch).unwrap();
+
+    let allocations = allocation_counter::measure(|| {
+        for _ in 0..8 {
+            stack.apply(&input, &mut output, &mut scratch).unwrap();
+        }
+    });
+    assert_eq!(allocations.count_total, 0);
 }
 
 proptest! {

@@ -2,6 +2,47 @@ use super::FieldElement;
 use crate::{FieldError, PrimeField};
 
 impl<const MODULUS: u32> PrimeField<MODULUS> {
+    /// Writes the multiplicative inverses of `values` to `output`.
+    ///
+    /// This uses one field inversion and `3(n - 1)` multiplications. The
+    /// output slice doubles as prefix-product storage, so the operation
+    /// allocates nothing. Length and zero checks complete before `output` is
+    /// mutated.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FieldError::LengthMismatch`] if the slices differ in length,
+    /// or [`FieldError::DivisionByZero`] if any input is zero.
+    pub fn batch_inv_elements(
+        &self,
+        values: &[FieldElement<MODULUS>],
+        output: &mut [FieldElement<MODULUS>],
+    ) -> Result<(), FieldError> {
+        if values.len() != output.len() {
+            return Err(FieldError::LengthMismatch);
+        }
+        if values.iter().any(|value| value.montgomery == 0) {
+            return Err(FieldError::DivisionByZero);
+        }
+        let Some((&first, rest)) = values.split_first() else {
+            return Ok(());
+        };
+
+        output[0] = first;
+        for (index, &value) in rest.iter().enumerate() {
+            output[index + 1] = output[index] * value;
+        }
+
+        let mut inverse = output[output.len() - 1].inv()?;
+        for index in (1..values.len()).rev() {
+            let prefix = output[index - 1];
+            output[index] = inverse * prefix;
+            inverse *= values[index];
+        }
+        output[0] = inverse;
+        Ok(())
+    }
+
     /// Adds `rhs` element-wise into `lhs` in Montgomery representation.
     ///
     /// This takes `O(n)` time, allocates nothing, and leaves each `lhs[i]` as

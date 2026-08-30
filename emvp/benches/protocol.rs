@@ -6,7 +6,7 @@
 use std::{hint::black_box, time::Duration};
 
 use criterion::{
-    BenchmarkGroup, BenchmarkId, Criterion, Throughput, criterion_group, criterion_main,
+    BatchSize, BenchmarkGroup, BenchmarkId, Criterion, Throughput, criterion_group, criterion_main,
     measurement::WallTime,
 };
 use emvp::{
@@ -22,7 +22,7 @@ use trapdoor_matrices::ToeplitzFastProduct;
 const MODULUS: u32 = 998_244_353;
 
 // Realistic parameter set satisfying every `EmvpParams::validate` constraint:
-// d = ceil(512 / 15) = 35 so (k + 1)^d = 513^35 >= 2^128, and
+// d = ceil(512 / 15) = 35 so 16^(d-1) * min(16,d) = 2^140 >= 2^128, and
 // (n / b + 1) * k = 65 * 512 = 33280 > n + lambda = 1152.
 const PARAMS: EmvpParams = EmvpParams {
     k: 512,
@@ -33,6 +33,8 @@ const PARAMS: EmvpParams = EmvpParams {
 
 // Matrix row counts benchmarked for every phase.
 const ROW_COUNTS: [usize; 2] = [32, 128];
+// Covers both sides of the n-row mask-block boundary during derivation.
+const DERIVE_ROW_COUNTS: [usize; 4] = [32, 128, 1024, 1025];
 
 fn seeded_rng(domain: u8, size: usize) -> ChaCha20Rng {
     let mut seed = [domain; 32];
@@ -58,22 +60,23 @@ fn toeplitz_block(
     stream: &mut ChaCha20Rng,
     _index: usize,
 ) -> Result<ToeplitzFastProduct<MODULUS>, ProtocolError> {
-    Ok(ToeplitzFastProduct::sample(PARAMS.n(), stream)?)
+    Ok(ToeplitzFastProduct::sample(PARAMS.n().unwrap(), stream)?)
 }
 
 // The expanded long-term secrets for `rows` matrix rows.
 fn derive_state(rows: usize, domain: u8) -> DerivedState<MODULUS, ToeplitzFastProduct<MODULUS>> {
     SecretKey::<MODULUS>::new(PARAMS, [domain; 32])
+        .unwrap()
         .derive(rows, toeplitz_block)
         .unwrap()
 }
 
 fn bench_derive(group: &mut BenchmarkGroup<'_, WallTime>, rows: usize) {
-    group.throughput(elements(rows * PARAMS.n()));
     group.bench_function(BenchmarkId::new("toeplitz", rows), |b| {
         b.iter(|| {
             black_box(
                 SecretKey::<MODULUS>::new(PARAMS, [0x72; 32])
+                    .unwrap()
                     .derive(rows, toeplitz_block)
                     .unwrap(),
             )
@@ -82,11 +85,14 @@ fn bench_derive(group: &mut BenchmarkGroup<'_, WallTime>, rows: usize) {
 }
 
 fn bench_encrypt(group: &mut BenchmarkGroup<'_, WallTime>, rows: usize) {
-    let mut state = derive_state(rows, 0x01);
     let matrix = field_values(rows * PARAMS.ell, 0x02);
     group.throughput(elements(rows * PARAMS.ell));
     group.bench_function(BenchmarkId::new("toeplitz", rows), |b| {
-        b.iter(|| black_box(encrypt(black_box(&mut state), black_box(&matrix)).unwrap()));
+        b.iter_batched(
+            || derive_state(rows, 0x01),
+            |mut state| black_box(encrypt(black_box(&mut state), black_box(&matrix)).unwrap()),
+            BatchSize::SmallInput,
+        );
     });
 }
 
@@ -130,7 +136,7 @@ fn protocol_fixtures(
 
 fn bench_answer(group: &mut BenchmarkGroup<'_, WallTime>, rows: usize) {
     let (encrypted, encrypted_query, _decoding_key) = protocol_fixtures(rows);
-    group.throughput(elements(rows * PARAMS.n()));
+    group.throughput(elements(rows * PARAMS.n().unwrap()));
     group.bench_function(BenchmarkId::new("toeplitz", rows), |b| {
         b.iter(|| {
             black_box(
@@ -148,7 +154,7 @@ fn bench_answer(group: &mut BenchmarkGroup<'_, WallTime>, rows: usize) {
 fn bench_decode(group: &mut BenchmarkGroup<'_, WallTime>, rows: usize) {
     let (encrypted, encrypted_query, decoding_key) = protocol_fixtures(rows);
     let answer_matrix = answer(&PARAMS, &encrypted, &encrypted_query).unwrap();
-    group.throughput(elements(rows * PARAMS.blocks()));
+    group.throughput(elements(rows * PARAMS.blocks().unwrap()));
     group.bench_function(BenchmarkId::new("toeplitz", rows), |b| {
         b.iter(|| black_box(decode(black_box(&answer_matrix), black_box(&decoding_key)).unwrap()));
     });
@@ -157,7 +163,7 @@ fn bench_decode(group: &mut BenchmarkGroup<'_, WallTime>, rows: usize) {
 fn protocol_benches(c: &mut Criterion) {
     {
         let mut derive_group = c.benchmark_group("derive");
-        for &rows in &ROW_COUNTS {
+        for &rows in &DERIVE_ROW_COUNTS {
             bench_derive(&mut derive_group, rows);
         }
         derive_group.finish();

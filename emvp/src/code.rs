@@ -14,10 +14,9 @@
 //! transpose satisfies `M_g^T = J M_g J` for the index reversal
 //! `J v = reverse(v)`, so `M_g^T r = reverse(conv(g, reverse(r)))`, and a row
 //! `m` times the dual gives `m [-M_g^T | I] = (-conv(g, m) | m)`. The cyclic
-//! convolution `conv(g, m)`, the product in `R`, is evaluated as a linear
-//! convolution of length `2k - 1` whose high half folds back onto the low
-//! half: indices `i` and `i + k` overlap exactly for `i <= k - 2`, and
-//! coefficient `k - 1` has no high partner.
+//! convolution `conv(g, m)`, the product in `R`, uses a direct length-`k` NTT
+//! when the field supports one. Other dimensions use a linear convolution of
+//! length `2k - 1` whose high half folds back onto the low half.
 //!
 //! This is experimental cryptography: the construction has no settled
 //! security parameters, the multiplier, its cached transform, and scratch
@@ -146,16 +145,19 @@ impl<const MODULUS: u32> CyclicDualCode<MODULUS> {
             .checked_mul(2)
             .and_then(|length| length.checked_sub(1))
             .ok_or(CodeError::DimensionOverflow)?;
-        let transform_length = linear_length
+        let fallback_transform_length = linear_length
             .checked_next_power_of_two()
             .ok_or(CodeError::DimensionOverflow)?;
-        let plan = NttPlan::<MODULUS>::new(transform_length)?;
+        let plan = match NttPlan::<MODULUS>::new(k) {
+            Ok(plan) => plan,
+            Err(FieldError::UnsupportedTransformLength(_)) => {
+                NttPlan::<MODULUS>::new(fallback_transform_length)?
+            }
+            Err(error) => return Err(error.into()),
+        };
 
         let mut spectrum = multiplier.clone();
-        spectrum.resize(
-            transform_length,
-            PrimeField::<MODULUS>::new().element_u32(0),
-        );
+        spectrum.resize(plan.len(), PrimeField::<MODULUS>::new().element_u32(0));
         plan.forward(&mut spectrum)?;
 
         Ok(Self {
@@ -174,6 +176,10 @@ impl<const MODULUS: u32> CyclicDualCode<MODULUS> {
     ///
     /// Returns the same errors as [`Self::new`].
     pub fn sample<R: CryptoRng + ?Sized>(k: usize, rng: &mut R) -> Result<Self, CodeError> {
+        if k == 0 {
+            return Err(CodeError::ZeroDimension("code dimension k"));
+        }
+        k.checked_mul(2).ok_or(CodeError::DimensionOverflow)?;
         let field = PrimeField::<MODULUS>::new();
         let mut multiplier = vec![field.element_u32(0); k];
         field.fill_uniform(rng, &mut multiplier);
@@ -289,8 +295,9 @@ impl<const MODULUS: u32> CyclicDualCode<MODULUS> {
         Ok(())
     }
 
-    /// Evaluates `conv(g, input)` through one cached-transform NTT
-    /// convolution and folds the linear result modulo `X^k - 1`.
+    /// Evaluates `conv(g, input)` through one cached-transform NTT. A direct
+    /// length-`k` transform already works modulo `X^k - 1`; the fallback
+    /// linear transform folds its high coefficients afterward.
     ///
     /// The transform buffer must have at least the plan's length elements;
     /// the extra tail is ignored. All lengths are checked before any buffer
@@ -319,9 +326,11 @@ impl<const MODULUS: u32> CyclicDualCode<MODULUS> {
         self.plan.inverse(transform)?;
 
         output.copy_from_slice(&transform[..self.k]);
-        let high = &transform[self.k..2 * self.k - 1];
-        for (low, &high) in output.iter_mut().zip(high) {
-            *low += high;
+        if self.plan.len() != self.k {
+            let high = &transform[self.k..2 * self.k - 1];
+            for (low, &high) in output.iter_mut().zip(high) {
+                *low += high;
+            }
         }
         Ok(())
     }
