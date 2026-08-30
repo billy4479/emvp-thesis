@@ -17,7 +17,9 @@
 //! [`trapdoor_matrices`]: trapdoor_matrices
 
 pub mod code;
+pub mod params;
 pub mod prf;
 
 pub use code::{CyclicCodeScratch, CyclicDualCode, CodeError};
+pub use params::{pow_ge_pow2, search, EmvpParams, ParamsError, POW_MAX_LAMBDA};
 pub use prf::{purpose, Prf, PrfError};
