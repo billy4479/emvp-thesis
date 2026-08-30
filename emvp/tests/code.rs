@@ -3,7 +3,7 @@
     reason = "fixed test fixtures establish that construction and encoding must succeed"
 )]
 
-use emvp::{CyclicDualCode, CodeError};
+use emvp::{CodeError, CyclicDualCode};
 use prime_field_layer::{FieldElement, PrimeField};
 use proptest::prelude::*;
 use rand_chacha::ChaCha20Rng;
@@ -176,7 +176,9 @@ fn repeated_calls_with_one_scratch_are_deterministic() {
 
     let field = PrimeField::<MODULUS>::new();
     let mut rng = ChaCha20Rng::seed_from_u64(0x7002);
-    let row: Vec<_> = (0..code.k()).map(|_| field.sample_uniform(&mut rng)).collect();
+    let row: Vec<_> = (0..code.k())
+        .map(|_| field.sample_uniform(&mut rng))
+        .collect();
     let mut encoded_first = zeros(code.n());
     let mut encoded_second = zeros(code.n());
     code.dual_encode_row(&row, &mut encoded_first, &mut scratch)

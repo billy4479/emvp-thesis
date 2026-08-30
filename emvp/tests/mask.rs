@@ -69,9 +69,7 @@ fn toeplitz_stack(
 
 /// Independently rebuilds the dense stack from the individual blocks,
 /// truncating to the mask's row count.
-fn stacked_dense<M: TdmMask<MODULUS>>(
-    stack: &RowStackMask<M, MODULUS>,
-) -> DenseMatrix<MODULUS> {
+fn stacked_dense<M: TdmMask<MODULUS>>(stack: &RowStackMask<M, MODULUS>) -> DenseMatrix<MODULUS> {
     let (total_rows, columns) = stack.dims();
     let mut values = Vec::new();
     for block in stack.blocks() {
@@ -252,7 +250,8 @@ fn remainder_row_stack_truncates_the_last_block() {
     let last = &stack.blocks()[2];
     let mut last_output = zeros::<MODULUS>(5);
     let mut last_scratch = last.scratch();
-    last.apply(&input, &mut last_output, &mut last_scratch).unwrap();
+    last.apply(&input, &mut last_output, &mut last_scratch)
+        .unwrap();
     assert_eq!(
         field_values(&structured[10..13]),
         field_values(&last_output[..3])
@@ -260,7 +259,7 @@ fn remainder_row_stack_truncates_the_last_block() {
 }
 
 #[test]
-fn row_stack_rejects_invalid_constructions() {
+fn row_stack_rejects_bad_block_descriptors() {
     assert!(matches!(
         RowStackMask::<ToeplitzFastProduct<MODULUS>, MODULUS>::new(Vec::new(), 5),
         Err(MaskError::LengthMismatch {
@@ -270,10 +269,13 @@ fn row_stack_rejects_invalid_constructions() {
         })
     ));
     assert!(matches!(
-        RowStackMask::new(vec![FixedBlock {
-            rows: 2,
-            columns: 3
-        }], 2),
+        RowStackMask::new(
+            vec![FixedBlock {
+                rows: 2,
+                columns: 3
+            }],
+            2
+        ),
         Err(MaskError::LengthMismatch {
             name: "first mask block rows",
             expected: 3,
@@ -281,10 +283,13 @@ fn row_stack_rejects_invalid_constructions() {
         })
     ));
     assert!(matches!(
-        RowStackMask::new(vec![FixedBlock {
-            rows: 0,
-            columns: 0
-        }], 1),
+        RowStackMask::new(
+            vec![FixedBlock {
+                rows: 0,
+                columns: 0
+            }],
+            1
+        ),
         Err(MaskError::LengthMismatch {
             name: "mask block rows",
             expected: 1,
@@ -331,7 +336,10 @@ fn row_stack_rejects_invalid_constructions() {
             actual: 4
         })
     ));
+}
 
+#[test]
+fn row_stack_rejects_invalid_constructions() {
     // Real constructions with different block sizes are rejected too.
     let large = sample_toeplitz(5, 0x6601);
     let small = sample_toeplitz(3, 0x6602);
@@ -375,7 +383,10 @@ fn fixed_block_double_stays_consistent_with_its_dense_form() {
         .apply(&elements::<MODULUS>(&[1, 2, 3]), &mut output, &mut ())
         .unwrap();
     assert_eq!(field_values(&output), vec![0, 0]);
-    assert_eq!(field_values(block.materialize().unwrap().values()), vec![0; 6]);
+    assert_eq!(
+        field_values(block.materialize().unwrap().values()),
+        vec![0; 6]
+    );
 }
 
 #[test]
@@ -427,7 +438,12 @@ fn length_errors_leave_outputs_unchanged() {
     let adapter_sentinel = sentinel_values::<MODULUS>(5, 7);
     let mut adapter_output = adapter_sentinel.clone();
     assert!(matches!(
-        TdmMask::apply(&product, &zeros::<MODULUS>(4), &mut adapter_output, &mut product_scratch),
+        TdmMask::apply(
+            &product,
+            &zeros::<MODULUS>(4),
+            &mut adapter_output,
+            &mut product_scratch
+        ),
         Err(MaskError::Tdm(TdmError::LengthMismatch {
             name: "fast-product input",
             expected: 5,
@@ -439,7 +455,12 @@ fn length_errors_leave_outputs_unchanged() {
     let mut short_adapter_output = zeros::<MODULUS>(4);
     let adapter_input = zeros::<MODULUS>(5);
     assert!(matches!(
-        TdmMask::apply(&product, &adapter_input, &mut short_adapter_output, &mut product_scratch),
+        TdmMask::apply(
+            &product,
+            &adapter_input,
+            &mut short_adapter_output,
+            &mut product_scratch
+        ),
         Err(MaskError::Tdm(TdmError::LengthMismatch {
             name: "fast-product output",
             expected: 5,

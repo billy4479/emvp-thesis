@@ -204,7 +204,10 @@ impl fmt::Display for ParamsError {
                 write!(formatter, "block size {b} must be at least 2")
             }
             Self::BlockDoesNotDivideLength { b, n } => {
-                write!(formatter, "block size {b} does not divide the codeword length {n}")
+                write!(
+                    formatter,
+                    "block size {b} does not divide the codeword length {n}"
+                )
             }
             Self::InsecureAgainstAlgebraicAttack { k, b, d, lambda } => write!(
                 formatter,
@@ -282,7 +285,8 @@ impl EmvpParams {
         if ell > k {
             return Err(ParamsError::EllExceedsRank { ell, k });
         }
-        let floor = Self::rank_floor(lambda);        if k < floor {
+        let floor = Self::rank_floor(lambda);
+        if k < floor {
             return Err(ParamsError::RankBelowSecurityFloor { k, lambda });
         }
         if b < 2 {
@@ -365,7 +369,10 @@ pub fn search(ell: usize, lambda: u32) -> Result<EmvpParams, ParamsError> {
         // Divisors of n in descending order, tried largest first.
         let mut divisor: usize = 1;
         let mut divisors = Vec::new();
-        while divisor.checked_mul(divisor).is_some_and(|square| square <= n) {
+        while divisor
+            .checked_mul(divisor)
+            .is_some_and(|square| square <= n)
+        {
             if n % divisor == 0 {
                 divisors.push(divisor);
                 if divisor != n / divisor {

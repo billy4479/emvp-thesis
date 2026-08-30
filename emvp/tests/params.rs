@@ -1,6 +1,6 @@
 #![expect(clippy::unwrap_used, reason = "test fixtures must succeed")]
 
-use emvp::{pow_ge_pow2, EmvpParams, ParamsError};
+use emvp::{EmvpParams, ParamsError, pow_ge_pow2};
 
 const LAMBDA: u32 = 128;
 
@@ -63,10 +63,7 @@ fn pow_matches_bignum_reference() {
             for &lambda in &[1_u32, 8, 64, 128, 129, 200] {
                 let actual = pow_ge_pow2(base, exp, lambda);
                 let expected = reference_pow_ge_pow2(base, exp, lambda);
-                assert_eq!(
-                    actual, expected,
-                    "base {base}, exp {exp}, lambda {lambda}"
-                );
+                assert_eq!(actual, expected, "base {base}, exp {exp}, lambda {lambda}");
             }
         }
     }
@@ -99,7 +96,10 @@ fn rejects_insecure_or_malformed_parameter_sets() {
     );
     assert_eq!(
         params(30, 30, 2).validate(),
-        Err(ParamsError::RankBelowSecurityFloor { k: 30, lambda: LAMBDA })
+        Err(ParamsError::RankBelowSecurityFloor {
+            k: 30,
+            lambda: LAMBDA
+        })
     );
     assert_eq!(
         params(162, 162, 1).validate(),
@@ -121,7 +121,13 @@ fn rejects_insecure_or_malformed_parameter_sets() {
     );
     // (4/2 + 1) * 2 = 6 <= 4 + 3, and 3^2 = 9 >= 2^3.
     assert_eq!(
-        EmvpParams { k: 2, ell: 2, b: 2, lambda: 3 }.validate(),
+        EmvpParams {
+            k: 2,
+            ell: 2,
+            b: 2,
+            lambda: 3
+        }
+        .validate(),
         Err(ParamsError::InsecureAgainstInclusionExclusion {
             n: 4,
             k: 2,
@@ -131,8 +137,16 @@ fn rejects_insecure_or_malformed_parameter_sets() {
     );
     // Security levels beyond the exact comparator range are rejected.
     assert_eq!(
-        EmvpParams { k: 4096, ell: 4096, b: 2, lambda: emvp::POW_MAX_LAMBDA + 1 }.validate(),
-        Err(ParamsError::LambdaOutOfScope { lambda: emvp::POW_MAX_LAMBDA + 1 })
+        EmvpParams {
+            k: 4096,
+            ell: 4096,
+            b: 2,
+            lambda: emvp::POW_MAX_LAMBDA + 1
+        }
+        .validate(),
+        Err(ParamsError::LambdaOutOfScope {
+            lambda: emvp::POW_MAX_LAMBDA + 1
+        })
     );
 }
 
@@ -169,7 +183,12 @@ fn search_finds_minimal_rank_and_largest_block() {
             if n % b != 0 {
                 continue;
             }
-            let candidate = EmvpParams { k, ell: 162, b, lambda: LAMBDA };
+            let candidate = EmvpParams {
+                k,
+                ell: 162,
+                b,
+                lambda: LAMBDA,
+            };
             assert!(
                 candidate.validate().is_err(),
                 "rank {k} with block size {b} should be infeasible"

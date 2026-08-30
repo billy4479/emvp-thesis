@@ -3,7 +3,7 @@
     reason = "fixed test fixtures establish that stream derivation must succeed"
 )]
 
-use emvp::prf::{purpose, Prf, PrfError};
+use emvp::prf::{Prf, PrfError, purpose};
 use rand_core::Rng;
 
 const KEY: [u8; 32] = [
@@ -29,7 +29,10 @@ fn same_key_purpose_and_index_give_identical_bytes() {
 fn different_keys_give_different_bytes() {
     let mut other_key = KEY;
     other_key[0] ^= 1;
-    assert_ne!(derived_bytes(KEY, purpose::TDM, 0, 32), derived_bytes(other_key, purpose::TDM, 0, 32));
+    assert_ne!(
+        derived_bytes(KEY, purpose::TDM, 0, 32),
+        derived_bytes(other_key, purpose::TDM, 0, 32)
+    );
 }
 
 #[test]
@@ -50,7 +53,10 @@ fn different_purposes_give_different_bytes() {
 fn different_indices_give_different_bytes() {
     let baseline = derived_bytes(KEY, purpose::QUERY_NONZERO, 0, 32);
     assert_ne!(baseline, derived_bytes(KEY, purpose::QUERY_NONZERO, 1, 32));
-    assert_ne!(baseline, derived_bytes(KEY, purpose::QUERY_NONZERO, 1 << 20, 32));
+    assert_ne!(
+        baseline,
+        derived_bytes(KEY, purpose::QUERY_NONZERO, 1 << 20, 32)
+    );
 }
 
 #[test]
