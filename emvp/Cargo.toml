@@ -13,7 +13,12 @@ rand_core = { workspace = true }
 trapdoor-matrices = { path = "../trapdoor-matrices" }
 
 [dev-dependencies]
+criterion = { workspace = true }
 proptest = { workspace = true }
 
 [lints]
 workspace = true
+
+[[bench]]
+name = "protocol"
+harness = false
