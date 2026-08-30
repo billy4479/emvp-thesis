@@ -1,0 +1,19 @@
+[package]
+name = "emvp"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+bench = false
+
+[dependencies]
+prime-field-layer = { path = "../prime-field-layer" }
+rand_chacha = { workspace = true }
+rand_core = { workspace = true }
+trapdoor-matrices = { path = "../trapdoor-matrices" }
+
+[dev-dependencies]
+proptest = { workspace = true }
+
+[lints]
+workspace = true

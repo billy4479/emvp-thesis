@@ -1,0 +1,112 @@
+use std::fmt;
+
+use rand_chacha::ChaCha20Rng;
+use rand_core::SeedableRng;
+
+/// Named purpose tags for [`Prf::stream`].
+///
+/// Every protocol component must derive its randomness under its own tag:
+/// the tag selects an exclusive `2^32`-word window of the `ChaCha20` stream, so
+/// index spaces are per-tag and independent. Reusing a tag for two components
+/// would hand both the same derived streams; adding a component means adding
+/// a fresh tag, never renumbering an existing one.
+pub mod purpose {
+    /// Seeds the secret code multiplier of the cyclic dual code.
+    pub const CODE_MULTIPLIER: u32 = 1;
+    /// Seeds the public random permutation that decorrelates the 1D-SLSN
+    /// block structure.
+    pub const CODE_PERMUTATION: u32 = 2;
+    /// Seeds the stack of trapdoored matrices.
+    pub const TDM: u32 = 3;
+    /// Seeds the nonzero entries of client queries.
+    pub const QUERY_NONZERO: u32 = 4;
+}
+
+/// Each derived stream is meant to be consumed as an 8-word (32-byte) seed
+/// by a downstream generator.
+const SLOT_WORDS: u128 = 8;
+
+/// Largest stream index whose 8-word slot stays inside the purpose window:
+/// `index * 8 + 8 <= 2^32`.
+const MAX_INDEX: u64 = (1 << (u32::BITS - 3)) - 1;
+
+/// A purpose-indexed deterministic PRF keyed by a 32-byte secret.
+///
+/// All protocol randomness is derived from one short key: [`Prf::stream`]
+/// returns a [`ChaCha20Rng`] positioned at a counter offset computed from a
+/// purpose tag and an index. This is a PRF under the standard assumption that
+/// `ChaCha20` in counter mode keyed with a uniform secret key is a secure
+/// stream cipher: the bytes at an unqueried `(purpose, index)` position are
+/// computationally indistinguishable from uniform to a party that does not
+/// know the key. The key must therefore be a uniform 32-byte secret.
+///
+/// The stream is partitioned so that derived streams cannot collide:
+///
+/// - every purpose tag occupies its own window of `2^32` `ChaCha` words;
+/// - each index addresses an 8-word slot inside that window (32 bytes, one
+///   downstream seed);
+/// - indices are bounded by [`MAX_INDEX`], so a slot never spills into the
+///   next purpose's window.
+#[derive(Clone)]
+pub struct Prf([u8; 32]);
+
+impl Prf {
+    /// Wraps a uniform 32-byte secret key.
+    #[must_use]
+    pub const fn new(key: [u8; 32]) -> Self {
+        Self(key)
+    }
+
+    /// Returns the `ChaCha20` stream at the slot selected by `purpose` and
+    /// `index`.
+    ///
+    /// The counter position, in 32-bit words, is
+    /// `(u128::from(purpose) << 32) + index * 8`. The stream position is the
+    /// only state, so derivation order does not matter: streams for
+    /// `(purpose A, index i)` and `(purpose B, index j)` yield identical bytes
+    /// regardless of which is derived first.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PrfError::IndexOutOfRange`] if `index` exceeds
+    /// [`MAX_INDEX`], since such a slot would overlap the next purpose's
+    /// window.
+    pub fn stream(&self, purpose: u32, index: u64) -> Result<ChaCha20Rng, PrfError> {
+        if index > MAX_INDEX {
+            return Err(PrfError::IndexOutOfRange { index });
+        }
+        let position = (u128::from(purpose) << u32::BITS) | (u128::from(index) * SLOT_WORDS);
+        let mut rng = ChaCha20Rng::from_seed(self.0);
+        rng.set_word_pos(position);
+        Ok(rng)
+    }
+}
+
+impl fmt::Debug for Prf {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.debug_struct("Prf").finish_non_exhaustive()
+    }
+}
+
+/// A rejected PRF derivation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PrfError {
+    /// A stream index would overlap the next purpose's window.
+    IndexOutOfRange {
+        /// The rejected index.
+        index: u64,
+    },
+}
+
+impl fmt::Display for PrfError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::IndexOutOfRange { index } => write!(
+                formatter,
+                "stream index {index} exceeds the {SLOT_WORDS}-word slot budget of a purpose window"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for PrfError {}
