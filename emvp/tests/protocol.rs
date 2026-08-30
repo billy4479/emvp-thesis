@@ -1,0 +1,381 @@
+#![expect(
+    clippy::unwrap_used,
+    reason = "fixed test fixtures establish that protocol steps must succeed"
+)]
+
+use emvp::{
+    AnswerMatrix, DecodingKey, DerivedState, EmvpParams, EncryptedMatrix, EncryptedQuery,
+    ProtocolError, SecretKey, TdmMask, answer, decode, encrypt, query,
+};
+use prime_field_layer::{FieldElement, PrimeField};
+use rand_chacha::ChaCha20Rng;
+use rand_core::{Rng, SeedableRng};
+use trapdoor_matrices::{DenseMatrix, RaaWeightedProduct, ToeplitzFastProduct};
+
+// NTT-friendly prime: 998_244_353 - 1 is divisible by 2^23.
+const MODULUS: u32 = 998_244_353;
+
+// Tiny deliberately-insecure research parameters: k = 8, ell = 8, b = 2,
+// so n = 16 and s = 8. The protocol layer does not re-validate params.
+const fn test_params(ell: usize) -> EmvpParams {
+    EmvpParams {
+        k: 8,
+        ell,
+        b: 2,
+        lambda: 7,
+    }
+}
+
+const fn field() -> PrimeField<MODULUS> {
+    PrimeField::<MODULUS>::new()
+}
+
+fn random_vector(length: usize, rng: &mut ChaCha20Rng) -> Vec<FieldElement<MODULUS>> {
+    let field = field();
+    (0..length).map(|_| field.sample_uniform(rng)).collect()
+}
+
+fn toeplitz_block(
+    stream: &mut ChaCha20Rng,
+    _index: usize,
+) -> Result<ToeplitzFastProduct<MODULUS>, ProtocolError> {
+    Ok(ToeplitzFastProduct::sample(16, stream)?)
+}
+
+fn raa_block(
+    stream: &mut ChaCha20Rng,
+    _index: usize,
+) -> Result<RaaWeightedProduct<MODULUS>, ProtocolError> {
+    Ok(RaaWeightedProduct::sample_nonzero(16, 2, stream)?)
+}
+
+fn derive_toeplitz(
+    rows: usize,
+    ell: usize,
+    key: u8,
+) -> DerivedState<MODULUS, ToeplitzFastProduct<MODULUS>> {
+    SecretKey::<MODULUS>::new(test_params(ell), [key; 32])
+        .derive(rows, toeplitz_block)
+        .unwrap()
+}
+
+fn run_protocol<M: TdmMask<MODULUS>>(
+    state: &mut DerivedState<MODULUS, M>,
+    matrix: &[FieldElement<MODULUS>],
+    q: &[FieldElement<MODULUS>],
+    rng: &mut ChaCha20Rng,
+) -> Vec<FieldElement<MODULUS>> {
+    let encrypted = encrypt(state, matrix).unwrap();
+    let (encrypted_query, decoding_key) = query(state, q, rng).unwrap();
+    let answer_matrix = answer(&state.params(), &encrypted, &encrypted_query).unwrap();
+    decode(&answer_matrix, &decoding_key).unwrap()
+}
+
+fn naive_matrix_vector(
+    matrix: &[FieldElement<MODULUS>],
+    q: &[FieldElement<MODULUS>],
+    rows: usize,
+    ell: usize,
+) -> Vec<FieldElement<MODULUS>> {
+    let field = field();
+    (0..rows)
+        .map(|row| {
+            let mut accumulator = field.element_u32(0);
+            for column in 0..ell {
+                accumulator += matrix[row * ell + column] * q[column];
+            }
+            accumulator
+        })
+        .collect()
+}
+
+#[test]
+fn end_to_end_matches_plaintext_product() {
+    let mut rng = ChaCha20Rng::seed_from_u64(1);
+    let (rows, ell) = (5_usize, 8_usize);
+    let mut state = derive_toeplitz(rows, ell, 2);
+    let matrix = random_vector(rows * ell, &mut rng);
+    let q = random_vector(ell, &mut rng);
+    let decoded = run_protocol(&mut state, &matrix, &q, &mut rng);
+    let expected = naive_matrix_vector(&matrix, &q, rows, ell);
+    assert_eq!(decoded, expected);
+}
+
+#[test]
+fn end_to_end_works_with_raa_mask() {
+    let mut rng = ChaCha20Rng::seed_from_u64(3);
+    let (rows, ell) = (7_usize, 8_usize);
+    let mut state = SecretKey::<MODULUS>::new(test_params(ell), [4; 32])
+        .derive(rows, raa_block)
+        .unwrap();
+    let matrix = random_vector(rows * ell, &mut rng);
+    let q = random_vector(ell, &mut rng);
+    let decoded = run_protocol(&mut state, &matrix, &q, &mut rng);
+    let expected = naive_matrix_vector(&matrix, &q, rows, ell);
+    assert_eq!(decoded, expected);
+}
+
+#[test]
+fn encrypt_is_deterministic() {
+    let mut rng = ChaCha20Rng::seed_from_u64(5);
+    let (rows, ell) = (5_usize, 8_usize);
+    let mut state = derive_toeplitz(rows, ell, 6);
+    let matrix = random_vector(rows * ell, &mut rng);
+    let first = encrypt(&mut state, &matrix).unwrap();
+    let second = encrypt(&mut state, &matrix).unwrap();
+    assert_eq!(first, second);
+}
+
+#[test]
+fn query_randomness_is_fresh() {
+    let mut rng = ChaCha20Rng::seed_from_u64(7);
+    let (rows, ell) = (5_usize, 8_usize);
+    let mut state = derive_toeplitz(rows, ell, 8);
+    let matrix = random_vector(rows * ell, &mut rng);
+    let q = random_vector(ell, &mut rng);
+    let encrypted = encrypt(&mut state, &matrix).unwrap();
+    let (first_query, first_key) = query(&mut state, &q, &mut rng).unwrap();
+    let (second_query, _second_key) = query(&mut state, &q, &mut rng).unwrap();
+    assert_ne!(first_query.values(), second_query.values());
+    let first_answer = answer(&state.params(), &encrypted, &first_query).unwrap();
+    let decoded = decode(&first_answer, &first_key).unwrap();
+    assert_eq!(decoded, naive_matrix_vector(&matrix, &q, rows, ell));
+}
+
+#[test]
+fn shorter_records_are_padded() {
+    let mut rng = ChaCha20Rng::seed_from_u64(9);
+    let (rows, ell) = (4_usize, 5_usize);
+    let mut state = derive_toeplitz(rows, ell, 10);
+    let matrix = random_vector(rows * ell, &mut rng);
+    let q = random_vector(ell, &mut rng);
+    let decoded = run_protocol(&mut state, &matrix, &q, &mut rng);
+    let expected = naive_matrix_vector(&matrix, &q, rows, ell);
+    assert_eq!(decoded, expected);
+}
+
+#[test]
+fn taller_matrices_stack_extra_mask_blocks() {
+    let mut rng = ChaCha20Rng::seed_from_u64(11);
+    let (rows, ell) = (2 * 16 + 3, 8_usize);
+    let mut state = derive_toeplitz(rows, ell, 12);
+    assert_eq!(state.mask().block_count(), 3);
+    let matrix = random_vector(rows * ell, &mut rng);
+    let q = random_vector(ell, &mut rng);
+    let decoded = run_protocol(&mut state, &matrix, &q, &mut rng);
+    let expected = naive_matrix_vector(&matrix, &q, rows, ell);
+    assert_eq!(decoded, expected);
+}
+
+#[test]
+fn wrong_key_gives_wrong_answer() {
+    let mut rng = ChaCha20Rng::seed_from_u64(13);
+    let (rows, ell) = (5_usize, 8_usize);
+    let mut state = derive_toeplitz(rows, ell, 14);
+    let mut other = derive_toeplitz(rows, ell, 15);
+    let matrix = random_vector(rows * ell, &mut rng);
+    let q = random_vector(ell, &mut rng);
+    let encrypted = encrypt(&mut state, &matrix).unwrap();
+    let (query_wrong, key_wrong) = query(&mut other, &q, &mut rng).unwrap();
+    let answer_wrong = answer(&state.params(), &encrypted, &query_wrong).unwrap();
+    let decoded = decode(&answer_wrong, &key_wrong).unwrap();
+    let expected = naive_matrix_vector(&matrix, &q, rows, ell);
+    assert_ne!(decoded, expected);
+}
+
+// Independent naive reimplementation of the encryption pipeline, in plain
+// u64 modular arithmetic. The dense mask is taken as input because the
+// caller needs the same materialization for its own naive query path.
+fn naive_encrypt_gathered(
+    state: &DerivedState<MODULUS, ToeplitzFastProduct<MODULUS>>,
+    dense_mask: &DenseMatrix<MODULUS>,
+    matrix: &[FieldElement<MODULUS>],
+    rows: usize,
+    ell: usize,
+) -> EncryptedMatrix<MODULUS> {
+    let params = state.params();
+    let code_dim = params.k;
+    let width = params.n();
+    let multiplier: Vec<u32> = state
+        .code()
+        .multiplier()
+        .iter()
+        .map(|&element| element.value())
+        .collect();
+    let permutation: Vec<usize> = state.permutation_indices().to_vec();
+    let modulus_u64 = u64::from(MODULUS);
+    let mut encrypted_values = Vec::new();
+    for row in 0..rows {
+        let record: Vec<u32> = matrix[row * ell..(row + 1) * ell]
+            .iter()
+            .map(|&element| element.value())
+            .collect();
+        // Left half: -M_g m; systematic half: m padded with zeros.
+        let mut encoded = Vec::with_capacity(width);
+        for i in 0..code_dim {
+            let mut accumulator = 0_u64;
+            for j in 0..code_dim {
+                accumulator +=
+                    u64::from(multiplier[(i + code_dim - j) % code_dim]) * u64::from(record[j]);
+            }
+            accumulator %= modulus_u64;
+            encoded.push((modulus_u64 - accumulator) % modulus_u64);
+        }
+        for value in record
+            .iter()
+            .copied()
+            .chain(std::iter::repeat(0_u32))
+            .take(code_dim)
+        {
+            encoded.push(u64::from(value));
+        }
+        for (slot, &masked) in encoded
+            .iter_mut()
+            .zip(&dense_mask.values()[row * width..(row + 1) * width])
+        {
+            *slot = (*slot + u64::from(masked.value())) % modulus_u64;
+        }
+        // Permute columns through the gather.
+        let permuted: Vec<u64> = permutation.iter().map(|&index| encoded[index]).collect();
+        encrypted_values.extend(
+            permuted
+                .iter()
+                .map(|&value| field().element_u32(value as u32)),
+        );
+    }
+    EncryptedMatrix::from_parts(rows, width, encrypted_values).unwrap()
+}
+
+#[test]
+fn permutation_direction_is_pinned_by_naive_oracle() {
+    let mut rng = ChaCha20Rng::seed_from_u64(17);
+    let (rows, ell) = (5_usize, 8_usize);
+    let mut state = derive_toeplitz(rows, ell, 18);
+    let params = state.params();
+    let code_dim = params.k;
+    let width = params.n();
+    let block_len = params.block_size();
+    let matrix = random_vector(rows * ell, &mut rng);
+    let query_vector = random_vector(ell, &mut rng);
+    let dense_mask = state.mask().materialize().unwrap();
+    let permutation: Vec<usize> = state.permutation_indices().to_vec();
+    let encrypted_naive = naive_encrypt_gathered(&state, &dense_mask, &matrix, rows, ell);
+
+    // Naive query, correct scatter direction.
+    let (_encrypted_query, decoding_key) = query(&mut state, &query_vector, &mut rng).unwrap();
+    let mut r_random = [0_u8; 32];
+    rng.fill_bytes(&mut r_random);
+    let mut query_rng = ChaCha20Rng::from_seed(r_random);
+    let codeword: Vec<u32> = {
+        let mut raw = vec![field().element_u32(0); width];
+        let mut scratch = state.code().scratch();
+        state
+            .code()
+            .sample_codeword(&mut query_rng, &mut raw, &mut scratch)
+            .unwrap();
+        raw.iter().map(|&element| element.value()).collect()
+    };
+    let mut q_tilde = codeword;
+    for (slot, &coefficient) in q_tilde[code_dim..].iter_mut().zip(&query_vector) {
+        *slot = (*slot + coefficient.value()) % MODULUS;
+    }
+    let alphas: Vec<u32> = decoding_key
+        .p_prime()
+        .iter()
+        .map(|&p| p.inv().unwrap().value())
+        .collect();
+    let modulus_u64 = u64::from(MODULUS);
+
+    let naive_answer = |gather: bool| {
+        let mut q_pi = vec![0_u32; width];
+        if gather {
+            for (position, &index) in permutation.iter().enumerate() {
+                q_pi[position] = q_tilde[index];
+            }
+        } else {
+            for (position, &index) in permutation.iter().enumerate() {
+                q_pi[index] = q_tilde[position];
+            }
+        }
+        let mut q_hat = q_pi.clone();
+        for (block, &alpha) in alphas.iter().enumerate() {
+            for slot in &mut q_hat[block * block_len..(block + 1) * block_len] {
+                *slot = (u64::from(*slot) * u64::from(alpha) % modulus_u64) as u32;
+            }
+        }
+        let q_hat_elements: Vec<FieldElement<MODULUS>> = q_hat
+            .iter()
+            .map(|&value| field().element_u32(value))
+            .collect();
+        let answer_matrix = answer(
+            &params,
+            &encrypted_naive,
+            &EncryptedQuery::from_parts(q_hat_elements),
+        )
+        .unwrap();
+        // Mask share r' = R q_tilde on the UNPERMUTED query.
+        let q_tilde_elements: Vec<FieldElement<MODULUS>> = q_tilde
+            .iter()
+            .map(|&value| field().element_u32(value))
+            .collect();
+        let mut r_prime = vec![field().element_u32(0); rows];
+        dense_mask.apply(&q_tilde_elements, &mut r_prime).unwrap();
+        let key = DecodingKey::from_parts(decoding_key.p_prime().to_vec(), r_prime);
+        decode(&answer_matrix, &key).unwrap()
+    };
+
+    let correct = naive_answer(true); // gather, matching the matrix columns
+    let expected = naive_matrix_vector(&matrix, &query_vector, rows, ell);
+    assert_eq!(correct, expected, "scatter direction must decode correctly");
+
+    let flipped = naive_answer(false); // scatter, the wrong direction
+    assert_ne!(
+        flipped, expected,
+        "the gather direction must break correctness"
+    );
+}
+
+#[test]
+fn length_errors_are_rejected_before_mutation() {
+    let mut rng = ChaCha20Rng::seed_from_u64(19);
+    let (rows, ell) = (5_usize, 8_usize);
+    let mut state = derive_toeplitz(rows, ell, 20);
+    let n = state.params().n();
+    let q = random_vector(ell, &mut rng);
+
+    let short_matrix = random_vector(rows * ell - 1, &mut rng);
+    assert!(matches!(
+        encrypt(&mut state, &short_matrix),
+        Err(ProtocolError::LengthMismatch { .. })
+    ));
+
+    let short_query = random_vector(ell - 1, &mut rng);
+    assert!(matches!(
+        query(&mut state, &short_query, &mut rng),
+        Err(ProtocolError::LengthMismatch { .. })
+    ));
+
+    let encrypted = encrypt(&mut state, &random_vector(rows * ell, &mut rng)).unwrap();
+    let (encrypted_query, decoding_key) = query(&mut state, &q, &mut rng).unwrap();
+    let answer_matrix = answer(&state.params(), &encrypted, &encrypted_query).unwrap();
+
+    let truncated_query = EncryptedQuery::from_parts(encrypted_query.values()[..n - 1].to_vec());
+    assert!(matches!(
+        answer(&state.params(), &encrypted, &truncated_query),
+        Err(ProtocolError::LengthMismatch { .. })
+    ));
+
+    let short_key = DecodingKey::from_parts(
+        decoding_key.p_prime()[..state.params().blocks() - 1].to_vec(),
+        decoding_key.r_prime().to_vec(),
+    );
+    let sentinel = AnswerMatrix::from_parts(
+        answer_matrix.values().to_vec(),
+        rows,
+        state.params().blocks(),
+    );
+    assert!(matches!(
+        decode(&sentinel, &short_key),
+        Err(ProtocolError::LengthMismatch { .. })
+    ));
+}

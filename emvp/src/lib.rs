@@ -20,8 +20,13 @@ pub mod code;
 pub mod mask;
 pub mod params;
 pub mod prf;
+pub mod protocol;
 
-pub use code::{CyclicCodeScratch, CyclicDualCode, CodeError};
+pub use code::{CodeError, CyclicCodeScratch, CyclicDualCode};
 pub use mask::{MaskError, RowStackMask, TdmMask};
-pub use params::{pow_ge_pow2, search, EmvpParams, ParamsError, POW_MAX_LAMBDA};
-pub use prf::{purpose, Prf, PrfError};
+pub use params::{EmvpParams, POW_MAX_LAMBDA, ParamsError, pow_ge_pow2, search};
+pub use prf::{Prf, PrfError, purpose};
+pub use protocol::{
+    AnswerMatrix, DecodingKey, DerivedState, EncryptedMatrix, EncryptedQuery, ProtocolError,
+    SecretKey, answer, decode, encrypt, query,
+};
