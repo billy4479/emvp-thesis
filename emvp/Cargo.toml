@@ -10,6 +10,7 @@ bench = false
 prime-field-layer = { path = "../prime-field-layer" }
 rand_chacha = { workspace = true }
 rand_core = { workspace = true }
+rayon = { workspace = true }
 trapdoor-matrices = { path = "../trapdoor-matrices" }
 
 [dev-dependencies]

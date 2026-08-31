@@ -31,6 +31,7 @@ use trapdoor_matrices::{
 
 /// A rejected mask construction or evaluation.
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[non_exhaustive]
 pub enum MaskError {
     /// A slice did not have the required length.
     LengthMismatch {
@@ -97,6 +98,14 @@ const fn check_len(name: &'static str, expected: usize, actual: usize) -> Result
 /// foreign construction types of the [`trapdoor_matrices`] crate as well as
 /// for user-supplied blocks. Every block is `rows x columns`; the shipped
 /// constructions are square `K x K`.
+///
+/// # Cryptographic contract
+///
+/// Protocol implementations must use independently sampled blocks whose
+/// materialized matrices are pseudorandom under the intended TDM assumption.
+/// [`Self::apply`], [`Self::materialize`], and
+/// [`Self::materialize_top_rows`] must all represent the same linear map.
+/// The type system cannot verify either requirement for user implementations.
 pub trait TdmMask<const MODULUS: u32> {
     /// Reusable storage for allocation-free evaluation.
     type Scratch;
@@ -285,7 +294,7 @@ impl<M: TdmMask<MODULUS>, const MODULUS: u32> RowStackMask<M, MODULUS> {
     /// Constructs a mask from square blocks stacked along the rows.
     ///
     /// The blocks must be nonempty, square, and equally sized, and
-    /// `total_rows` must lie in `1..=blocks.len() * n` where `n` is the
+    /// the block count must equal `total_rows.div_ceil(n)` where `n` is the
     /// common block dimension.
     ///
     /// # Errors
@@ -350,6 +359,14 @@ impl<M: TdmMask<MODULUS>, const MODULUS: u32> RowStackMask<M, MODULUS> {
                 name: "total mask rows",
                 expected: full_rows,
                 actual: total_rows,
+            });
+        }
+        let expected_blocks = total_rows.div_ceil(block_rows);
+        if blocks.len() != expected_blocks {
+            return Err(MaskError::LengthMismatch {
+                name: "mask blocks for total rows",
+                expected: expected_blocks,
+                actual: blocks.len(),
             });
         }
 
@@ -457,10 +474,20 @@ impl<M: TdmMask<MODULUS>, const MODULUS: u32> TdmMask<MODULUS> for RowStackMask<
             .total_rows
             .checked_mul(block_rows)
             .ok_or(MaskError::DimensionOverflow)?;
-        let mut values = Vec::with_capacity(length);
-
         let last = self.blocks.len() - 1;
-        for block in &self.blocks[..last] {
+        if last == 0 {
+            let matrix = self.blocks[0].materialize_top_rows(self.total_rows)?;
+            check_len("materialized tail rows", self.total_rows, matrix.rows())?;
+            check_len("materialized tail columns", block_rows, matrix.columns())?;
+            return Ok(matrix);
+        }
+
+        let first = self.blocks[0].materialize()?;
+        check_len("materialized block rows", block_rows, first.rows())?;
+        check_len("materialized block columns", block_rows, first.columns())?;
+        let mut values = first.into_values();
+        values.reserve(length - values.len());
+        for block in &self.blocks[1..last] {
             let matrix = block.materialize()?;
             check_len("materialized block rows", block_rows, matrix.rows())?;
             check_len("materialized block columns", block_rows, matrix.columns())?;

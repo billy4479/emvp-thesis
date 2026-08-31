@@ -30,6 +30,7 @@ use rand_core::CryptoRng;
 
 /// A rejected code construction, encoding, or codeword sampling.
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[non_exhaustive]
 pub enum CodeError {
     /// A slice did not have the required length.
     LengthMismatch {

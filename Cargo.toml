@@ -16,6 +16,7 @@ allocation-counter = "0.8"
 criterion = { version = "0.8", features = ["html_reports"] }
 proptest = "1"
 rand_chacha = { version = "0.10", default-features = false }
+rayon = "1.11"
 
 [workspace.lints.rust]
 unsafe_code = "deny"

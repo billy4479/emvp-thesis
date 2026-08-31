@@ -416,6 +416,17 @@ fn row_stack_rejects_invalid_constructions() {
             actual: 0
         })
     ));
+
+    let first = sample_toeplitz(5, 0x6606);
+    let second = sample_toeplitz(5, 0x6607);
+    assert!(matches!(
+        RowStackMask::new(vec![first, second], 2),
+        Err(MaskError::LengthMismatch {
+            name: "mask blocks for total rows",
+            expected: 1,
+            actual: 2,
+        })
+    ));
 }
 
 #[test]

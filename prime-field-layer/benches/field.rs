@@ -157,7 +157,7 @@ fn batch_inversion(c: &mut Criterion) {
     let lengths: &[usize] = if common::is_quick() {
         &[4_096]
     } else {
-        &[16, 256, 4_096]
+        &[16, 64, 256, 4_096]
     };
     for &length in lengths {
         group.throughput(Throughput::Elements(length as u64));
@@ -168,6 +168,20 @@ fn batch_inversion(c: &mut Criterion) {
                 |values| field.batch_inv_assign(black_box(values)).unwrap(),
                 BatchSize::SmallInput,
             );
+        });
+
+        let element_input: Vec<_> = input
+            .iter()
+            .map(|&value| field.element_u32(value))
+            .collect();
+        let mut element_output = vec![field.element_u32(0); length];
+        group.bench_with_input(BenchmarkId::new("elements", length), &length, |b, _| {
+            b.iter(|| {
+                field
+                    .batch_inv_elements(black_box(&element_input), black_box(&mut element_output))
+                    .unwrap();
+                black_box(&element_output);
+            });
         });
     }
     group.finish();

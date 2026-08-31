@@ -24,9 +24,12 @@ pub mod protocol;
 
 pub use code::{CodeError, CyclicCodeScratch, CyclicDualCode};
 pub use mask::{MaskError, RowStackMask, TdmMask};
-pub use params::{EmvpParams, POW_MAX_LAMBDA, ParamsError, pow_ge_pow2, search};
+pub use params::{
+    EmvpParams, POW_MAX_LAMBDA, PROTOCOL_MAX_LAMBDA, ParamsError, pow_ge_pow2, search,
+};
 pub use prf::{Prf, PrfError, purpose};
 pub use protocol::{
     AnswerMatrix, DecodingKey, DerivedState, EncryptedMatrix, EncryptedQuery, ProtocolError,
-    SecretKey, answer, decode, encrypt, query,
+    QueryReservation, QueryReservations, QueryScratch, SecretKey, answer, answer_into, decode,
+    decode_into, encrypt, query, query_with_scratch,
 };

@@ -22,7 +22,6 @@ pub struct ToeplitzMap<const MODULUS: u32> {
     diagonals: Vec<FieldElement<MODULUS>>,
     plan: NttPlan<MODULUS>,
     spectrum: Vec<FieldElement<MODULUS>>,
-    transpose_spectrum: Vec<FieldElement<MODULUS>>,
 }
 
 impl<const MODULUS: u32> ToeplitzMap<MODULUS> {
@@ -63,13 +62,7 @@ impl<const MODULUS: u32> ToeplitzMap<MODULUS> {
         for offset in 0..columns - 1 {
             spectrum[transform_length - 1 - offset] = diagonals[rows + offset];
         }
-        let mut transpose_spectrum = vec![zero; transform_length];
-        transpose_spectrum[0] = spectrum[0];
-        for index in 1..transform_length {
-            transpose_spectrum[index] = spectrum[transform_length - index];
-        }
         plan.forward(&mut spectrum)?;
-        plan.forward(&mut transpose_spectrum)?;
 
         Ok(Self {
             rows,
@@ -77,7 +70,6 @@ impl<const MODULUS: u32> ToeplitzMap<MODULUS> {
             diagonals,
             plan,
             spectrum,
-            transpose_spectrum,
         })
     }
 
@@ -173,6 +165,7 @@ impl<const MODULUS: u32> ToeplitzMap<MODULUS> {
         input: &[FieldElement<MODULUS>],
         output: &mut [FieldElement<MODULUS>],
         transform: &mut [FieldElement<MODULUS>],
+        transpose_spectrum: &[FieldElement<MODULUS>],
     ) -> Result<(), TdmError> {
         check_len("Toeplitz transpose input", self.rows, input.len())?;
         check_len("Toeplitz transpose output", self.columns, output.len())?;
@@ -183,6 +176,11 @@ impl<const MODULUS: u32> ToeplitzMap<MODULUS> {
                 actual: transform.len(),
             });
         }
+        check_len(
+            "Toeplitz transpose spectrum",
+            self.transform_length(),
+            transpose_spectrum.len(),
+        )?;
 
         let transform = &mut transform[..self.transform_length()];
         let zero = PrimeField::<MODULUS>::new().element_u32(0);
@@ -190,10 +188,28 @@ impl<const MODULUS: u32> ToeplitzMap<MODULUS> {
         transform[..self.rows].copy_from_slice(input);
         self.plan.forward(transform)?;
         self.plan
-            .pointwise_mul_assign(transform, &self.transpose_spectrum)?;
+            .pointwise_mul_assign(transform, transpose_spectrum)?;
         self.plan.inverse(transform)?;
         output.copy_from_slice(&transform[..self.columns]);
         Ok(())
+    }
+
+    fn transpose_spectrum(&self) -> Vec<FieldElement<MODULUS>> {
+        let length = self.transform_length();
+        let zero = PrimeField::<MODULUS>::new().element_u32(0);
+        let mut transpose = vec![zero; length];
+        let bits = length.trailing_zeros();
+        for (target_index, target) in transpose.iter_mut().enumerate() {
+            let frequency = target_index.reverse_bits() >> (usize::BITS - bits);
+            let source_frequency = if frequency == 0 {
+                0
+            } else {
+                length - frequency
+            };
+            let source_index = source_frequency.reverse_bits() >> (usize::BITS - bits);
+            *target = self.spectrum[source_index];
+        }
+        transpose
     }
 }
 
@@ -244,6 +260,12 @@ pub struct ToeplitzFastProduct<const MODULUS: u32> {
     middle: ToeplitzMap<MODULUS>,
     pi_left: Permutation,
     s_left: ToeplitzMap<MODULUS>,
+}
+
+struct ToeplitzTransposeSpectra<const MODULUS: u32> {
+    right: Vec<FieldElement<MODULUS>>,
+    middle: Vec<FieldElement<MODULUS>>,
+    left: Vec<FieldElement<MODULUS>>,
 }
 
 impl<const MODULUS: u32> ToeplitzFastProduct<MODULUS> {
@@ -415,6 +437,7 @@ impl<const MODULUS: u32> ToeplitzFastProduct<MODULUS> {
         input: &[FieldElement<MODULUS>],
         output: &mut [FieldElement<MODULUS>],
         scratch: &mut ToeplitzScratch<MODULUS>,
+        spectra: &ToeplitzTransposeSpectra<MODULUS>,
     ) -> Result<(), TdmError> {
         let expanded = self.middle.rows();
         check_len("fast-product transpose input", self.k, input.len())?;
@@ -434,6 +457,7 @@ impl<const MODULUS: u32> ToeplitzFastProduct<MODULUS> {
             input,
             &mut scratch.stage_a,
             &mut scratch.transform,
+            &spectra.left,
         )?;
         self.pi_left
             .apply_transpose(&scratch.stage_a, &mut scratch.stage_b)?;
@@ -441,6 +465,7 @@ impl<const MODULUS: u32> ToeplitzFastProduct<MODULUS> {
             &scratch.stage_b,
             &mut scratch.stage_a,
             &mut scratch.transform,
+            &spectra.middle,
         )?;
         self.pi_right
             .apply_transpose(&scratch.stage_a, &mut scratch.stage_b)?;
@@ -448,6 +473,7 @@ impl<const MODULUS: u32> ToeplitzFastProduct<MODULUS> {
             &scratch.stage_b,
             output,
             &mut scratch.transform,
+            &spectra.right,
         )
     }
 
@@ -490,11 +516,16 @@ impl<const MODULUS: u32> ToeplitzFastProduct<MODULUS> {
         let mut input = vec![zero; self.k].into_boxed_slice();
         let mut output = vec![zero; self.k].into_boxed_slice();
         let mut scratch = self.scratch();
+        let spectra = ToeplitzTransposeSpectra {
+            right: self.s_right.transpose_spectrum(),
+            middle: self.middle.transpose_spectrum(),
+            left: self.s_left.transpose_spectrum(),
+        };
 
         for row in 0..rows {
             input.fill(zero);
             input[row] = one;
-            self.apply_transpose(&input, &mut output, &mut scratch)?;
+            self.apply_transpose(&input, &mut output, &mut scratch, &spectra)?;
             values.extend_from_slice(&output);
         }
         DenseMatrix::new(rows, self.k, values)

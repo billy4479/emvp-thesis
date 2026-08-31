@@ -20,6 +20,10 @@ pub mod purpose {
     pub const TDM: u32 = 3;
     /// Seeds the nonzero entries of client queries.
     pub const QUERY_NONZERO: u32 = 4;
+    /// Seeds the random codeword of each client query.
+    pub const QUERY_CODEWORD: u32 = 5;
+    /// Derives the public identifier that binds artifacts to a key and matrix.
+    pub const INSTANCE_ID: u32 = 6;
 }
 
 /// Each indexed slot contains the 8-word (32-byte) seed of a downstream
@@ -55,6 +59,21 @@ impl Prf {
         Self(key)
     }
 
+    /// Derives a PRF for one public 128-bit protocol instance identifier.
+    ///
+    /// The high 64 bits select a `ChaCha20` stream and the low 64 bits select
+    /// a non-overlapping 32-byte seed slot in that stream. Distinct instance
+    /// identifiers therefore domain-separate all downstream protocol state.
+    #[must_use]
+    pub fn derive_context(&self, context: u128) -> Self {
+        let mut root = ChaCha20Rng::from_seed(self.0);
+        root.set_stream((context >> u64::BITS) as u64);
+        root.set_word_pos(u128::from(context as u64) * SLOT_WORDS);
+        let mut seed = [0_u8; 32];
+        root.fill_bytes(&mut seed);
+        Self(seed)
+    }
+
     /// Returns a downstream `ChaCha20` generator seeded by the slot selected
     /// by `purpose` and `index`.
     ///
@@ -70,15 +89,21 @@ impl Prf {
     /// `MAX_INDEX`, since such a slot would overlap the next purpose's
     /// window.
     pub fn stream(&self, purpose: u32, index: u64) -> Result<ChaCha20Rng, PrfError> {
-        if index > MAX_INDEX {
-            return Err(PrfError::IndexOutOfRange { index });
-        }
+        Self::check_index(index)?;
         let position = (u128::from(purpose) << u32::BITS) | (u128::from(index) * SLOT_WORDS);
         let mut root = ChaCha20Rng::from_seed(self.0);
         root.set_word_pos(position);
         let mut seed = [0_u8; 32];
         root.fill_bytes(&mut seed);
         Ok(ChaCha20Rng::from_seed(seed))
+    }
+
+    pub(crate) const fn check_index(index: u64) -> Result<(), PrfError> {
+        if index > MAX_INDEX {
+            Err(PrfError::IndexOutOfRange { index })
+        } else {
+            Ok(())
+        }
     }
 }
 
@@ -90,6 +115,7 @@ impl fmt::Debug for Prf {
 
 /// A rejected PRF derivation.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
 pub enum PrfError {
     /// A stream index would overlap the next purpose's window.
     IndexOutOfRange {

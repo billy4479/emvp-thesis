@@ -1,6 +1,6 @@
 #![expect(clippy::unwrap_used, reason = "test fixtures must succeed")]
 
-use emvp::{EmvpParams, ParamsError, pow_ge_pow2};
+use emvp::{EmvpParams, PROTOCOL_MAX_LAMBDA, ParamsError, pow_ge_pow2};
 
 const LAMBDA: u32 = 128;
 
@@ -164,17 +164,17 @@ fn rejects_insecure_or_malformed_parameter_sets() {
             lambda: 2
         })
     );
-    // Security levels beyond the exact comparator range are rejected.
+    // Security levels beyond the root-key strength are rejected.
     assert_eq!(
         EmvpParams {
             k: 4096,
             ell: 4096,
             b: 2,
-            lambda: emvp::POW_MAX_LAMBDA + 1
+            lambda: PROTOCOL_MAX_LAMBDA + 1
         }
         .validate(),
         Err(ParamsError::LambdaOutOfScope {
-            lambda: emvp::POW_MAX_LAMBDA + 1
+            lambda: PROTOCOL_MAX_LAMBDA + 1
         })
     );
 }
@@ -234,6 +234,36 @@ fn search_respects_record_lengths() {
         assert_eq!(found.ell, ell);
         found.validate().unwrap();
     }
+}
+
+#[test]
+fn protocol_security_cannot_exceed_the_prf_key() {
+    let params = EmvpParams {
+        k: 257,
+        ell: 257,
+        b: 2,
+        lambda: PROTOCOL_MAX_LAMBDA + 1,
+    };
+    assert_eq!(
+        params.validate(),
+        Err(ParamsError::LambdaOutOfScope {
+            lambda: PROTOCOL_MAX_LAMBDA + 1,
+        })
+    );
+    assert_eq!(
+        emvp::search(257, PROTOCOL_MAX_LAMBDA + 1),
+        Err(ParamsError::LambdaOutOfScope {
+            lambda: PROTOCOL_MAX_LAMBDA + 1,
+        })
+    );
+}
+
+#[test]
+fn search_budget_is_relative_to_the_starting_rank() {
+    let found = emvp::search(10_000_000, LAMBDA).unwrap();
+    assert_eq!(found.k, 10_000_000);
+    assert_eq!(found.ell, 10_000_000);
+    found.validate().unwrap();
 }
 
 #[test]

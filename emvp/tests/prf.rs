@@ -4,7 +4,8 @@
 )]
 
 use emvp::prf::{Prf, PrfError, purpose};
-use rand_core::Rng;
+use rand_chacha::ChaCha20Rng;
+use rand_core::{Rng, SeedableRng};
 
 const KEY: [u8; 32] = [
     0x2b, 0x7e, 0x15, 0x16, 0x28, 0xae, 0xd2, 0xa6, 0xab, 0xf7, 0x15, 0x88, 0x09, 0xcf, 0x4f, 0x3c,
@@ -12,7 +13,11 @@ const KEY: [u8; 32] = [
 ];
 
 fn derived_bytes(key: [u8; 32], tag: u32, index: u64, count: usize) -> Vec<u8> {
-    let mut stream = Prf::new(key).stream(tag, index).unwrap();
+    bytes(&Prf::new(key), tag, index, count)
+}
+
+fn bytes(prf: &Prf, tag: u32, index: u64, count: usize) -> Vec<u8> {
+    let mut stream = prf.stream(tag, index).unwrap();
     let mut bytes = vec![0; count];
     stream.fill_bytes(&mut bytes);
     bytes
@@ -32,6 +37,44 @@ fn different_keys_give_different_bytes() {
     assert_ne!(
         derived_bytes(KEY, purpose::TDM, 0, 32),
         derived_bytes(other_key, purpose::TDM, 0, 32)
+    );
+}
+
+#[test]
+fn instance_contexts_domain_separate_every_purpose() {
+    let root = Prf::new([0x42; 32]);
+    let first = root.derive_context(1);
+    let second = root.derive_context(2);
+
+    for purpose in [
+        purpose::CODE_MULTIPLIER,
+        purpose::TDM,
+        purpose::QUERY_CODEWORD,
+    ] {
+        assert_ne!(
+            bytes(&first, purpose, 0, 64),
+            bytes(&second, purpose, 0, 64)
+        );
+    }
+    assert_eq!(
+        bytes(&root.derive_context(1), purpose::TDM, 3, 64),
+        bytes(&first, purpose::TDM, 3, 64)
+    );
+}
+
+#[test]
+fn instance_context_position_matches_chacha_layout() {
+    let context = (0x0123_4567_89ab_cdef_u128 << 64) | 0xfedc_ba98_7654_3210;
+    let mut root = ChaCha20Rng::from_seed(KEY);
+    root.set_stream((context >> 64) as u64);
+    root.set_word_pos(u128::from(context as u64) * 8);
+    let mut child_key = [0_u8; 32];
+    root.fill_bytes(&mut child_key);
+
+    let derived = Prf::new(KEY).derive_context(context);
+    assert_eq!(
+        bytes(&derived, purpose::QUERY_CODEWORD, 7, 96),
+        bytes(&Prf::new(child_key), purpose::QUERY_CODEWORD, 7, 96)
     );
 }
 

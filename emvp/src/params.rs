@@ -15,7 +15,7 @@
 //! - Structural constraints of the cyclic instantiation: records of length
 //!   `ell <= k` are zero-padded, blocks must divide `n`, and `b >= 2` so
 //!   that more than one block exists.
-//! - The protocol needs a noticeable padding slack (`n - k >= lambda^O(1)`,
+//! - The protocol needs a noticeable padding slack (`n - k >= lambda^Omega(1)`,
 //!   Fig. 1). With `n = 2k` we take `k >= ceil(lambda / 4)` as a concrete
 //!   stand-in; the paper's own tables keep `k` of the same order as
 //!   `lambda`.
@@ -33,6 +33,9 @@ use std::fmt;
 
 /// Largest security level [`pow_ge_pow2`] compares exactly.
 pub const POW_MAX_LAMBDA: u32 = 4096;
+
+/// Largest protocol security level supported by the 256-bit PRF key.
+pub const PROTOCOL_MAX_LAMBDA: u32 = 256;
 
 /// Ranks scanned by [`search`] before it gives up.
 const SEARCH_RANK_BUDGET: usize = 10_000_000;
@@ -129,10 +132,11 @@ const fn exact_bit_length(limbs: &[u64]) -> u64 {
 
 /// A rejected or unfeasible parameter set.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
 pub enum ParamsError {
     /// The record length was zero.
     ZeroEll,
-    /// The security level exceeded what [`pow_ge_pow2`] supports exactly.
+    /// The security level exceeded the 256-bit protocol key strength.
     LambdaOutOfScope {
         /// The rejected security parameter.
         lambda: u32,
@@ -201,7 +205,7 @@ impl fmt::Display for ParamsError {
             Self::ZeroEll => formatter.write_str("record length must be nonzero"),
             Self::LambdaOutOfScope { lambda } => write!(
                 formatter,
-                "security level lambda = {lambda} exceeds the exact range of this module"
+                "security level lambda = {lambda} exceeds the 256-bit protocol key strength"
             ),
             Self::EllExceedsRank { ell, k } => {
                 write!(formatter, "record length {ell} exceeds the rank {k}")
@@ -304,7 +308,7 @@ impl EmvpParams {
     /// Returns the first violated constraint as a [`ParamsError`].
     pub fn validate(&self) -> Result<(), ParamsError> {
         let Self { k, b, lambda, .. } = *self;
-        if lambda > POW_MAX_LAMBDA {
+        if lambda > PROTOCOL_MAX_LAMBDA {
             return Err(ParamsError::LambdaOutOfScope { lambda });
         }
         self.validate_dimensions()?;
@@ -395,20 +399,19 @@ impl EmvpParams {
 ///
 /// Returns [`ParamsError::ZeroEll`] for a zero record length,
 /// [`ParamsError::LambdaOutOfScope`] for security levels beyond
-/// [`POW_MAX_LAMBDA`], and [`ParamsError::SearchExhausted`] after scanning
+/// [`PROTOCOL_MAX_LAMBDA`], and [`ParamsError::SearchExhausted`] after scanning
 /// the rank budget without success.
 pub fn search(ell: usize, lambda: u32) -> Result<EmvpParams, ParamsError> {
     if ell == 0 {
         return Err(ParamsError::ZeroEll);
     }
-    if lambda > POW_MAX_LAMBDA {
+    if lambda > PROTOCOL_MAX_LAMBDA {
         return Err(ParamsError::LambdaOutOfScope { lambda });
     }
     let floor = usize::max(ell, EmvpParams::rank_floor(lambda));
-    if floor >= SEARCH_RANK_BUDGET {
-        return Err(ParamsError::SearchExhausted { floor_rank: floor });
-    }
-    let last = floor + SEARCH_RANK_BUDGET;
+    let last = floor
+        .checked_add(SEARCH_RANK_BUDGET)
+        .ok_or(ParamsError::DimensionOverflow)?;
     for k in floor..last {
         let Some(n) = k.checked_mul(2) else {
             return Err(ParamsError::DimensionOverflow);
