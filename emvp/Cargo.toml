@@ -19,6 +19,9 @@ bench-common = { path = "../prime-field-layer/benches/common" }
 criterion = { workspace = true }
 proptest = { workspace = true }
 
+[features]
+bench-huge = ["bench-common/huge"]
+
 [lints]
 workspace = true
 

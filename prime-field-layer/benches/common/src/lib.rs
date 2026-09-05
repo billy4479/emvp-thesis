@@ -19,6 +19,21 @@ pub fn skip_in_quick_mode(target: &str) -> bool {
     }
 }
 
+/// LLM-scale benchmark dimensions whose fixtures hold gigabytes of field
+/// elements. They are opt-in so everyday suite runs stay small.
+pub fn is_huge() -> bool {
+    cfg!(feature = "huge")
+}
+
+pub fn skip_unless_huge(target: &str) -> bool {
+    if is_huge() {
+        false
+    } else {
+        println!("skipping `{target}` benchmarks (build with --features bench-huge to run)");
+        true
+    }
+}
+
 /// One-time threshold studies (schoolbook/dense crossovers, thread-count
 /// boundaries) that do not need re-running on every suite invocation.
 const CALIBRATION_ENV: &str = "EMVP_BENCH_CALIBRATION";
