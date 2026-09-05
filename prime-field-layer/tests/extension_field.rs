@@ -162,7 +162,7 @@ fn runtime_degree_mismatches_are_rejected_without_mutation() {
 
 #[test]
 fn ntt_reduction_multiplication_and_squaring_match_slow_oracle() {
-    const MODULUS: u32 = 998_244_353;
+    const MODULUS: u32 = 1_073_479_681;
     let k: usize = 128;
     let modulus = irreducible_binomial(k, MODULUS);
     let extension = ExtensionField::<MODULUS>::new_unchecked_irreducible(k, &modulus).unwrap();
@@ -203,16 +203,16 @@ fn ntt_reduction_multiplication_and_squaring_match_slow_oracle() {
 
 #[test]
 fn threshold_behavior_is_degree_only() {
-    let schoolbook_modulus = irreducible_binomial(23, 998_244_353);
-    let ntt_modulus = irreducible_binomial(24, 998_244_353);
+    let schoolbook_modulus = irreducible_binomial(23, 1_073_479_681);
+    let ntt_modulus = irreducible_binomial(24, 1_073_479_681);
     assert_eq!(
-        PolynomialReductionPlan::<998_244_353>::new(23, &schoolbook_modulus)
+        PolynomialReductionPlan::<1_073_479_681>::new(23, &schoolbook_modulus)
             .unwrap()
             .algorithm(),
         PolynomialAlgorithm::Schoolbook
     );
     assert_eq!(
-        PolynomialReductionPlan::<998_244_353>::new(24, &ntt_modulus)
+        PolynomialReductionPlan::<1_073_479_681>::new(24, &ntt_modulus)
             .unwrap()
             .algorithm(),
         PolynomialAlgorithm::Ntt {
@@ -223,7 +223,7 @@ fn threshold_behavior_is_degree_only() {
 
 #[test]
 fn caller_scratch_reuses_all_allocations() {
-    const MODULUS: u32 = 998_244_353;
+    const MODULUS: u32 = 1_073_479_681;
     let k: usize = 128;
     let modulus = irreducible_binomial(k, MODULUS);
     let extension = ExtensionField::<MODULUS>::new_unchecked_irreducible(k, &modulus).unwrap();

@@ -48,7 +48,7 @@ fn arithmetic_uses_the_static_field() {
 
 #[test]
 fn assignment_operators_use_montgomery_arithmetic() {
-    let field = PrimeField::<998_244_353>::new();
+    let field = PrimeField::<1_073_479_681>::new();
     let mut value = field.element(123_456_789);
 
     value += field.element(17);
@@ -61,5 +61,5 @@ fn assignment_operators_use_montgomery_arithmetic() {
 
 #[test]
 fn element_has_no_runtime_field_pointer() {
-    assert_eq!(size_of::<FieldElement<998_244_353>>(), size_of::<u32>());
+    assert_eq!(size_of::<FieldElement<1_073_479_681>>(), size_of::<u32>());
 }

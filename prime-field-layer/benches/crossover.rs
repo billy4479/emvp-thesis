@@ -59,12 +59,12 @@ fn convolutions(c: &mut Criterion) {
     if common::skip_calibration("schoolbook convolution baselines") {
         return;
     }
-    let mut group = c.benchmark_group("convolution_p998244353");
+    let mut group = c.benchmark_group("convolution_p1073479681");
     // Only the lengths where an O(N^2) baseline is still measurable; the
     // production-sized 4096 case lives in the auto/backend convolution groups.
     for transform_length in [16, 64, 128, 256] {
-        let linear_lhs = common::values(transform_length / 2, 998_244_353, 97);
-        let linear_rhs = common::values(transform_length / 2, 998_244_353, 12_345);
+        let linear_lhs = common::values(transform_length / 2, 1_073_479_681, 97);
+        let linear_rhs = common::values(transform_length / 2, 1_073_479_681, 12_345);
         let output_length = linear_lhs.len() + linear_rhs.len() - 1;
         group.throughput(Throughput::Elements(output_length as u64));
         group.bench_function(
@@ -74,7 +74,7 @@ fn convolutions(c: &mut Criterion) {
             ),
             |b| {
                 b.iter(|| {
-                    field_element_schoolbook_linear::<998_244_353>(
+                    field_element_schoolbook_linear::<1_073_479_681>(
                         black_box(&linear_lhs),
                         black_box(&linear_rhs),
                     )
@@ -82,14 +82,14 @@ fn convolutions(c: &mut Criterion) {
             },
         );
 
-        let lhs = common::values(transform_length, 998_244_353, 97);
-        let rhs = common::values(transform_length, 998_244_353, 12_345);
+        let lhs = common::values(transform_length, 1_073_479_681, 97);
+        let rhs = common::values(transform_length, 1_073_479_681, 12_345);
         group.throughput(Throughput::Elements(transform_length as u64));
         group.bench_function(
             BenchmarkId::new("cyclic_u64_mod_schoolbook_baseline", transform_length),
             |b| {
                 b.iter(|| {
-                    u64_mod_schoolbook_cyclic::<998_244_353>(black_box(&lhs), black_box(&rhs))
+                    u64_mod_schoolbook_cyclic::<1_073_479_681>(black_box(&lhs), black_box(&rhs))
                 });
             },
         );
@@ -97,7 +97,7 @@ fn convolutions(c: &mut Criterion) {
             BenchmarkId::new("negacyclic_u64_mod_schoolbook_baseline", transform_length),
             |b| {
                 b.iter(|| {
-                    u64_mod_schoolbook_negacyclic::<998_244_353>(black_box(&lhs), black_box(&rhs))
+                    u64_mod_schoolbook_negacyclic::<1_073_479_681>(black_box(&lhs), black_box(&rhs))
                 });
             },
         );
@@ -147,7 +147,7 @@ fn linear_dispatch_for_modulus<const MODULUS: u32>(c: &mut Criterion) {
 }
 
 fn linear_dispatch(c: &mut Criterion) {
-    linear_dispatch_for_modulus::<998_244_353>(c);
+    linear_dispatch_for_modulus::<1_073_479_681>(c);
 }
 
 fn crossover(c: &mut Criterion) {

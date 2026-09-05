@@ -5,7 +5,7 @@ use std::hint::black_box;
 
 use prime_field_layer::{FieldElement, NttPlan, PrimeField};
 
-const P1: u32 = 998_244_353;
+const P1: u32 = 1_073_479_681;
 const P2: u32 = 2_013_265_921;
 const P3: u32 = 2_281_701_377;
 

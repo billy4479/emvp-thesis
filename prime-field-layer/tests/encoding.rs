@@ -52,8 +52,8 @@ fn element_values<const MODULUS: u32>(values: &[FieldElement<MODULUS>]) -> Vec<u
 
 #[test]
 fn canonical_encoding_round_trips_boundaries() {
-    let field = PrimeField::<998_244_353>::new();
-    for expected in [0, 1, 255, 256, 65_535, 998_244_352] {
+    let field = PrimeField::<1_073_479_681>::new();
+    for expected in [0, 1, 255, 256, 65_535, 1_073_479_680] {
         let element = field.element_u32(expected);
         let encoding = element.to_canonical_le_bytes();
         assert_eq!(encoding.len(), FIELD_ELEMENT_ENCODED_SIZE);

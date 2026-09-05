@@ -23,7 +23,7 @@ fn elements<const MODULUS: u32>(
 
 #[test]
 fn pretransformed_linear_operand_matches_convenience_api_and_reuses_scratch() {
-    let plan = NttPlan::<998_244_353>::new(16).unwrap();
+    let plan = NttPlan::<1_073_479_681>::new(16).unwrap();
     let fixed = [7, 11, 13, 17, 19];
     let prepared = plan.pretransform_linear_operand(&fixed).unwrap();
     let mut workspace = prepared.workspace();
@@ -43,7 +43,7 @@ fn pretransformed_linear_operand_matches_convenience_api_and_reuses_scratch() {
     prepared
         .convolve(&second, &mut second_output, &mut workspace)
         .unwrap();
-    assert_eq!(second_output, oracle_linear::<998_244_353>(&fixed, &second));
+    assert_eq!(second_output, oracle_linear::<1_073_479_681>(&fixed, &second));
 }
 
 #[test]
@@ -125,7 +125,7 @@ fn pretransformed_linear_operand_preserves_empty_semantics_and_reports_errors() 
 
 #[test]
 fn pretransformed_kernel_computes_linear_products_and_zeroes_stale_tail() {
-    const MODULUS: u32 = 998_244_353;
+    const MODULUS: u32 = 1_073_479_681;
     let plan = NttPlan::<MODULUS>::new(16).unwrap();
     let field = PrimeField::<MODULUS>::new();
     let fixed = values::<MODULUS>(7, 97);
@@ -172,7 +172,7 @@ fn pretransformed_kernel_matches_cyclic_semantics_for_full_length_inputs() {
 
 #[test]
 fn pretransformed_kernel_supports_wrapped_toeplitz_packing() {
-    const MODULUS: u32 = 998_244_353;
+    const MODULUS: u32 = 1_073_479_681;
     let (rows, columns) = (5_usize, 4_usize);
     let diagonals = values::<MODULUS>(rows + columns - 1, 97);
     let input = values::<MODULUS>(columns, 12_345);

@@ -241,7 +241,7 @@ fn check_montgomery_boundaries<const MODULUS: u32>() {
 fn montgomery_simd_handles_boundary_values_and_tails() {
     check_montgomery_boundaries::<17>();
     check_montgomery_boundaries::<65_537>();
-    check_montgomery_boundaries::<998_244_353>();
+    check_montgomery_boundaries::<1_073_479_681>();
     check_montgomery_boundaries::<2_013_265_921>();
     check_montgomery_boundaries::<4_294_967_291>();
 }
@@ -266,7 +266,7 @@ fn batch_inverse_matches_scalar_inversion() {
     check_batch_inverse::<2>();
     check_batch_inverse::<17>();
     check_batch_inverse::<65_537>();
-    check_batch_inverse::<998_244_353>();
+    check_batch_inverse::<1_073_479_681>();
 }
 
 fn check_batch_inverse_rejects_noncanonical_zero<const MODULUS: u32>() {
@@ -287,7 +287,7 @@ fn batch_inverse_rejects_multiples_of_the_modulus_before_mutation() {
     check_batch_inverse_rejects_noncanonical_zero::<2>();
     check_batch_inverse_rejects_noncanonical_zero::<17>();
     check_batch_inverse_rejects_noncanonical_zero::<65_537>();
-    check_batch_inverse_rejects_noncanonical_zero::<998_244_353>();
+    check_batch_inverse_rejects_noncanonical_zero::<1_073_479_681>();
     check_batch_inverse_rejects_noncanonical_zero::<4_294_967_291>();
 }
 
@@ -298,8 +298,8 @@ fn batch_inverse_reduces_noncanonical_nonzero_values() {
     binary.batch_inv_assign(&mut binary_values).unwrap();
     assert_eq!(binary_values, [1, 1]);
 
-    let field = PrimeField::<998_244_353>::new();
-    let mut values = [998_244_354, 1_996_488_705, u32::MAX];
+    let field = PrimeField::<1_073_479_681>::new();
+    let mut values = [1_073_479_682, 2_146_959_361, u32::MAX];
     let expected = values.map(|value| field.inv(value).unwrap());
     field.batch_inv_assign(&mut values).unwrap();
     assert_eq!(values, expected);
@@ -322,7 +322,7 @@ fn element_batch_inverse_matches_scalar_inversion() {
     check_element_batch_inverse::<2>();
     check_element_batch_inverse::<17>();
     check_element_batch_inverse::<65_537>();
-    check_element_batch_inverse::<998_244_353>();
+    check_element_batch_inverse::<1_073_479_681>();
 }
 
 #[test]

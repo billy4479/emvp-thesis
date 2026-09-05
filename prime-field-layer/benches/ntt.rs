@@ -16,8 +16,8 @@ use prime_field_layer::{NegacyclicPlan, NttPlan, linear_convolution};
 fn plan_construction(c: &mut Criterion) {
     let mut group = c.benchmark_group("ntt_plan_setup_inclusive");
     for length in [256, 4_096] {
-        group.bench_function(BenchmarkId::new("p998244353", length), |b| {
-            b.iter(|| NttPlan::<998_244_353>::new(black_box(length)).unwrap());
+        group.bench_function(BenchmarkId::new("p1073479681", length), |b| {
+            b.iter(|| NttPlan::<1_073_479_681>::new(black_box(length)).unwrap());
         });
         group.bench_function(BenchmarkId::new("p2013265921", length), |b| {
             b.iter(|| NttPlan::<2_013_265_921>::new(black_box(length)).unwrap());
@@ -96,7 +96,7 @@ fn transforms_for_modulus<const MODULUS: u32>(c: &mut Criterion, length: usize) 
 
 fn transforms(c: &mut Criterion) {
     for length in [1_024, 4_096, 16_384, 65_536] {
-        transforms_for_modulus::<998_244_353>(c, length);
+        transforms_for_modulus::<1_073_479_681>(c, length);
     }
     transforms_for_modulus::<2_013_265_921>(c, 4_096);
     transforms_for_modulus::<2_281_701_377>(c, 4_096);
@@ -109,11 +109,11 @@ fn bench_linear(
     rhs: &[u32],
 ) {
     let output_length = lhs.len() + rhs.len() - 1;
-    let auto = NttPlan::<998_244_353>::new(transform_length).unwrap();
+    let auto = NttPlan::<1_073_479_681>::new(transform_length).unwrap();
     group.throughput(Throughput::Elements(output_length as u64));
     group.bench_function(
         BenchmarkId::new("linear_free_auto_dispatch", transform_length),
-        |b| b.iter(|| linear_convolution::<998_244_353>(black_box(lhs), black_box(rhs)).unwrap()),
+        |b| b.iter(|| linear_convolution::<1_073_479_681>(black_box(lhs), black_box(rhs)).unwrap()),
     );
     group.bench_function(
         BenchmarkId::new(
@@ -130,7 +130,7 @@ fn bench_linear(
 }
 
 fn convolutions(c: &mut Criterion) {
-    let mut group = c.benchmark_group("convolution_p998244353");
+    let mut group = c.benchmark_group("convolution_p1073479681");
     // Small cases expose the schoolbook/NTT crossover; 4096 remains a
     // representative production-sized transform without an O(N^2) baseline.
     let lengths: &[usize] = if common::is_quick() {
@@ -139,14 +139,14 @@ fn convolutions(c: &mut Criterion) {
         &[16, 64, 128, 256, 4_096]
     };
     for &transform_length in lengths {
-        let linear_lhs = common::values(transform_length / 2, 998_244_353, 97);
-        let linear_rhs = common::values(transform_length / 2, 998_244_353, 12_345);
+        let linear_lhs = common::values(transform_length / 2, 1_073_479_681, 97);
+        let linear_rhs = common::values(transform_length / 2, 1_073_479_681, 12_345);
         bench_linear(&mut group, transform_length, &linear_lhs, &linear_rhs);
 
-        let lhs = common::values(transform_length, 998_244_353, 97);
-        let rhs = common::values(transform_length, 998_244_353, 12_345);
-        let auto = NttPlan::<998_244_353>::new(transform_length).unwrap();
-        let negacyclic = NegacyclicPlan::<998_244_353>::new(transform_length).unwrap();
+        let lhs = common::values(transform_length, 1_073_479_681, 97);
+        let rhs = common::values(transform_length, 1_073_479_681, 12_345);
+        let auto = NttPlan::<1_073_479_681>::new(transform_length).unwrap();
+        let negacyclic = NegacyclicPlan::<1_073_479_681>::new(transform_length).unwrap();
         group.throughput(Throughput::Elements(transform_length as u64));
         group.bench_function(
             BenchmarkId::new(
@@ -232,7 +232,7 @@ fn fixed_operand_convolutions_for_modulus<const MODULUS: u32>(c: &mut Criterion)
 }
 
 fn fixed_operand_convolutions(c: &mut Criterion) {
-    fixed_operand_convolutions_for_modulus::<998_244_353>(c);
+    fixed_operand_convolutions_for_modulus::<1_073_479_681>(c);
     fixed_operand_convolutions_for_modulus::<2_013_265_921>(c);
 }
 

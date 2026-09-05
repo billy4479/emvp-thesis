@@ -2,7 +2,7 @@ use prime_field_layer::{NttBackend, NttPerformanceWarning, NttPlan};
 
 #[test]
 fn diagnostics_report_the_actual_modulus_tier() {
-    let lazy = NttPlan::<998_244_353>::new_scalar(256).unwrap();
+    let lazy = NttPlan::<1_073_479_681>::new_scalar(256).unwrap();
     assert_eq!(lazy.backend(), NttBackend::ScalarShoupLazy);
     assert_eq!(
         lazy.performance_warning(),
@@ -25,7 +25,7 @@ fn diagnostics_report_the_actual_modulus_tier() {
     let above_boundary = NttPlan::<1_107_296_257>::new_scalar(16).unwrap();
     assert_eq!(above_boundary.backend(), NttBackend::ScalarShoup);
 
-    let short_auto = NttPlan::<998_244_353>::new(16).unwrap();
+    let short_auto = NttPlan::<1_073_479_681>::new(16).unwrap();
     assert_eq!(short_auto.backend(), NttBackend::ScalarShoupLazy);
     assert_eq!(short_auto.performance_warning(), None);
 

@@ -13,9 +13,9 @@ use trapdoor_matrices::{
     ToeplitzFastProduct,
 };
 
-// NTT-friendly prime for the Toeplitz and RAA constructions: 998_244_353 - 1
-// is divisible by 2^23, so every transform length below is supported.
-const MODULUS: u32 = 998_244_353;
+// NTT-friendly prime for the Toeplitz and RAA constructions: 1_073_479_681 - 1
+// is divisible by 2^18, so every transform length below is supported.
+const MODULUS: u32 = 1_073_479_681;
 
 // Small prime for the Ring-LPN adapter, with the irreducible cubic
 // x^3 + 3x + 1 copied from the trapdoor-matrices integration tests.

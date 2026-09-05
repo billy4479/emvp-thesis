@@ -106,7 +106,7 @@ fn reduction_handles_full_u64_range() {
     check_reduction::<2>();
     check_reduction::<17>();
     check_reduction::<65_537>();
-    check_reduction::<998_244_353>();
+    check_reduction::<1_073_479_681>();
     check_reduction::<4_294_967_291>();
 }
 
@@ -140,7 +140,7 @@ fn exponentiation_matches_oracle() {
     check_exponentiation::<2>();
     check_exponentiation::<17>();
     check_exponentiation::<65_537>();
-    check_exponentiation::<998_244_353>();
+    check_exponentiation::<1_073_479_681>();
     check_exponentiation::<4_294_967_291>();
 }
 
@@ -172,7 +172,7 @@ fn inversion_is_multiplicative_and_rejects_zero() {
     check_all_inverses::<17>();
     check_all_inverses::<257>();
     check_boundary_inverses::<65_537>();
-    check_boundary_inverses::<998_244_353>();
+    check_boundary_inverses::<1_073_479_681>();
     check_boundary_inverses::<4_294_967_291>();
 }
 
@@ -196,7 +196,7 @@ fn inversion_reduces_full_width_inputs_before_the_zero_check() {
     check_noncanonical_inverses::<2>();
     check_noncanonical_inverses::<17>();
     check_noncanonical_inverses::<65_537>();
-    check_noncanonical_inverses::<998_244_353>();
+    check_noncanonical_inverses::<1_073_479_681>();
     check_noncanonical_inverses::<4_294_967_291>();
 }
 
@@ -236,7 +236,7 @@ proptest! {
 
     #[test]
     fn random_operations_match_widened_oracle(
-        modulus in prop::sample::select(vec![3, 17, 257, 65_537, 998_244_353, 4_294_967_291u32]),
+        modulus in prop::sample::select(vec![3, 17, 257, 65_537, 1_073_479_681, 4_294_967_291u32]),
         lhs in any::<u32>(),
         rhs in any::<u32>(),
         exponent in any::<u32>(),
@@ -246,7 +246,7 @@ proptest! {
             17 => check_random::<17>(lhs, rhs, exponent),
             257 => check_random::<257>(lhs, rhs, exponent),
             65_537 => check_random::<65_537>(lhs, rhs, exponent),
-            998_244_353 => check_random::<998_244_353>(lhs, rhs, exponent),
+            1_073_479_681 => check_random::<1_073_479_681>(lhs, rhs, exponent),
             4_294_967_291 => check_random::<4_294_967_291>(lhs, rhs, exponent),
             _ => unreachable!(),
         }

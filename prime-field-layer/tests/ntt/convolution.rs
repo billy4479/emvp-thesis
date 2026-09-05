@@ -6,7 +6,7 @@ use crate::support::{check_convolutions, oracle_linear};
 fn convolution_variants_match_independent_oracles() {
     check_convolutions::<17>();
     check_convolutions::<65_537>();
-    check_convolutions::<998_244_353>();
+    check_convolutions::<1_073_479_681>();
     check_convolutions::<2_013_265_921>();
     check_convolutions::<2_281_701_377>();
 }
@@ -82,8 +82,8 @@ fn length_one_convolutions_and_unreduced_inputs_are_supported() {
         oracle_linear::<2_281_701_377>(&lhs, &rhs)
     );
     assert_eq!(
-        linear_convolution::<998_244_353>(&lhs, &rhs).unwrap(),
-        oracle_linear::<998_244_353>(&lhs, &rhs)
+        linear_convolution::<1_073_479_681>(&lhs, &rhs).unwrap(),
+        oracle_linear::<1_073_479_681>(&lhs, &rhs)
     );
     assert_eq!(
         linear_convolution::<2_013_265_921>(&lhs, &rhs).unwrap(),

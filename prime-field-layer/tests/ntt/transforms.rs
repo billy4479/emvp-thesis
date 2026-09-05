@@ -4,7 +4,7 @@ use crate::support::{bit_reverse, check_round_trip, oracle_dft};
 
 #[test]
 fn cloned_dynamic_plan_keeps_shared_tables_alive_for_transforms() {
-    let plan = NttPlan::<998_244_353>::new(4_096).unwrap();
+    let plan = NttPlan::<1_073_479_681>::new(4_096).unwrap();
     let clone = plan.clone();
     let input: Vec<_> = (0..plan.len()).map(|index| index as u32).collect();
     let mut values = plan.elements(&input);
@@ -25,12 +25,12 @@ fn round_trips_all_modulus_tiers_and_lengths() {
     for length in [1, 2, 4, 8, 16] {
         check_round_trip::<17>(length);
         check_round_trip::<65_537>(length);
-        check_round_trip::<998_244_353>(length);
+        check_round_trip::<1_073_479_681>(length);
         check_round_trip::<2_013_265_921>(length);
         check_round_trip::<2_281_701_377>(length);
     }
     check_round_trip::<65_537>(256);
-    check_round_trip::<998_244_353>(1_024);
+    check_round_trip::<1_073_479_681>(1_024);
     check_round_trip::<2_013_265_921>(4_096);
     check_round_trip::<2_281_701_377>(256);
 }

@@ -139,7 +139,7 @@ fn bulk(c: &mut Criterion) {
 
 fn batch_inversion(c: &mut Criterion) {
     let mut group = c.benchmark_group("batch_inversion");
-    let field = PrimeField::<998_244_353>::new();
+    let field = PrimeField::<1_073_479_681>::new();
     let lengths: &[usize] = if common::is_quick() {
         &[4_096]
     } else {

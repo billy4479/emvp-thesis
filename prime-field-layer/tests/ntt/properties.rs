@@ -5,13 +5,13 @@ use crate::support::{oracle_cyclic, oracle_linear, oracle_negacyclic};
 
 proptest! {
     #[test]
-    fn property_linear_matches_naive_998244353(
-        lhs in prop::collection::vec(0u32..998_244_353, 0..17),
-        rhs in prop::collection::vec(0u32..998_244_353, 0..17),
+    fn property_linear_matches_naive_1073479681(
+        lhs in prop::collection::vec(0u32..1_073_479_681, 0..17),
+        rhs in prop::collection::vec(0u32..1_073_479_681, 0..17),
     ) {
         prop_assert_eq!(
-            linear_convolution::<998_244_353>(&lhs, &rhs).unwrap(),
-            oracle_linear::<998_244_353>(&lhs, &rhs)
+            linear_convolution::<1_073_479_681>(&lhs, &rhs).unwrap(),
+            oracle_linear::<1_073_479_681>(&lhs, &rhs)
         );
     }
 

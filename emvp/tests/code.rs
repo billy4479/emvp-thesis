@@ -9,10 +9,10 @@ use proptest::prelude::*;
 use rand_chacha::ChaCha20Rng;
 use rand_core::{Rng, SeedableRng};
 
-// 998_244_353 - 1 = 2^23 * 7 * 17, so the field supports the power-of-two
-// transform length next_pow2(2k - 1) of every `k` exercised below; the
-// largest is k = 17, needing a length-64 plan.
-const MODULUS: u32 = 998_244_353;
+// 1_073_479_681 - 1 = 2^18 * 3^2 * 5 * 7 * 13, so the field supports the
+// power-of-two transform length next_pow2(2k - 1) of every `k` exercised
+// below; the largest is k = 17, needing a length-64 plan.
+const MODULUS: u32 = 1_073_479_681;
 
 fn elements(values: &[u32]) -> Vec<FieldElement<MODULUS>> {
     let field = PrimeField::<MODULUS>::new();

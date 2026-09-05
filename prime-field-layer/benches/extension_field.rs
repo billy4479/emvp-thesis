@@ -10,7 +10,7 @@ use bench_common as common;
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use prime_field_layer::{ExtensionField, PolynomialReductionPlan};
 
-const MODULUS: u32 = 998_244_353;
+const MODULUS: u32 = 1_073_479_681;
 
 fn irreducible_binomial(degree: usize) -> Vec<u32> {
     let mut polynomial = vec![0; degree + 1];
@@ -47,7 +47,7 @@ fn multiplication_for_degree<const K: usize>(
 }
 
 fn extension_multiplication(c: &mut Criterion) {
-    let mut group = c.benchmark_group("extension_multiplication_p998244353");
+    let mut group = c.benchmark_group("extension_multiplication_p1073479681");
     common::tune_group(
         &mut group,
         20,
@@ -86,7 +86,7 @@ fn reduction_for_degree<const K: usize>(
 }
 
 fn fixed_monic_reduction(c: &mut Criterion) {
-    let mut group = c.benchmark_group("fixed_monic_reduction_p998244353");
+    let mut group = c.benchmark_group("fixed_monic_reduction_p1073479681");
     common::tune_group(
         &mut group,
         20,

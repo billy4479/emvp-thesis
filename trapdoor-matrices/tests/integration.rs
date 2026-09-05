@@ -244,12 +244,12 @@ fn awkward_rectangular_toeplitz_matches_dense_oracle_in_supported_fields() {
     let wide_diagonals = [4, 9, 16, 8, 15, 7, 3, 14, 2, 11, 6];
     let wide_input = [5, 1, 13, 7, 4];
     check_rectangular_toeplitz::<17>(7, 5, &wide_diagonals, &wide_input);
-    check_rectangular_toeplitz::<998_244_353>(7, 5, &wide_diagonals, &wide_input);
+    check_rectangular_toeplitz::<1_073_479_681>(7, 5, &wide_diagonals, &wide_input);
 
     let tall_diagonals = [1, 8, 6, 14, 3, 12, 5, 9, 4, 16, 7];
     let tall_input = [
         123_456_789,
-        998_244_352,
+        1_073_479_680,
         42,
         765_432_100,
         19,
@@ -258,7 +258,7 @@ fn awkward_rectangular_toeplitz_matches_dense_oracle_in_supported_fields() {
         700_000_003,
         11,
     ];
-    check_rectangular_toeplitz::<998_244_353>(3, 9, &tall_diagonals, &tall_input);
+    check_rectangular_toeplitz::<1_073_479_681>(3, 9, &tall_diagonals, &tall_input);
 }
 
 #[test]
@@ -302,7 +302,7 @@ fn toeplitz_validation_and_length_errors_leave_output_unchanged() {
     assert_eq!(short_output, short_output_before);
 }
 
-fn explicit_fast_product() -> ToeplitzFastProduct<998_244_353> {
+fn explicit_fast_product() -> ToeplitzFastProduct<1_073_479_681> {
     let k = 3;
     let right = ToeplitzMap::new(6, 3, elements(&[2, 7, 1, 8, 2, 8, 1, 8])).unwrap();
     let pi_right = Permutation::new(vec![2, 5, 0, 4, 1, 3]).unwrap();
@@ -312,15 +312,15 @@ fn explicit_fast_product() -> ToeplitzFastProduct<998_244_353> {
     ToeplitzFastProduct::new(k, right, pi_right, middle, pi_left, left).unwrap()
 }
 
-fn fast_product_oracle(product: &ToeplitzFastProduct<998_244_353>, input: &[u32]) -> Vec<u32> {
+fn fast_product_oracle(product: &ToeplitzFastProduct<1_073_479_681>, input: &[u32]) -> Vec<u32> {
     let right_diagonals = values(product.s_right().diagonals());
     let middle_diagonals = values(product.middle().diagonals());
     let left_diagonals = values(product.s_left().diagonals());
-    let right = toeplitz_oracle(6, 3, &right_diagonals, input, 998_244_353);
+    let right = toeplitz_oracle(6, 3, &right_diagonals, input, 1_073_479_681);
     let right_gather = gather(&right, product.pi_right().indices());
-    let middle = toeplitz_oracle(6, 6, &middle_diagonals, &right_gather, 998_244_353);
+    let middle = toeplitz_oracle(6, 6, &middle_diagonals, &right_gather, 1_073_479_681);
     let left_gather = gather(&middle, product.pi_left().indices());
-    toeplitz_oracle(3, 6, &left_diagonals, &left_gather, 998_244_353)
+    toeplitz_oracle(3, 6, &left_diagonals, &left_gather, 1_073_479_681)
 }
 
 #[test]
@@ -339,7 +339,7 @@ fn full_toeplitz_product_matches_hand_composition_materialization_and_linearity(
 
     let materialized = product.materialize().unwrap();
     let expected_matrix =
-        materialize_oracle(3, 998_244_353, |basis| fast_product_oracle(&product, basis));
+        materialize_oracle(3, 1_073_479_681, |basis| fast_product_oracle(&product, basis));
     assert_eq!(values(materialized.values()), expected_matrix);
     let mut dense_output = elements(&[0; 3]);
     materialized
@@ -349,13 +349,13 @@ fn full_toeplitz_product_matches_hand_composition_materialization_and_linearity(
 
     let x = [10, 20, 30];
     let y = [7, 11, 13];
-    let x_plus_y: [u32; 3] = std::array::from_fn(|index| add_mod(x[index], y[index], 998_244_353));
+    let x_plus_y: [u32; 3] = std::array::from_fn(|index| add_mod(x[index], y[index], 1_073_479_681));
     let rx = fast_product_oracle(&product, &x);
     let ry = fast_product_oracle(&product, &y);
     let expected_sum: Vec<_> = rx
         .iter()
         .zip(&ry)
-        .map(|(&lhs, &rhs)| add_mod(lhs, rhs, 998_244_353))
+        .map(|(&lhs, &rhs)| add_mod(lhs, rhs, 1_073_479_681))
         .collect();
     assert_eq!(fast_product_oracle(&product, &x_plus_y), expected_sum);
 }
@@ -377,7 +377,7 @@ fn partial_toeplitz_materialization_matches_full_row_prefix() {
 fn full_toeplitz_product_length_errors_leave_output_unchanged() {
     let product = explicit_fast_product();
     let mut scratch = product.scratch();
-    let sentinel = elements::<998_244_353>(&[101, 102, 103]);
+    let sentinel = elements::<1_073_479_681>(&[101, 102, 103]);
     let mut output = sentinel.clone();
     assert!(
         product
@@ -386,7 +386,7 @@ fn full_toeplitz_product_length_errors_leave_output_unchanged() {
     );
     assert_eq!(output, sentinel);
 
-    let mut short_output = elements::<998_244_353>(&[201, 202]);
+    let mut short_output = elements::<1_073_479_681>(&[201, 202]);
     let short_output_before = short_output.clone();
     assert!(
         product
@@ -400,8 +400,8 @@ fn full_toeplitz_product_length_errors_leave_output_unchanged() {
 fn sampled_toeplitz_product_is_reproducible_from_seed() {
     let mut first_rng = ChaCha20Rng::from_seed([19; 32]);
     let mut second_rng = ChaCha20Rng::from_seed([19; 32]);
-    let first = ToeplitzFastProduct::<998_244_353>::sample(5, &mut first_rng).unwrap();
-    let second = ToeplitzFastProduct::<998_244_353>::sample(5, &mut second_rng).unwrap();
+    let first = ToeplitzFastProduct::<1_073_479_681>::sample(5, &mut first_rng).unwrap();
+    let second = ToeplitzFastProduct::<1_073_479_681>::sample(5, &mut second_rng).unwrap();
 
     assert_eq!(first.s_right().diagonals(), second.s_right().diagonals());
     assert_eq!(first.pi_right(), second.pi_right());
@@ -976,7 +976,7 @@ proptest! {
         diagonals in prop::collection::vec(any::<u32>(), 11),
         input in prop::collection::vec(any::<u32>(), 7),
     ) {
-        check_rectangular_toeplitz::<998_244_353>(5, 7, &diagonals, &input);
+        check_rectangular_toeplitz::<1_073_479_681>(5, 7, &diagonals, &input);
     }
 
     #[test]

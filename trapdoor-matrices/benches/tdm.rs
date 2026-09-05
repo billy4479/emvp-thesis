@@ -17,7 +17,7 @@ use trapdoor_matrices::{
     IrreducibleRingLpn, RaaWeightedProduct, SparseMatrix, ToeplitzFastProduct,
 };
 
-const MODULUS: u32 = 998_244_353;
+const MODULUS: u32 = 1_073_479_681;
 const RAA_C: usize = 4;
 const TARGET_COLUMN_WEIGHT: usize = 16;
 

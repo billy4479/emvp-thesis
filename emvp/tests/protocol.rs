@@ -15,8 +15,8 @@ use trapdoor_matrices::{
     DenseMatrix, IrreducibleRingLpn, RaaWeightedProduct, SparseMatrix, ToeplitzFastProduct,
 };
 
-// NTT-friendly prime: 998_244_353 - 1 is divisible by 2^23.
-const MODULUS: u32 = 998_244_353;
+// NTT-friendly prime: 1_073_479_681 - 1 is divisible by 2^18.
+const MODULUS: u32 = 1_073_479_681;
 
 // Tiny deliberately-insecure research parameters: k = 8, ell = 8, b = 2,
 // so n = 16 and s = 8. The protocol layer does not re-validate params.

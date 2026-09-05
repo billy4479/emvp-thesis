@@ -13,7 +13,7 @@ fn accepts_representative_primes() {
     accepts::<17>();
     accepts::<257>();
     accepts::<65_537>();
-    accepts::<998_244_353>();
+    accepts::<1_073_479_681>();
     accepts::<2_147_483_647>();
     accepts::<4_294_967_291>();
 }
@@ -29,5 +29,5 @@ fn reports_two_adicity() {
     check_two_adicity::<3>(1);
     check_two_adicity::<17>(4);
     check_two_adicity::<65_537>(16);
-    check_two_adicity::<998_244_353>(23);
+    check_two_adicity::<1_073_479_681>(18);
 }

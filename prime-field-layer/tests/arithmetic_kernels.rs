@@ -108,7 +108,7 @@ fn check_dense_kernels<const MODULUS: u32>() {
 #[test]
 fn dense_kernels_match_canonical_references_at_boundaries_and_tails() {
     check_dense_kernels::<2>();
-    check_dense_kernels::<998_244_353>();
+    check_dense_kernels::<1_073_479_681>();
     check_dense_kernels::<2_013_265_921>();
 }
 
@@ -142,13 +142,13 @@ fn check_batched_scan<const MODULUS: u32>(positions: usize, width: usize) {
 #[test]
 fn batched_scan_matches_independent_lane_references_at_boundaries() {
     check_batched_scan::<2>(7, 3);
-    check_batched_scan::<998_244_353>(7, 3);
+    check_batched_scan::<1_073_479_681>(7, 3);
     check_batched_scan::<2_013_265_921>(7, 3);
 }
 
 #[test]
 fn batched_scan_supports_one_lane() {
-    check_batched_scan::<998_244_353>(9, 1);
+    check_batched_scan::<1_073_479_681>(9, 1);
 }
 
 #[test]
@@ -167,7 +167,7 @@ fn batched_scan_rejects_zero_width_without_mutation() {
         Err(ArithmeticKernelError::ZeroBatchWidth)
     );
 
-    let original = elements::<998_244_353>(&[1, 2]);
+    let original = elements::<1_073_479_681>(&[1, 2]);
     let mut values = original.clone();
 
     assert_eq!(
@@ -239,15 +239,15 @@ fn check_sparse<const MODULUS: u32>() {
 #[test]
 fn sparse_accumulation_matches_reference_with_duplicates_and_boundary_indices() {
     check_sparse::<2>();
-    check_sparse::<998_244_353>();
+    check_sparse::<1_073_479_681>();
     check_sparse::<2_013_265_921>();
 }
 
 #[test]
 fn length_errors_do_not_mutate_outputs() {
-    let field = PrimeField::<998_244_353>::new();
-    let original = elements::<998_244_353>(&[1, 2, 3]);
-    let short = elements::<998_244_353>(&[4, 5]);
+    let field = PrimeField::<1_073_479_681>::new();
+    let original = elements::<1_073_479_681>(&[1, 2, 3]);
+    let short = elements::<1_073_479_681>(&[4, 5]);
     let scalar = field.element_u32(7);
 
     assert_eq!(

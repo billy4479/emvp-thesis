@@ -22,8 +22,8 @@ use trapdoor_matrices::{
     IrreducibleRingLpn, RaaWeightedProduct, SparseMatrix, ToeplitzFastProduct,
 };
 
-// NTT-friendly prime: 998_244_353 - 1 is divisible by 2^23.
-const MODULUS: u32 = 998_244_353;
+// NTT-friendly prime: 1_073_479_681 - 1 is divisible by 2^18.
+const MODULUS: u32 = 1_073_479_681;
 
 // Realistic parameter set satisfying every `EmvpParams::validate` constraint:
 // d = ceil(512 / 15) = 35 so 16^(d-1) * min(16,d) = 2^140 >= 2^128, and

@@ -52,17 +52,17 @@ fn bench_weighted_scan<const MODULUS: u32>(group: &mut BenchmarkGroup<'_, WallTi
 
 fn weighted_scan(c: &mut Criterion) {
     let mut group = c.benchmark_group("arithmetic_kernels/weighted_scan");
-    bench_weighted_scan::<998_244_353>(&mut group);
+    bench_weighted_scan::<1_073_479_681>(&mut group);
     bench_weighted_scan::<2_013_265_921>(&mut group);
     let positions = 512;
     let width = 8;
-    let values = field_elements::<998_244_353>(positions * width, 12_345);
-    let weights = field_elements::<998_244_353>(positions, 97);
+    let values = field_elements::<1_073_479_681>(positions * width, 12_345);
+    let weights = field_elements::<1_073_479_681>(positions, 97);
     group.throughput(Throughput::Elements((positions * width) as u64));
     group.bench_function(
         BenchmarkId::new(
             "batched_weighted_scan",
-            format!("p=998244353/positions={positions}/width={width}"),
+            format!("p=1073479681/positions={positions}/width={width}"),
         ),
         |b| {
             b.iter_batched_ref(
@@ -119,7 +119,7 @@ fn bench_sparse_accumulation<const MODULUS: u32>(group: &mut BenchmarkGroup<'_, 
 
 fn sparse_accumulation(c: &mut Criterion) {
     let mut group = c.benchmark_group("arithmetic_kernels/sparse_accumulation");
-    bench_sparse_accumulation::<998_244_353>(&mut group);
+    bench_sparse_accumulation::<1_073_479_681>(&mut group);
     bench_sparse_accumulation::<2_013_265_921>(&mut group);
     group.finish();
 }

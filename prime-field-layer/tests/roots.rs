@@ -25,7 +25,7 @@ fn check_roots<const MODULUS: u32>(max_length: usize) {
 fn roots_have_exact_requested_order() {
     check_roots::<17>(16);
     check_roots::<65_537>(65_536);
-    check_roots::<998_244_353>(1 << 23);
+    check_roots::<1_073_479_681>(1 << 18);
 }
 
 #[test]

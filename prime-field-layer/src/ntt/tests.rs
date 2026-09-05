@@ -2,7 +2,7 @@ use super::*;
 
 #[test]
 fn lazy_boundaries_round_trip_and_normalize_output() {
-    const MODULUS: u32 = 998_244_353;
+    const MODULUS: u32 = 1_073_479_681;
 
     let plan = NttPlan::<MODULUS>::new_scalar(256).unwrap();
     // Every endpoint of the [0, 4p) forward lazy interval, plus the
@@ -46,7 +46,7 @@ fn lazy_boundaries_round_trip_and_normalize_output() {
 
 #[test]
 fn lazy_inverse_boundaries_round_trip_and_normalize_output() {
-    const MODULUS: u32 = 998_244_353;
+    const MODULUS: u32 = 1_073_479_681;
 
     let plan = NttPlan::<MODULUS>::new_scalar(256).unwrap();
     // Endpoints of the [0, 2p) inverse lazy interval, seeded directly
@@ -93,7 +93,7 @@ fn transform_outputs_have_canonical_montgomery_words() {
         assert!(values.iter().all(|value| value.montgomery() < MODULUS));
     }
 
-    check::<998_244_353>();
+    check::<1_073_479_681>();
     check::<2_013_265_921>();
     check::<2_281_701_377>();
 }
