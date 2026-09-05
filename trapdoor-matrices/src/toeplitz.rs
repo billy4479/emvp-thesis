@@ -150,12 +150,9 @@ impl<const MODULUS: u32> ToeplitzMap<MODULUS> {
         transform: &mut [FieldElement<MODULUS>],
     ) -> Result<(), TdmError> {
         let transform = &mut transform[..self.transform_length()];
-        let zero = PrimeField::<MODULUS>::new().element_u32(0);
-        transform.fill(zero);
         transform[..self.columns].copy_from_slice(input);
-        self.plan.forward(transform)?;
-        self.plan.pointwise_mul_assign(transform, &self.spectrum)?;
-        self.plan.inverse(transform)?;
+        self.plan
+            .convolve_pretransformed_assign(&self.spectrum, self.columns, transform)?;
         output.copy_from_slice(&transform[..self.rows]);
         Ok(())
     }

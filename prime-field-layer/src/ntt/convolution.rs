@@ -119,6 +119,46 @@ impl<const MODULUS: u32> NttPlan<MODULUS> {
         self.pointwise_mul_assign(lhs, rhs)?;
         self.inverse(lhs)
     }
+
+    /// Computes the length-`N` cyclic product with a pretransformed operand.
+    ///
+    /// `fixed_spectrum` is the forward transform of the fixed operand: exactly
+    /// `N` frequency-domain values, as obtained by transforming any packed
+    /// length-`N` coefficient vector once. On entry, `values[..input_length]`
+    /// holds the fresh operand's coefficients in natural order; the entries
+    /// beyond `input_length` are overwritten. On return, `values` holds the
+    /// `N` time-domain coefficients of the cyclic product
+    /// `fixed * input mod x^N - 1`.
+    ///
+    /// The method performs one forward transform, one pointwise multiplication,
+    /// and one inverse transform, allocates nothing, and addresses memory
+    /// independently of field values. Callers choose the semantics through the
+    /// packing of `fixed_spectrum` and the outputs they read: natural-order
+    /// packing with `m + n <= N` coefficients yields the plain linear
+    /// convolution in the first `m + n - 1` entries, and wrapped packing
+    /// expresses negative diagonals, as in fast Toeplitz products.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FieldError::LengthMismatch`] before mutation if
+    /// `fixed_spectrum` or `values` does not have this plan's length, or if
+    /// `input_length` exceeds the plan length.
+    pub fn convolve_pretransformed_assign(
+        &self,
+        fixed_spectrum: &[FieldElement<MODULUS>],
+        input_length: usize,
+        values: &mut [FieldElement<MODULUS>],
+    ) -> Result<(), FieldError> {
+        let length = self.len();
+        if fixed_spectrum.len() != length || values.len() != length || input_length > length {
+            return Err(FieldError::LengthMismatch);
+        }
+        let zero = self.field.element_u32(0);
+        values[input_length..].fill(zero);
+        self.forward(values)?;
+        self.pointwise_mul_assign(values, fixed_spectrum)?;
+        self.inverse(values)
+    }
 }
 impl<const MODULUS: u32> PretransformedLinearOperand<'_, MODULUS> {
     /// Returns the number of coefficients in the fixed operand.
@@ -199,14 +239,14 @@ impl<const MODULUS: u32> PretransformedLinearOperand<'_, MODULUS> {
             return Ok(());
         }
 
-        workspace.values.fill(self.plan.field.element_u32(0));
         for (element, &value) in workspace.values.iter_mut().zip(input) {
             *element = self.plan.field.element_u32(value);
         }
-        self.plan.forward(&mut workspace.values)?;
-        self.plan
-            .pointwise_mul_assign(&mut workspace.values, &self.values)?;
-        self.plan.inverse(&mut workspace.values)?;
+        self.plan.convolve_pretransformed_assign(
+            &self.values,
+            input.len(),
+            &mut workspace.values,
+        )?;
         for (output, value) in output.iter_mut().zip(&workspace.values) {
             *output = value.value();
         }
