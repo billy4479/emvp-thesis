@@ -30,6 +30,6 @@ pub use params::{
 pub use prf::{Prf, PrfError, purpose};
 pub use protocol::{
     AnswerMatrix, DecodingKey, DerivedState, EncryptedMatrix, EncryptedQuery, ProtocolError,
-    QueryReservation, QueryReservations, QueryScratch, SecretKey, answer, answer_into, decode,
-    decode_into, encrypt, query, query_with_scratch,
+    QueryReservation, QueryReservations, QueryScratch, SecretKey, answer_into, decode_into,
+    encrypt, query, query_with_scratch,
 };

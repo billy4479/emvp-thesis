@@ -979,28 +979,6 @@ fn query_core<const MODULUS: u32, M: TdmMask<MODULUS>>(
 ///
 /// Returns an error before producing output if parameters are malformed, the
 /// matrix columns differ from `n`, or the query length differs from `n`.
-pub fn answer<const MODULUS: u32>(
-    params: &EmvpParams,
-    matrix: &EncryptedMatrix<MODULUS>,
-    query: &EncryptedQuery<MODULUS>,
-) -> Result<AnswerMatrix<MODULUS>, ProtocolError> {
-    let (n, b, s, rows) = validate_answer(params, matrix, query)?;
-    let zero = PrimeField::<MODULUS>::new().element_u32(0);
-    let mut values = vec![
-        zero;
-        rows.checked_mul(s)
-            .ok_or(ProtocolError::DimensionOverflow)?
-    ];
-    fill_answer(matrix, query, &mut values, n, b, s, rows);
-    Ok(AnswerMatrix {
-        values,
-        rows,
-        blocks: s,
-        instance_id: matrix.instance_id,
-        query_id: query.query_id,
-    })
-}
-
 /// Answers an encrypted query into caller-owned row-major storage.
 ///
 /// `output` must contain `matrix.rows() * params.blocks()` elements. This
@@ -1071,25 +1049,6 @@ fn fill_answer<const MODULUS: u32>(
             fill_answer_row(matrix_row, &query.values, b, output_row);
         }
     }
-}
-
-/// Decodes the client share of the matrix-vector product.
-///
-/// Returns `a = M' p' - r'`, which equals `M q` for a matching protocol run.
-///
-/// # Errors
-///
-/// Returns an error if the decoding-key lengths do not match the answer
-/// dimensions.
-pub fn decode<const MODULUS: u32>(
-    answer: &AnswerMatrix<MODULUS>,
-    key: &DecodingKey<MODULUS>,
-) -> Result<Vec<FieldElement<MODULUS>>, ProtocolError> {
-    let (rows, s) = validate_decode(answer, key)?;
-    let zero = PrimeField::<MODULUS>::new().element_u32(0);
-    let mut output = vec![zero; rows];
-    fill_decoded(answer, key, &mut output, s);
-    Ok(output)
 }
 
 /// Decodes a matrix-vector product into caller-owned storage.

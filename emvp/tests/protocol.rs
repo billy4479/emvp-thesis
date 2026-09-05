@@ -5,13 +5,15 @@
 
 use emvp::{
     AnswerMatrix, DecodingKey, DerivedState, EmvpParams, EncryptedMatrix, EncryptedQuery, Prf,
-    ProtocolError, SecretKey, TdmMask, answer, answer_into, decode, decode_into, encrypt, purpose,
-    query, query_with_scratch,
+    ProtocolError, SecretKey, TdmMask, answer_into, decode_into, encrypt, purpose, query,
+    query_with_scratch,
 };
 use prime_field_layer::{FieldElement, PrimeField};
 use rand_chacha::ChaCha20Rng;
 use rand_core::SeedableRng;
-use trapdoor_matrices::{DenseMatrix, RaaWeightedProduct, ToeplitzFastProduct};
+use trapdoor_matrices::{
+    DenseMatrix, IrreducibleRingLpn, RaaWeightedProduct, SparseMatrix, ToeplitzFastProduct,
+};
 
 // NTT-friendly prime: 998_244_353 - 1 is divisible by 2^23.
 const MODULUS: u32 = 998_244_353;
@@ -50,6 +52,44 @@ fn raa_block(
     Ok(RaaWeightedProduct::sample_nonzero(16, 2, stream)?)
 }
 
+// A square `n x n` Ring-LPN mask block for the test parameters, where
+// `n = 2k = 16`. The sparse secret `E` has a fixed small column weight.
+fn ring_block(
+    stream: &mut ChaCha20Rng,
+    _index: usize,
+) -> Result<IrreducibleRingLpn<MODULUS>, ProtocolError> {
+    let n = 16;
+    let field = field();
+    let multiplier: Vec<u32> = (0..n)
+        .map(|_| field.sample_uniform(stream).value())
+        .collect();
+    let rows = 2 * n;
+    let target_weight = 4;
+    let mut offsets = Vec::with_capacity(n + 1);
+    let mut row_indices = Vec::with_capacity(n * target_weight);
+    let mut values = Vec::with_capacity(n * target_weight);
+    offsets.push(0);
+    for column in 0..n {
+        for entry in 0..target_weight {
+            row_indices.push((17 * column + entry) % rows);
+            values.push(field.sample_uniform_nonzero(stream));
+        }
+        offsets.push(row_indices.len());
+    }
+    let sparse = SparseMatrix::new(rows, n, offsets, row_indices, values)?;
+    // This monic binomial is test input, not an irreducibility claim: the
+    // unchecked constructor skips an impractical irreducibility search.
+    let mut modulus = vec![0; n + 1];
+    modulus[0] = MODULUS - 3;
+    modulus[n] = 1;
+    Ok(IrreducibleRingLpn::new_unchecked_irreducible(
+        n,
+        &modulus,
+        &multiplier,
+        sparse,
+    )?)
+}
+
 fn derive_toeplitz(
     rows: usize,
     ell: usize,
@@ -62,6 +102,32 @@ fn derive_toeplitz(
         .unwrap()
 }
 
+fn answer_matrix(
+    params: &EmvpParams,
+    encrypted: &EncryptedMatrix<MODULUS>,
+    query: &EncryptedQuery<MODULUS>,
+) -> AnswerMatrix<MODULUS> {
+    let zero = field().element_u32(0);
+    let mut values = vec![zero; encrypted.rows() * params.blocks().unwrap()];
+    answer_into(params, encrypted, query, &mut values).unwrap();
+    AnswerMatrix::from_parts(
+        encrypted.instance_id(),
+        query.query_id(),
+        values,
+        encrypted.rows(),
+        params.blocks().unwrap(),
+    )
+}
+
+fn decode_answer(
+    answer: &AnswerMatrix<MODULUS>,
+    key: &DecodingKey<MODULUS>,
+) -> Vec<FieldElement<MODULUS>> {
+    let mut output = vec![field().element_u32(0); answer.rows()];
+    decode_into(answer, key, &mut output).unwrap();
+    output
+}
+
 fn run_protocol<M: TdmMask<MODULUS>>(
     state: &mut DerivedState<MODULUS, M>,
     matrix: &[FieldElement<MODULUS>],
@@ -69,8 +135,8 @@ fn run_protocol<M: TdmMask<MODULUS>>(
 ) -> Vec<FieldElement<MODULUS>> {
     let encrypted = encrypt(state, matrix).unwrap();
     let (encrypted_query, decoding_key) = query(state, q).unwrap();
-    let answer_matrix = answer(&state.params(), &encrypted, &encrypted_query).unwrap();
-    decode(&answer_matrix, &decoding_key).unwrap()
+    let answer = answer_matrix(&state.params(), &encrypted, &encrypted_query);
+    decode_answer(&answer, &decoding_key)
 }
 
 fn naive_matrix_vector(
@@ -110,6 +176,21 @@ fn end_to_end_works_with_raa_mask() {
     let mut state = SecretKey::<MODULUS>::new_insecure(test_params(ell), [4; 32])
         .unwrap()
         .derive(rows, &mut rng, raa_block)
+        .unwrap();
+    let matrix = random_vector(rows * ell, &mut rng);
+    let q = random_vector(ell, &mut rng);
+    let decoded = run_protocol(&mut state, &matrix, &q);
+    let expected = naive_matrix_vector(&matrix, &q, rows, ell);
+    assert_eq!(decoded, expected);
+}
+
+#[test]
+fn end_to_end_works_with_ring_lpn_mask() {
+    let mut rng = ChaCha20Rng::seed_from_u64(0x7400);
+    let (rows, ell) = (7_usize, 8_usize);
+    let mut state = SecretKey::<MODULUS>::new_insecure(test_params(ell), [0x74; 32])
+        .unwrap()
+        .derive(rows, &mut rng, ring_block)
         .unwrap();
     let matrix = random_vector(rows * ell, &mut rng);
     let q = random_vector(ell, &mut rng);
@@ -168,8 +249,8 @@ fn query_randomness_is_fresh() {
     let (first_query, first_key) = query(&mut state, &q).unwrap();
     let (second_query, _second_key) = query(&mut state, &q).unwrap();
     assert_ne!(first_query.values(), second_query.values());
-    let first_answer = answer(&state.params(), &encrypted, &first_query).unwrap();
-    let decoded = decode(&first_answer, &first_key).unwrap();
+    let first_answer = answer_matrix(&state.params(), &encrypted, &first_query);
+    let decoded = decode_answer(&first_answer, &first_key);
     assert_eq!(decoded, naive_matrix_vector(&matrix, &q, rows, ell));
 }
 
@@ -233,16 +314,16 @@ fn decode_rejects_a_key_for_another_query() {
     let encrypted = encrypt(&mut state, &matrix).unwrap();
     let (first_query, _) = query(&mut state, &q).unwrap();
     let (_, second_key) = query(&mut state, &q).unwrap();
-    let first_answer = answer(&state.params(), &encrypted, &first_query).unwrap();
+    let first_answer = answer_matrix(&state.params(), &encrypted, &first_query);
 
     assert!(matches!(
-        decode(&first_answer, &second_key),
+        decode_into(&first_answer, &second_key, &mut []),
         Err(ProtocolError::QueryMismatch { .. })
     ));
 }
 
 #[test]
-fn caller_owned_answer_and_decode_buffers_match_allocating_wrappers() {
+fn caller_owned_buffers_are_fully_overwritten() {
     let mut rng = ChaCha20Rng::seed_from_u64(0x7300);
     let (rows, ell) = (5_usize, 8_usize);
     let mut state = derive_toeplitz(rows, ell, 10);
@@ -250,10 +331,11 @@ fn caller_owned_answer_and_decode_buffers_match_allocating_wrappers() {
     let q = random_vector(ell, &mut rng);
     let encrypted = encrypt(&mut state, &matrix).unwrap();
     let (encrypted_query, decoding_key) = query(&mut state, &q).unwrap();
-    let expected_answer = answer(&state.params(), &encrypted, &encrypted_query).unwrap();
 
-    let zero = field().element_u32(0);
-    let mut answer_values = vec![zero; expected_answer.values().len()];
+    // Dirty the output buffers to prove both `_into` variants overwrite
+    // every slot instead of accumulating into them.
+    let garbage = field().element_u32(1);
+    let mut answer_values = vec![garbage; rows * state.params().blocks().unwrap()];
     answer_into(
         &state.params(),
         &encrypted,
@@ -261,10 +343,16 @@ fn caller_owned_answer_and_decode_buffers_match_allocating_wrappers() {
         &mut answer_values,
     )
     .unwrap();
-    assert_eq!(answer_values, expected_answer.values());
 
-    let mut decoded = vec![zero; rows];
-    decode_into(&expected_answer, &decoding_key, &mut decoded).unwrap();
+    let answer = AnswerMatrix::from_parts(
+        encrypted.instance_id(),
+        encrypted_query.query_id(),
+        answer_values,
+        rows,
+        state.params().blocks().unwrap(),
+    );
+    let mut decoded = vec![garbage; rows];
+    decode_into(&answer, &decoding_key, &mut decoded).unwrap();
     assert_eq!(decoded, naive_matrix_vector(&matrix, &q, rows, ell));
 }
 
@@ -308,7 +396,7 @@ fn wrong_instance_is_rejected() {
     let encrypted = encrypt(&mut state, &matrix).unwrap();
     let (query_wrong, _key_wrong) = query(&mut other, &q).unwrap();
     assert!(matches!(
-        answer(&state.params(), &encrypted, &query_wrong),
+        answer_into(&state.params(), &encrypted, &query_wrong, &mut []),
         Err(ProtocolError::InstanceMismatch { .. })
     ));
 }
@@ -438,12 +526,11 @@ fn permutation_direction_is_pinned_by_naive_oracle() {
             .iter()
             .map(|&value| field().element_u32(value))
             .collect();
-        let answer_matrix = answer(
+        let answer = answer_matrix(
             &params,
             &encrypted_naive,
             &EncryptedQuery::from_parts(state.instance_id(), 0, q_hat_elements),
-        )
-        .unwrap();
+        );
         // Mask share r' = R q_tilde on the UNPERMUTED query.
         let q_tilde_elements: Vec<FieldElement<MODULUS>> = q_tilde
             .iter()
@@ -457,7 +544,7 @@ fn permutation_direction_is_pinned_by_naive_oracle() {
             decoding_key.p_prime().to_vec(),
             r_prime,
         );
-        decode(&answer_matrix, &key).unwrap()
+        decode_answer(&answer, &key)
     };
 
     let correct = naive_answer(true); // gather, matching the matrix columns
@@ -493,7 +580,7 @@ fn length_errors_are_rejected_before_mutation() {
 
     let encrypted = encrypt(&mut state, &random_vector(rows * ell, &mut rng)).unwrap();
     let (encrypted_query, decoding_key) = query(&mut state, &q).unwrap();
-    let answer_matrix = answer(&state.params(), &encrypted, &encrypted_query).unwrap();
+    let answer_matrix = answer_matrix(&state.params(), &encrypted, &encrypted_query);
 
     let truncated_query = EncryptedQuery::from_parts(
         encrypted_query.instance_id(),
@@ -501,7 +588,7 @@ fn length_errors_are_rejected_before_mutation() {
         encrypted_query.values()[..n - 1].to_vec(),
     );
     assert!(matches!(
-        answer(&state.params(), &encrypted, &truncated_query),
+        answer_into(&state.params(), &encrypted, &truncated_query, &mut []),
         Err(ProtocolError::LengthMismatch { .. })
     ));
 
@@ -519,7 +606,7 @@ fn length_errors_are_rejected_before_mutation() {
         state.params().blocks().unwrap(),
     );
     assert!(matches!(
-        decode(&sentinel, &short_key),
+        decode_into(&sentinel, &short_key, &mut []),
         Err(ProtocolError::LengthMismatch { .. })
     ));
 }
@@ -530,7 +617,7 @@ fn malformed_answer_is_validated_before_output_allocation() {
     let answer = AnswerMatrix::from_parts(1, 0, Vec::new(), usize::MAX, 2);
     let key = DecodingKey::from_parts(1, 0, vec![zero; 2], Vec::new());
     assert!(matches!(
-        decode(&answer, &key),
+        decode_into(&answer, &key, &mut []),
         Err(ProtocolError::LengthMismatch { .. })
     ));
 }
@@ -574,7 +661,7 @@ fn answer_rejects_malformed_block_dimensions() {
             lambda: 7,
         };
         assert!(matches!(
-            answer(&malformed, &matrix, &encrypted_query),
+            answer_into(&malformed, &matrix, &encrypted_query, &mut []),
             Err(ProtocolError::Params(_))
         ));
     }
