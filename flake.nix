@@ -34,6 +34,10 @@
             rustc
             clippy
 
+            perf
+            cargo-flamegraph
+            samply
+
             gnuplot
           ];
         };

@@ -4,6 +4,9 @@ result-*
 
 target/
 
+*.svg
+perf.data*
+
 
 # Added by cargo
 
