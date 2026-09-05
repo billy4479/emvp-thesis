@@ -5,6 +5,7 @@
 
 use std::{hint::black_box, time::Duration};
 
+use bench_common as common;
 use criterion::{
     BatchSize, BenchmarkGroup, BenchmarkId, Criterion, Throughput, criterion_group, criterion_main,
     measurement::WallTime,
@@ -189,7 +190,9 @@ fn toeplitz_apply_for(group: &mut BenchmarkGroup<'_, WallTime>, k: usize) {
         },
     );
 
-    if k <= 64 {
+    // Calibrated the structured/dense dispatch threshold; kept for one-off
+    // re-measurement via EMVP_BENCH_CALIBRATION=1.
+    if k <= 64 && common::calibration_enabled() {
         let dense = map.materialize().unwrap();
         let mut dense_output = field_values(k, 0x44);
         group.bench_function(BenchmarkId::new("direct_dense_crossover", k), |b| {
@@ -253,7 +256,9 @@ fn raa_apply_for(group: &mut BenchmarkGroup<'_, WallTime>, k: usize) {
         });
     });
 
-    if k <= 64 {
+    // Calibrated the structured/dense dispatch threshold; kept for one-off
+    // re-measurement via EMVP_BENCH_CALIBRATION=1.
+    if k <= 64 && common::calibration_enabled() {
         let dense = map.materialize().unwrap();
         let mut dense_output = field_values(k, 0x54);
         group.bench_function(BenchmarkId::new("direct_dense_crossover", k), |b| {

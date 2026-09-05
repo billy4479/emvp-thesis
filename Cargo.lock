@@ -229,6 +229,7 @@ name = "emvp"
 version = "0.1.0"
 dependencies = [
  "allocation-counter",
+ "bench-common",
  "criterion",
  "prime-field-layer",
  "proptest",
@@ -757,6 +758,7 @@ name = "trapdoor-matrices"
 version = "0.1.0"
 dependencies = [
  "allocation-counter",
+ "bench-common",
  "criterion",
  "prime-field-layer",
  "proptest",

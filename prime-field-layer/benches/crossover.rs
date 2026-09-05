@@ -54,6 +54,11 @@ fn u64_mod_schoolbook_negacyclic<const MODULUS: u32>(lhs: &[u32], rhs: &[u32]) -
 }
 
 fn convolutions(c: &mut Criterion) {
+    // O(N^2) schoolbook baselines calibrated the schoolbook/NTT dispatch
+    // threshold; re-run them only when revisiting that choice.
+    if common::skip_calibration("schoolbook convolution baselines") {
+        return;
+    }
     let mut group = c.benchmark_group("convolution_p998244353");
     // Only the lengths where an O(N^2) baseline is still measurable; the
     // production-sized 4096 case lives in the auto/backend convolution groups.
@@ -108,16 +113,9 @@ fn linear_dispatch_for_modulus<const MODULUS: u32>(c: &mut Criterion) {
         Duration::from_millis(500),
         Duration::from_secs(1),
     );
-    for (lhs_length, rhs_length) in [
-        (64, 64),
-        (65, 65),
-        (72, 72),
-        (80, 80),
-        (3, 1_728),
-        (3, 1_729),
-        (1, 8_192),
-        (2, 4_097),
-    ] {
+    // Square shapes near the schoolbook/NTT dispatch threshold; degenerate
+    // aspect ratios (1x8192, 3x1728, ...) were one-time dispatch probes.
+    for (lhs_length, rhs_length) in [(64, 64), (65, 65), (72, 72), (80, 80)] {
         let lhs = common::values(lhs_length, MODULUS, 97);
         let rhs = common::values(rhs_length, MODULUS, 12_345);
         let result_length = lhs_length + rhs_length - 1;
@@ -128,14 +126,16 @@ fn linear_dispatch_for_modulus<const MODULUS: u32>(c: &mut Criterion) {
         group.bench_function(BenchmarkId::new("free_auto_dispatch", &parameter), |b| {
             b.iter(|| linear_convolution::<MODULUS>(black_box(&lhs), black_box(&rhs)).unwrap());
         });
-        group.bench_function(
-            BenchmarkId::new("field_element_montgomery_schoolbook", &parameter),
-            |b| {
-                b.iter(|| {
-                    field_element_schoolbook_linear::<MODULUS>(black_box(&lhs), black_box(&rhs))
-                });
-            },
-        );
+        if common::calibration_enabled() {
+            group.bench_function(
+                BenchmarkId::new("field_element_montgomery_schoolbook", &parameter),
+                |b| {
+                    b.iter(|| {
+                        field_element_schoolbook_linear::<MODULUS>(black_box(&lhs), black_box(&rhs))
+                    });
+                },
+            );
+        }
         group.bench_function(BenchmarkId::new("cached_scalar_ntt", &parameter), |b| {
             b.iter(|| {
                 plan.linear_convolution(black_box(&lhs), black_box(&rhs))
@@ -148,7 +148,6 @@ fn linear_dispatch_for_modulus<const MODULUS: u32>(c: &mut Criterion) {
 
 fn linear_dispatch(c: &mut Criterion) {
     linear_dispatch_for_modulus::<998_244_353>(c);
-    linear_dispatch_for_modulus::<2_281_701_377>(c);
 }
 
 fn crossover(c: &mut Criterion) {

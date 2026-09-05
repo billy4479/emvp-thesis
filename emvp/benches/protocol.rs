@@ -5,19 +5,22 @@
 
 use std::{hint::black_box, sync::OnceLock, time::Duration};
 
+use bench_common as common;
 use criterion::{
     BatchSize, BenchmarkGroup, BenchmarkId, Criterion, Throughput, criterion_group, criterion_main,
     measurement::WallTime,
 };
 use emvp::{
-    DecodingKey, DerivedState, EmvpParams, EncryptedMatrix, EncryptedQuery, ProtocolError,
-    SecretKey, answer, answer_into, decode, decode_into, encrypt, query,
+    AnswerMatrix, DecodingKey, DerivedState, EmvpParams, EncryptedMatrix, EncryptedQuery,
+    ProtocolError, SecretKey, TdmMask, answer_into, decode_into, encrypt, query,
 };
 use prime_field_layer::{FieldElement, PrimeField};
 use rand_chacha::ChaCha20Rng;
 use rand_core::SeedableRng;
 use rayon::{ThreadPool, ThreadPoolBuilder, prelude::*};
-use trapdoor_matrices::{RaaWeightedProduct, ToeplitzFastProduct};
+use trapdoor_matrices::{
+    IrreducibleRingLpn, RaaWeightedProduct, SparseMatrix, ToeplitzFastProduct,
+};
 
 // NTT-friendly prime: 998_244_353 - 1 is divisible by 2^23.
 const MODULUS: u32 = 998_244_353;
@@ -32,14 +35,19 @@ const PARAMS: EmvpParams = EmvpParams {
     lambda: 128,
 };
 
-// Online client cases cross the n-row mask-block boundary.
-const CLIENT_ROW_COUNTS: [usize; 6] = [32, 128, 1024, 1025, 2048, 2049];
-// Server cases extend beyond cache-resident encrypted matrices.
+// Online client cases cross the n-row mask-block boundary at rows = n = 1024.
+const CLIENT_ROW_COUNTS: [usize; 5] = [32, 128, 1024, 1025, 2048];
+// Server cases extend beyond cache-resident encrypted matrices. The answer
+// and decode phases are TDM-agnostic: they consume only the encrypted matrix.
 const SERVER_ROW_COUNTS: [usize; 3] = [128, 1024, 8192];
-// Includes cases around the eight-thread answer crossover.
-const ANSWER_ROW_COUNTS: [usize; 6] = [16, 31, 32, 128, 1024, 8192];
+// Cases around the eight-thread answer crossover; calibration-only because
+// that boundary was measured once when sizing the rayon thread pool.
+const ANSWER_CALIBRATION_ROW_COUNTS: [usize; 3] = [16, 31, 32];
 // Covers both sides of the n-row mask-block boundary during derivation.
 const DERIVE_ROW_COUNTS: [usize; 4] = [32, 128, 1024, 1025];
+
+// Sparse column weight of the Ring-LPN benchmark blocks.
+const TARGET_COLUMN_WEIGHT: usize = 16;
 
 fn benchmark_pool() -> &'static ThreadPool {
     static POOL: OnceLock<ThreadPool> = OnceLock::new();
@@ -73,6 +81,7 @@ fn toeplitz_block(
     Ok(ToeplitzFastProduct::sample(PARAMS.n().unwrap(), stream)?)
 }
 
+// One `n x n` RAA mask block with three nonzero weights per factor.
 fn raa_block(
     stream: &mut ChaCha20Rng,
     _index: usize,
@@ -84,80 +93,111 @@ fn raa_block(
     )?)
 }
 
+// One square `n x n` Ring-LPN mask block. The sparse secret keeps a fixed
+// column weight, and the monic binomial modulus is benchmark input, not an
+// irreducibility claim; the unchecked constructor isolates block sampling
+// from an impractical irreducibility search at degree n.
+fn ring_block(
+    stream: &mut ChaCha20Rng,
+    _index: usize,
+) -> Result<IrreducibleRingLpn<MODULUS>, ProtocolError> {
+    let n = PARAMS.n()?;
+    let field = PrimeField::<MODULUS>::new();
+    let multiplier: Vec<u32> = (0..n)
+        .map(|_| field.sample_uniform(stream).value())
+        .collect();
+    let rows = 2 * n;
+    let target_weight = TARGET_COLUMN_WEIGHT.min(n);
+    let mut offsets = Vec::with_capacity(n + 1);
+    let mut row_indices = Vec::with_capacity(n * target_weight);
+    let mut values = Vec::with_capacity(n * target_weight);
+    offsets.push(0);
+    for column in 0..n {
+        for entry in 0..target_weight {
+            row_indices.push((17 * column + entry) % rows);
+            values.push(field.sample_uniform_nonzero(stream));
+        }
+        offsets.push(row_indices.len());
+    }
+    let sparse = SparseMatrix::new(rows, n, offsets, row_indices, values)?;
+    let mut modulus = vec![0; n + 1];
+    modulus[0] = MODULUS - 3;
+    modulus[n] = 1;
+    Ok(IrreducibleRingLpn::new_unchecked_irreducible(
+        n,
+        &modulus,
+        &multiplier,
+        sparse,
+    )?)
+}
+
+type BlockBuilder<M> = fn(&mut ChaCha20Rng, usize) -> Result<M, ProtocolError>;
+
 // The expanded long-term secrets for `rows` matrix rows.
-fn derive_state(rows: usize, domain: u8) -> DerivedState<MODULUS, ToeplitzFastProduct<MODULUS>> {
+fn derive_with<M: TdmMask<MODULUS>>(
+    rows: usize,
+    domain: u8,
+    build_block: BlockBuilder<M>,
+) -> DerivedState<MODULUS, M> {
     let mut rng = seeded_rng(domain ^ 0x80, rows);
     SecretKey::<MODULUS>::new(PARAMS, [domain; 32])
         .unwrap()
-        .derive(rows, &mut rng, toeplitz_block)
+        .derive(rows, &mut rng, build_block)
         .unwrap()
 }
 
-fn derive_raa_state(rows: usize, domain: u8) -> DerivedState<MODULUS, RaaWeightedProduct<MODULUS>> {
-    let mut rng = seeded_rng(domain ^ 0x80, rows);
-    SecretKey::<MODULUS>::new(PARAMS, [domain; 32])
-        .unwrap()
-        .derive(rows, &mut rng, raa_block)
-        .unwrap()
-}
-
-fn bench_derive(group: &mut BenchmarkGroup<'_, WallTime>, rows: usize) {
-    group.bench_function(BenchmarkId::new("toeplitz", rows), |b| {
+fn bench_derive_for<M: TdmMask<MODULUS>>(
+    group: &mut BenchmarkGroup<'_, WallTime>,
+    label: &str,
+    rows: usize,
+    build_block: BlockBuilder<M>,
+) {
+    group.bench_function(BenchmarkId::new(label, rows), |b| {
         b.iter(|| {
             let mut rng = seeded_rng(0xf2, rows);
             black_box(
                 SecretKey::<MODULUS>::new(PARAMS, [0x72; 32])
                     .unwrap()
-                    .derive(rows, &mut rng, toeplitz_block)
+                    .derive(rows, &mut rng, build_block)
                     .unwrap(),
             )
         });
     });
 }
 
-fn bench_encrypt(group: &mut BenchmarkGroup<'_, WallTime>, rows: usize) {
+fn bench_encrypt_for<M: TdmMask<MODULUS>>(
+    group: &mut BenchmarkGroup<'_, WallTime>,
+    label: &str,
+    rows: usize,
+    build_block: BlockBuilder<M>,
+) {
     let matrix = field_values(rows * PARAMS.ell, 0x02);
     group.throughput(elements(rows * PARAMS.ell));
-    group.bench_function(BenchmarkId::new("toeplitz", rows), |b| {
+    group.bench_function(BenchmarkId::new(label, rows), |b| {
         b.iter_batched(
-            || derive_state(rows, 0x01),
+            || derive_with(rows, 0x01, build_block),
             |mut state| black_box(encrypt(black_box(&mut state), black_box(&matrix)).unwrap()),
             BatchSize::SmallInput,
         );
     });
 }
 
-fn bench_raa_encrypt(group: &mut BenchmarkGroup<'_, WallTime>, rows: usize) {
-    let matrix = field_values(rows * PARAMS.ell, 0x12);
-    group.throughput(elements(rows * PARAMS.ell));
-    group.bench_function(BenchmarkId::new("raa", rows), |b| {
-        b.iter_batched(
-            || derive_raa_state(rows, 0x11),
-            |mut state| black_box(encrypt(black_box(&mut state), black_box(&matrix)).unwrap()),
-            BatchSize::SmallInput,
-        );
-    });
-}
-
-fn bench_query(group: &mut BenchmarkGroup<'_, WallTime>, rows: usize) {
-    let mut state = derive_state(rows, 0x03);
+fn bench_query_for<M: TdmMask<MODULUS>>(
+    group: &mut BenchmarkGroup<'_, WallTime>,
+    label: &str,
+    rows: usize,
+    build_block: BlockBuilder<M>,
+) {
+    let mut state = derive_with(rows, 0x03, build_block);
     let record = field_values(PARAMS.ell, 0x04);
     // The stream keeps advancing across iterations, mirroring repeated
     // queries with fresh randomness.
-    group.bench_function(BenchmarkId::new("toeplitz", rows), |b| {
+    group.bench_function(BenchmarkId::new(label, rows), |b| {
         b.iter(|| {
             let (encrypted_query, decoding_key) =
                 query(black_box(&mut state), black_box(&record)).unwrap();
             black_box((encrypted_query, decoding_key))
         });
-    });
-}
-
-fn bench_raa_query(group: &mut BenchmarkGroup<'_, WallTime>, rows: usize) {
-    let mut state = derive_raa_state(rows, 0x13);
-    let record = field_values(PARAMS.ell, 0x14);
-    group.bench_function(BenchmarkId::new("raa", rows), |b| {
-        b.iter(|| black_box(query(black_box(&mut state), black_box(&record)).unwrap()));
     });
 }
 
@@ -195,7 +235,7 @@ fn protocol_fixtures(
     EncryptedQuery<MODULUS>,
     DecodingKey<MODULUS>,
 ) {
-    let mut state = derive_state(rows, 0x06);
+    let mut state = derive_with(rows, 0x06, toeplitz_block);
     let matrix = field_values(rows * PARAMS.ell, 0x07);
     let record = field_values(PARAMS.ell, 0x08);
     let encrypted = encrypt(&mut state, &matrix).unwrap();
@@ -205,26 +245,10 @@ fn protocol_fixtures(
 
 fn bench_answer(group: &mut BenchmarkGroup<'_, WallTime>, rows: usize) {
     let (encrypted, encrypted_query, _decoding_key) = protocol_fixtures(rows);
-    group.throughput(elements(rows * PARAMS.n().unwrap()));
-    group.bench_function(BenchmarkId::new("toeplitz", rows), |b| {
-        b.iter(|| {
-            black_box(
-                benchmark_pool()
-                    .install(|| {
-                        answer(
-                            black_box(&PARAMS),
-                            black_box(&encrypted),
-                            black_box(&encrypted_query),
-                        )
-                    })
-                    .unwrap(),
-            )
-        });
-    });
-
     let zero = PrimeField::<MODULUS>::new().element_u32(0);
     let mut output = vec![zero; rows * PARAMS.blocks().unwrap()];
-    group.bench_function(BenchmarkId::new("toeplitz_into", rows), |b| {
+    group.throughput(elements(rows * PARAMS.n().unwrap()));
+    group.bench_function(BenchmarkId::from_parameter(rows), |b| {
         b.iter(|| {
             benchmark_pool()
                 .install(|| {
@@ -243,15 +267,20 @@ fn bench_answer(group: &mut BenchmarkGroup<'_, WallTime>, rows: usize) {
 
 fn bench_decode(group: &mut BenchmarkGroup<'_, WallTime>, rows: usize) {
     let (encrypted, encrypted_query, decoding_key) = protocol_fixtures(rows);
-    let answer_matrix = answer(&PARAMS, &encrypted, &encrypted_query).unwrap();
-    group.throughput(elements(rows * PARAMS.blocks().unwrap()));
-    group.bench_function(BenchmarkId::new("toeplitz", rows), |b| {
-        b.iter(|| black_box(decode(black_box(&answer_matrix), black_box(&decoding_key)).unwrap()));
-    });
-
     let zero = PrimeField::<MODULUS>::new().element_u32(0);
+    let blocks = PARAMS.blocks().unwrap();
+    let mut answer_values = vec![zero; rows * blocks];
+    answer_into(&PARAMS, &encrypted, &encrypted_query, &mut answer_values).unwrap();
+    let answer_matrix = AnswerMatrix::from_parts(
+        encrypted.instance_id(),
+        encrypted_query.query_id(),
+        answer_values,
+        rows,
+        blocks,
+    );
     let mut output = vec![zero; rows];
-    group.bench_function(BenchmarkId::new("toeplitz_into", rows), |b| {
+    group.throughput(elements(rows * blocks));
+    group.bench_function(BenchmarkId::from_parameter(rows), |b| {
         b.iter(|| {
             decode_into(
                 black_box(&answer_matrix),
@@ -268,7 +297,9 @@ fn protocol_benches(c: &mut Criterion) {
     {
         let mut derive_group = c.benchmark_group("derive");
         for &rows in &DERIVE_ROW_COUNTS {
-            bench_derive(&mut derive_group, rows);
+            bench_derive_for(&mut derive_group, "toeplitz", rows, toeplitz_block);
+            bench_derive_for(&mut derive_group, "raa", rows, raa_block);
+            bench_derive_for(&mut derive_group, "ring", rows, ring_block);
         }
         derive_group.finish();
     }
@@ -276,10 +307,9 @@ fn protocol_benches(c: &mut Criterion) {
     {
         let mut encrypt_group = c.benchmark_group("encrypt");
         for &rows in &CLIENT_ROW_COUNTS {
-            bench_encrypt(&mut encrypt_group, rows);
-        }
-        for &rows in &[128, 1025] {
-            bench_raa_encrypt(&mut encrypt_group, rows);
+            bench_encrypt_for(&mut encrypt_group, "toeplitz", rows, toeplitz_block);
+            bench_encrypt_for(&mut encrypt_group, "raa", rows, raa_block);
+            bench_encrypt_for(&mut encrypt_group, "ring", rows, ring_block);
         }
         encrypt_group.finish();
     }
@@ -287,18 +317,22 @@ fn protocol_benches(c: &mut Criterion) {
     {
         let mut query_group = c.benchmark_group("query");
         for &rows in &CLIENT_ROW_COUNTS {
-            bench_query(&mut query_group, rows);
-        }
-        for &rows in &[128, 1025] {
-            bench_raa_query(&mut query_group, rows);
+            bench_query_for(&mut query_group, "toeplitz", rows, toeplitz_block);
+            bench_query_for(&mut query_group, "raa", rows, raa_block);
+            bench_query_for(&mut query_group, "ring", rows, ring_block);
         }
         query_group.finish();
     }
 
     {
         let mut answer_group = c.benchmark_group("answer");
-        for &rows in &ANSWER_ROW_COUNTS {
+        for &rows in &SERVER_ROW_COUNTS {
             bench_answer(&mut answer_group, rows);
+        }
+        if common::calibration_enabled() {
+            for &rows in &ANSWER_CALIBRATION_ROW_COUNTS {
+                bench_answer(&mut answer_group, rows);
+            }
         }
         answer_group.finish();
     }

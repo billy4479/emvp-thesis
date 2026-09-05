@@ -31,22 +31,6 @@ fn plan_construction(c: &mut Criterion) {
     group.finish();
 }
 
-fn plan_cloning(c: &mut Criterion) {
-    let mut group = c.benchmark_group("ntt_plan_clone");
-    for length in [256, 4_096, 65_536] {
-        let plan = NttPlan::<998_244_353>::new(length).unwrap();
-        let tight_plan = NttPlan::<2_013_265_921>::new(length).unwrap();
-        group.throughput(Throughput::Elements(length as u64));
-        group.bench_function(BenchmarkId::new("p998244353", length), |b| {
-            b.iter(|| black_box(black_box(&plan).clone()));
-        });
-        group.bench_function(BenchmarkId::new("p2013265921", length), |b| {
-            b.iter(|| black_box(black_box(&tight_plan).clone()));
-        });
-    }
-    group.finish();
-}
-
 fn transforms_for_modulus<const MODULUS: u32>(c: &mut Criterion, length: usize) {
     let mut group = c.benchmark_group(format!("ntt_cached_p{MODULUS}"));
     common::tune_group(
@@ -130,17 +114,6 @@ fn bench_linear(
     group.bench_function(
         BenchmarkId::new("linear_free_auto_dispatch", transform_length),
         |b| b.iter(|| linear_convolution::<998_244_353>(black_box(lhs), black_box(rhs)).unwrap()),
-    );
-    group.bench_function(
-        BenchmarkId::new("linear_ntt_setup_inclusive", transform_length),
-        |b| {
-            b.iter(|| {
-                NttPlan::<998_244_353>::new(transform_length)
-                    .unwrap()
-                    .linear_convolution(black_box(lhs), black_box(rhs))
-                    .unwrap()
-            });
-        },
     );
     group.bench_function(
         BenchmarkId::new(
@@ -266,6 +239,6 @@ fn fixed_operand_convolutions(c: &mut Criterion) {
 criterion_group! {
     name = benches;
     config = common::criterion_tuned(20, Duration::from_secs(1), Duration::from_secs(2));
-    targets = plan_construction, plan_cloning, transforms, convolutions, fixed_operand_convolutions
+    targets = plan_construction, transforms, convolutions, fixed_operand_convolutions
 }
 criterion_main!(benches);

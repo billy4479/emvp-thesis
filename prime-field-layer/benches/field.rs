@@ -12,20 +12,6 @@ use criterion::{
 };
 use prime_field_layer::PrimeField;
 
-fn bench_construction<const MODULUS: u32>(group: &mut BenchmarkGroup<'_, WallTime>) {
-    group.bench_function(BenchmarkId::from_parameter(MODULUS), |b| {
-        b.iter(|| black_box(PrimeField::<MODULUS>::new()));
-    });
-}
-
-fn construction(c: &mut Criterion) {
-    let mut group = c.benchmark_group("construction");
-    bench_construction::<65_537>(&mut group);
-    bench_construction::<998_244_353>(&mut group);
-    bench_construction::<4_294_967_291>(&mut group);
-    group.finish();
-}
-
 fn bench_scalar<const MODULUS: u32>(group: &mut BenchmarkGroup<'_, WallTime>) {
     let field = PrimeField::<MODULUS>::new();
     let lhs = MODULUS - 2;
@@ -190,6 +176,6 @@ fn batch_inversion(c: &mut Criterion) {
 criterion_group! {
     name = benches;
     config = common::criterion_default();
-    targets = construction, scalar, bulk, batch_inversion
+    targets = scalar, bulk, batch_inversion
 }
 criterion_main!(benches);

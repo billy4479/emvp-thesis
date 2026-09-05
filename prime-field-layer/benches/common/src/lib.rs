@@ -19,6 +19,24 @@ pub fn skip_in_quick_mode(target: &str) -> bool {
     }
 }
 
+/// One-time threshold studies (schoolbook/dense crossovers, thread-count
+/// boundaries) that do not need re-running on every suite invocation.
+const CALIBRATION_ENV: &str = "EMVP_BENCH_CALIBRATION";
+
+#[must_use]
+pub fn calibration_enabled() -> bool {
+    std::env::var_os(CALIBRATION_ENV).is_some_and(|value| value == "1")
+}
+
+pub fn skip_calibration(target: &str) -> bool {
+    if calibration_enabled() {
+        false
+    } else {
+        println!("skipping `{target}` calibration (set {CALIBRATION_ENV}=1 to run)");
+        true
+    }
+}
+
 pub fn values(length: usize, modulus: u32, offset: u64) -> Vec<u32> {
     (0..length)
         .map(|index| ((index as u64 * 2_654_435_761 + offset) % u64::from(modulus)) as u32)

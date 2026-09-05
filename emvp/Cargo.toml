@@ -15,6 +15,7 @@ trapdoor-matrices = { path = "../trapdoor-matrices" }
 
 [dev-dependencies]
 allocation-counter = { workspace = true }
+bench-common = { path = "../prime-field-layer/benches/common" }
 criterion = { workspace = true }
 proptest = { workspace = true }
 

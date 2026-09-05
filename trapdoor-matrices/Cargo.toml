@@ -18,6 +18,7 @@ rand_core = { workspace = true }
 
 [dev-dependencies]
 allocation-counter = { workspace = true }
+bench-common = { path = "../prime-field-layer/benches/common" }
 criterion = { workspace = true }
 proptest = { workspace = true }
 rand_chacha = { workspace = true }
