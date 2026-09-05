@@ -338,8 +338,9 @@ fn full_toeplitz_product_matches_hand_composition_materialization_and_linearity(
     assert_eq!(scratch.transform_length(), 16);
 
     let materialized = product.materialize().unwrap();
-    let expected_matrix =
-        materialize_oracle(3, 1_073_479_681, |basis| fast_product_oracle(&product, basis));
+    let expected_matrix = materialize_oracle(3, 1_073_479_681, |basis| {
+        fast_product_oracle(&product, basis)
+    });
     assert_eq!(values(materialized.values()), expected_matrix);
     let mut dense_output = elements(&[0; 3]);
     materialized
@@ -349,7 +350,8 @@ fn full_toeplitz_product_matches_hand_composition_materialization_and_linearity(
 
     let x = [10, 20, 30];
     let y = [7, 11, 13];
-    let x_plus_y: [u32; 3] = std::array::from_fn(|index| add_mod(x[index], y[index], 1_073_479_681));
+    let x_plus_y: [u32; 3] =
+        std::array::from_fn(|index| add_mod(x[index], y[index], 1_073_479_681));
     let rx = fast_product_oracle(&product, &x);
     let ry = fast_product_oracle(&product, &y);
     let expected_sum: Vec<_> = rx

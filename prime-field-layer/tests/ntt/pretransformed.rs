@@ -43,7 +43,10 @@ fn pretransformed_linear_operand_matches_convenience_api_and_reuses_scratch() {
     prepared
         .convolve(&second, &mut second_output, &mut workspace)
         .unwrap();
-    assert_eq!(second_output, oracle_linear::<1_073_479_681>(&fixed, &second));
+    assert_eq!(
+        second_output,
+        oracle_linear::<1_073_479_681>(&fixed, &second)
+    );
 }
 
 #[test]
