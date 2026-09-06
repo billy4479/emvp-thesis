@@ -18,9 +18,7 @@ use prime_field_layer::{FieldElement, PrimeField};
 use rand_chacha::ChaCha20Rng;
 use rand_core::SeedableRng;
 use rayon::{ThreadPool, ThreadPoolBuilder, prelude::*};
-use trapdoor_matrices::{
-    IrreducibleRingLpn, RaaWeightedProduct, SparseMatrix, ToeplitzFastProduct,
-};
+use trapdoor_matrices::{IrreducibleRingLpn, RaaWeightedProduct, ToeplitzFastProduct};
 
 // NTT-friendly prime: 1_073_479_681 - 1 is divisible by 2^18.
 const MODULUS: u32 = 1_073_479_681;
@@ -138,42 +136,18 @@ fn raa_block(
     Ok(RaaWeightedProduct::sample_nonzero(params.n()?, 3, stream)?)
 }
 
-// One square `n x n` Ring-LPN mask block. The sparse secret keeps a fixed
-// column weight, and the monic binomial modulus is benchmark input, not an
-// irreducibility claim; the unchecked constructor isolates block sampling
-// from an impractical irreducibility search at degree n.
+// One square `n x n` Ring-LPN mask block with a fixed-weight secret, built
+// by the shared deterministic test/benchmark builder.
 fn ring_block(
     params: EmvpParams,
     stream: &mut ChaCha20Rng,
     _index: usize,
 ) -> Result<IrreducibleRingLpn<MODULUS>, ProtocolError> {
     let n = params.n()?;
-    let field = PrimeField::<MODULUS>::new();
-    let multiplier: Vec<u32> = (0..n)
-        .map(|_| field.sample_uniform(stream).value())
-        .collect();
-    let rows = 2 * n;
-    let target_weight = TARGET_COLUMN_WEIGHT.min(n);
-    let mut offsets = Vec::with_capacity(n + 1);
-    let mut row_indices = Vec::with_capacity(n * target_weight);
-    let mut values = Vec::with_capacity(n * target_weight);
-    offsets.push(0);
-    for column in 0..n {
-        for entry in 0..target_weight {
-            row_indices.push((17 * column + entry) % rows);
-            values.push(field.sample_uniform_nonzero(stream));
-        }
-        offsets.push(row_indices.len());
-    }
-    let sparse = SparseMatrix::new(rows, n, offsets, row_indices, values)?;
-    let mut modulus = vec![0; n + 1];
-    modulus[0] = MODULUS - 3;
-    modulus[n] = 1;
-    Ok(IrreducibleRingLpn::new_unchecked_irreducible(
+    Ok(trapdoor_matrices::testing::ring_block::<MODULUS, _>(
         n,
-        &modulus,
-        &multiplier,
-        sparse,
+        TARGET_COLUMN_WEIGHT.min(n),
+        stream,
     )?)
 }
 

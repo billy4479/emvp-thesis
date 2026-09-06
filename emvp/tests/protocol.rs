@@ -11,9 +11,7 @@ use emvp::{
 use prime_field_layer::{FieldElement, PrimeField};
 use rand_chacha::ChaCha20Rng;
 use rand_core::SeedableRng;
-use trapdoor_matrices::{
-    DenseMatrix, IrreducibleRingLpn, RaaWeightedProduct, SparseMatrix, ToeplitzFastProduct,
-};
+use trapdoor_matrices::{DenseMatrix, IrreducibleRingLpn, RaaWeightedProduct, ToeplitzFastProduct};
 
 // NTT-friendly prime: 1_073_479_681 - 1 is divisible by 2^18.
 const MODULUS: u32 = 1_073_479_681;
@@ -53,40 +51,14 @@ fn raa_block(
 }
 
 // A square `n x n` Ring-LPN mask block for the test parameters, where
-// `n = 2k = 16`. The sparse secret `E` has a fixed small column weight.
+// `n = 2k = 16`. The sparse secret `E` has a fixed small column weight,
+// built by the shared deterministic test/benchmark builder.
 fn ring_block(
     stream: &mut ChaCha20Rng,
     _index: usize,
 ) -> Result<IrreducibleRingLpn<MODULUS>, ProtocolError> {
-    let n = 16;
-    let field = field();
-    let multiplier: Vec<u32> = (0..n)
-        .map(|_| field.sample_uniform(stream).value())
-        .collect();
-    let rows = 2 * n;
-    let target_weight = 4;
-    let mut offsets = Vec::with_capacity(n + 1);
-    let mut row_indices = Vec::with_capacity(n * target_weight);
-    let mut values = Vec::with_capacity(n * target_weight);
-    offsets.push(0);
-    for column in 0..n {
-        for entry in 0..target_weight {
-            row_indices.push((17 * column + entry) % rows);
-            values.push(field.sample_uniform_nonzero(stream));
-        }
-        offsets.push(row_indices.len());
-    }
-    let sparse = SparseMatrix::new(rows, n, offsets, row_indices, values)?;
-    // This monic binomial is test input, not an irreducibility claim: the
-    // unchecked constructor skips an impractical irreducibility search.
-    let mut modulus = vec![0; n + 1];
-    modulus[0] = MODULUS - 3;
-    modulus[n] = 1;
-    Ok(IrreducibleRingLpn::new_unchecked_irreducible(
-        n,
-        &modulus,
-        &multiplier,
-        sparse,
+    Ok(trapdoor_matrices::testing::ring_block::<MODULUS, _>(
+        16, 4, stream,
     )?)
 }
 

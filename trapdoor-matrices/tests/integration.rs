@@ -3,13 +3,15 @@
     reason = "fixed test fixtures establish that construction and evaluation must succeed"
 )]
 
-use prime_field_layer::{ExtensionFieldError, FieldElement, FieldError, PrimeField};
+use prime_field_layer::{
+    ExtensionField, ExtensionFieldError, FieldElement, FieldError, PrimeField,
+};
 use proptest::prelude::*;
 use rand_chacha::ChaCha20Rng;
 use rand_core::SeedableRng;
 use trapdoor_matrices::{
-    DenseMatrix, IrreducibleRingLpn, Permutation, RaaWeightedProduct, SparseMatrix, TdmError,
-    ToeplitzFastProduct, ToeplitzMap,
+    DenseMatrix, IrreducibleRingLpn, ParameterWarning, Permutation, RaaWeightedProduct,
+    SparseMatrix, TdmError, ToeplitzFastProduct, ToeplitzMap, automatic_ring_modulus,
 };
 
 fn elements<const MODULUS: u32>(values: &[u32]) -> Vec<FieldElement<MODULUS>> {
@@ -580,49 +582,116 @@ fn ring_lpn_duplicate_sparse_rows_accumulate_independently() {
 }
 
 #[test]
-fn ring_lpn_sampling_handles_probability_edges_and_is_reproducible() {
+fn ring_lpn_sampling_is_reproducible_and_respects_weight_bounds() {
     let modulus = [1, 3, 0, 1];
-    let mut zero_rng = ChaCha20Rng::from_seed([31; 32]);
     let k = 3;
-    let zero = IrreducibleRingLpn::<17>::sample(k, &modulus, 0, 7, &mut zero_rng).unwrap();
-    assert_eq!(zero.nnz(), 0);
-    assert_eq!(zero.sparse_matrix().column_offsets(), [0, 0, 0, 0]);
-
-    let mut full_rng = ChaCha20Rng::from_seed([37; 32]);
-    let full = IrreducibleRingLpn::<17>::sample(k, &modulus, 7, 7, &mut full_rng).unwrap();
-    assert_eq!(full.nnz(), 18);
-    assert_eq!(full.sparse_matrix().column_offsets(), [0, 6, 12, 18]);
-    assert_eq!(
-        full.sparse_matrix().row_indices(),
-        [0, 1, 2, 3, 4, 5, 0, 1, 2, 3, 4, 5, 0, 1, 2, 3, 4, 5]
-    );
-    assert!(
-        full.sparse_matrix()
-            .values()
-            .iter()
-            .all(|value| value.value() != 0)
-    );
 
     let mut first_rng = ChaCha20Rng::from_seed([41; 32]);
     let mut second_rng = ChaCha20Rng::from_seed([41; 32]);
-    let first = IrreducibleRingLpn::<17>::sample(k, &modulus, 2, 5, &mut first_rng).unwrap();
-    let second = IrreducibleRingLpn::<17>::sample(k, &modulus, 2, 5, &mut second_rng).unwrap();
-    assert_eq!(first.multiplier(), second.multiplier());
-    assert_eq!(first.sparse_matrix(), second.sparse_matrix());
+    let first =
+        IrreducibleRingLpn::<17>::sample_with_modulus(k, 2, &modulus, &mut first_rng).unwrap();
+    let second =
+        IrreducibleRingLpn::<17>::sample_with_modulus(k, 2, &modulus, &mut second_rng).unwrap();
+    assert_eq!(
+        first.instance().multiplier(),
+        second.instance().multiplier()
+    );
+    assert_eq!(
+        first.instance().sparse_matrix(),
+        second.instance().sparse_matrix()
+    );
 
-    let mut invalid_rng = ChaCha20Rng::from_seed([43; 32]);
+    let mut zero_rng = ChaCha20Rng::from_seed([31; 32]);
     assert!(matches!(
-        IrreducibleRingLpn::<17>::sample(k, &modulus, 1, 0, &mut invalid_rng),
-        Err(TdmError::InvalidProbability {
-            numerator: 1,
-            denominator: 0
+        IrreducibleRingLpn::<17>::sample_with_modulus(k, 0, &modulus, &mut zero_rng),
+        Err(TdmError::ZeroDimension("column weight"))
+    ));
+
+    let mut oversized_rng = ChaCha20Rng::from_seed([43; 32]);
+    assert!(matches!(
+        IrreducibleRingLpn::<17>::sample_with_modulus(k, 4, &modulus, &mut oversized_rng),
+        Err(TdmError::WeightExceedsColumns {
+            weight: 4,
+            maximum: 3
         })
     ));
+}
+
+#[test]
+fn ring_lpn_sampling_never_produces_empty_columns() {
+    let modulus = automatic_ring_modulus::<17>(8).unwrap();
+    let k = 8;
+    // With weight one over sixteen rows, a Bernoulli column is empty with
+    // probability about (15/16)^16 ~= 0.36, so this exercises resampling.
+    for domain in 1..8u8 {
+        let mut rng = ChaCha20Rng::from_seed([domain; 32]);
+        let sampled =
+            IrreducibleRingLpn::<17>::sample_with_modulus(k, 1, &modulus, &mut rng).unwrap();
+        let offsets = sampled.instance().sparse_matrix().column_offsets();
+        assert!(offsets.windows(2).all(|pair| pair[0] < pair[1]));
+        assert!(
+            sampled
+                .instance()
+                .sparse_matrix()
+                .values()
+                .iter()
+                .all(|value| value.value() != 0)
+        );
+    }
+}
+
+#[test]
+fn ring_lpn_automatic_sampling_proves_its_modulus_and_reports_assessment() {
+    // F_17 has two-adicity four, so k = 4 gets an irreducible binomial.
+    let mut rng = ChaCha20Rng::from_seed([47; 32]);
+    let sampled = IrreducibleRingLpn::<17>::sample(4, 2, &mut rng).unwrap();
+    let modulus = sampled.instance().modulus();
+    assert_eq!(modulus.len(), 5);
+    assert_eq!(modulus[4], 1);
+    assert!(modulus[1..4].iter().all(|&coefficient| coefficient == 0));
+    assert!(modulus[0] > 0 && modulus[0] < 17);
+    // The analytic proof is confirmed here by Rabin's independent test.
+    ExtensionField::<17>::new(4, modulus).unwrap();
+    // Tiny parameters still construct but are reported as broken: the ring
+    // degree, the plausibility weight, the decoding estimate, and the
+    // enumeration estimate all fail their floors at k = 4.
+    assert_eq!(sampled.warnings().len(), 4);
     assert!(matches!(
-        IrreducibleRingLpn::<17>::sample(k, &modulus, 6, 5, &mut invalid_rng),
-        Err(TdmError::InvalidProbability {
-            numerator: 6,
-            denominator: 5
+        sampled.warnings()[0],
+        ParameterWarning::RingDegreeBelowFloor { .. }
+    ));
+
+    // Determinism: the same seed yields the same instance.
+    let mut first_rng = ChaCha20Rng::from_seed([47; 32]);
+    let first = IrreducibleRingLpn::<17>::sample(4, 2, &mut first_rng).unwrap();
+    assert_eq!(
+        first.instance().sparse_matrix(),
+        sampled.instance().sparse_matrix()
+    );
+    assert_eq!(
+        first.instance().multiplier(),
+        sampled.instance().multiplier()
+    );
+    assert_eq!(first.warnings(), sampled.warnings());
+}
+
+#[test]
+fn ring_lpn_automatic_sampling_rejects_unsupported_shapes() {
+    let mut rng = ChaCha20Rng::from_seed([53; 32]);
+    // Non-power-of-two degree has no automatic binomial.
+    assert!(matches!(
+        IrreducibleRingLpn::<17>::sample(3, 1, &mut rng),
+        Err(TdmError::AutomaticModulusUnsupported {
+            modulus: 17,
+            degree: 3
+        })
+    ));
+    // F_2 has two-adicity zero.
+    assert!(matches!(
+        IrreducibleRingLpn::<2>::sample(4, 1, &mut rng),
+        Err(TdmError::AutomaticModulusUnsupported {
+            modulus: 2,
+            degree: 4
         })
     ));
 }

@@ -42,31 +42,21 @@ fn elements(count: usize) -> Throughput {
 
 fn ring_inputs(k: usize) -> (Box<[u32]>, Box<[u32]>, SparseMatrix<MODULUS>) {
     let field = PrimeField::<MODULUS>::new();
-    let mut rng = seeded_rng(0x31, k);
     let multiplier = (0..k)
-        .map(|_| field.sample_uniform(&mut rng).value())
+        .map(|_| field.sample_uniform(&mut seeded_rng(0x31, k)).value())
         .collect::<Box<[u32]>>();
-    let rows = 2 * k;
     let target_weight = k.min(TARGET_COLUMN_WEIGHT);
-    let mut offsets = Vec::with_capacity(k + 1);
-    let mut row_indices = Vec::with_capacity(k * target_weight);
-    let mut values = Vec::with_capacity(k * target_weight);
-    offsets.push(0);
-    for column in 0..k {
-        for entry in 0..target_weight {
-            row_indices.push((17 * column + entry) % rows);
-            values.push(field.sample_uniform_nonzero(&mut rng));
-        }
-        offsets.push(row_indices.len());
-    }
-    let sparse = SparseMatrix::new(rows, k, offsets, row_indices, values).unwrap();
+    let sparse = trapdoor_matrices::testing::fixed_weight_sparse::<MODULUS, _>(
+        k,
+        target_weight,
+        &mut seeded_rng(0x31, k),
+    )
+    .unwrap();
 
-    // This monic polynomial is benchmark input, not an irreducibility claim.
-    // The unchecked API isolates construction cost from an impractical search
-    // for checked degree-64 and degree-256 modulus polynomials.
-    let mut modulus = vec![0; k + 1].into_boxed_slice();
-    modulus[0] = MODULUS - 3;
-    modulus[k] = 1;
+    // The automatic binomial modulus is irreducible by the binomial
+    // criterion, so the unchecked constructor is sound here and isolates
+    // construction cost from Rabin's irreducibility search.
+    let modulus = trapdoor_matrices::automatic_ring_modulus::<MODULUS>(k).unwrap();
     (modulus, multiplier, sparse)
 }
 

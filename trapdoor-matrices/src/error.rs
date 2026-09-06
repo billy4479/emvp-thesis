@@ -21,6 +21,18 @@ pub enum TdmError {
     SamplingRangeTooLarge { upper_bound: usize },
     /// A Bernoulli numerator exceeded its nonzero denominator.
     InvalidProbability { numerator: u32, denominator: u32 },
+    /// A requested expected column weight exceeded the supported maximum.
+    WeightExceedsColumns { weight: usize, maximum: usize },
+    /// The base field for automatic modulus selection is composite.
+    ModulusNotPrime { modulus: u32 },
+    /// No automatic irreducible modulus exists for this field and degree.
+    ///
+    /// Automatic selection needs a prime field with two-adicity at least
+    /// two and a power-of-two extension degree. Use the explicit-modulus
+    /// constructor for anything else.
+    AutomaticModulusUnsupported { modulus: u32, degree: usize },
+    /// Bernoulli sampling kept producing empty columns.
+    SamplingRetryBudgetExhausted { retries: usize },
     /// Sparse column offsets were malformed.
     InvalidSparseOffsets,
     /// A sparse row index was outside the matrix.
@@ -64,6 +76,23 @@ impl fmt::Display for TdmError {
             } => write!(
                 formatter,
                 "invalid Bernoulli probability {numerator}/{denominator}"
+            ),
+            Self::WeightExceedsColumns { weight, maximum } => write!(
+                formatter,
+                "expected column weight {weight} exceeds the supported maximum {maximum}"
+            ),
+            Self::ModulusNotPrime { modulus } => {
+                write!(formatter, "modulus {modulus} is not prime")
+            }
+            Self::AutomaticModulusUnsupported { modulus, degree } => write!(
+                formatter,
+                "no automatic irreducible modulus for field {modulus} at degree {degree}: \
+                 the field needs two-adicity at least two and the degree must be a \
+                 power of two; supply a modulus explicitly instead"
+            ),
+            Self::SamplingRetryBudgetExhausted { retries } => write!(
+                formatter,
+                "Bernoulli sampling produced an empty column in {retries} attempts"
             ),
             Self::InvalidSparseOffsets => {
                 formatter.write_str("sparse column offsets are malformed")
