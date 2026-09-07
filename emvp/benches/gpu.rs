@@ -15,12 +15,32 @@
 //! (derive + encrypt + queries) and the one-time matrix upload happen before
 //! timing; every measured iteration is one full `answer_batch`. Without a
 //! compute adapter the binary prints a notice and benchmarks nothing.
+//!
+//! # Case IDs and filters
+//!
+//! Each `(batch, rows)` size runs three cases under the `gpu_answer` group:
+//! `gpu_answer/gpu/batchB-rowsR` (device answer path),
+//! `gpu_answer/cpu/batchB-rowsR` (CPU reference on the same shapes), and
+//! `gpu_answer/phase/batchB-rowsR` (the same device path with the
+//! host-side [`PhaseTimings`] breakdown printed after the criterion table).
+//!
+//! The criterion `--` filter is a regular expression over full case IDs, so
+//! one filter selects the whole paired suite in a single run:
+//!
+//! ```text
+//! cargo bench -p emvp --features gpu -- 'gpu_answer/(gpu|cpu|phase)'
+//! ```
+//!
+//! Plain `-- gpu` matches only the `gpu_answer/gpu/*` cases because the
+//! existing `cpu` and `phase` IDs intentionally do not contain the string
+//! "gpu" — the `gpu` and `cpu` IDs are kept verbatim so criterion baselines
+//! saved by earlier validation runs still resolve.
 
 use std::time::Duration;
 
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use emvp::{
-    DerivedState, EmvpParams, EncryptedMatrix, EncryptedQuery, GpuAnswerer, GpuError,
+    DerivedState, EmvpParams, EncryptedMatrix, EncryptedQuery, GpuAnswerer, GpuError, PhaseTimings,
     ProtocolError, SecretKey, answer_batch, encrypt, query,
 };
 use prime_field_layer::{FieldElement, PrimeField};
@@ -102,6 +122,39 @@ fn protocol_fixtures_batch(
     (encrypted, queries)
 }
 
+/// Accessor for one [`PhaseTimings`] phase field.
+type PhaseAccessor = fn(&PhaseTimings) -> Duration;
+
+/// Prints the host-side phase breakdown a `phase` case collected across all
+/// of its measured iterations.
+fn print_phase_breakdown(batch: usize, rows: usize, samples: &[PhaseTimings]) {
+    if samples.is_empty() {
+        return;
+    }
+    let phases: [(&str, PhaseAccessor); 6] = [
+        ("prepare_buffers", |timings| timings.prepare_buffers),
+        ("encode_upload_queries", |timings| {
+            timings.encode_upload_queries
+        }),
+        ("dispatch_submit", |timings| timings.dispatch_submit),
+        ("wait_readback", |timings| timings.wait_readback),
+        ("reconstruct", |timings| timings.reconstruct),
+        ("total", PhaseTimings::total),
+    ];
+    println!(
+        "phase breakdown gpu_answer/phase/batch{batch}-rows{rows} over {} calls (median | mean):",
+        samples.len()
+    );
+    for (name, accessor) in phases {
+        let mut values: Vec<Duration> = samples.iter().map(accessor).collect();
+        values.sort();
+        let median = values[values.len() / 2];
+        let mean =
+            values.iter().sum::<Duration>() / u32::try_from(values.len()).unwrap_or(u32::MAX);
+        println!("  {name:<24}{median:.3?} | {mean:.3?}");
+    }
+}
+
 fn gpu_benches(c: &mut Criterion) {
     let answerer = match GpuAnswerer::new_sync() {
         Ok(answerer) => answerer,
@@ -123,14 +176,31 @@ fn gpu_benches(c: &mut Criterion) {
         // One-time upload; the measured GPU iterations reuse the
         // device-resident matrix.
         let gpu_matrix = answerer.upload_matrix_sync(&PARAMS, &encrypted).unwrap();
-        let elements = batch * rows * PARAMS.n().unwrap();
-        group.throughput(Throughput::Elements(u64::try_from(elements).unwrap()));
+        let elements = u64::try_from(batch * rows * PARAMS.n().unwrap()).unwrap();
+        group.throughput(Throughput::Elements(elements));
         group.bench_function(
             BenchmarkId::new("gpu", format!("batch{batch}-rows{rows}")),
             |b| {
                 b.iter(|| answerer.answer_batch_sync(&gpu_matrix, &queries).unwrap());
             },
         );
+        // The same device path instrumented with the host-side phase
+        // breakdown; the criterion number is the same wall time as the
+        // `gpu` case and the block printed afterwards attributes it to the
+        // phases of `PhaseTimings`.
+        let mut phase_samples: Vec<PhaseTimings> = Vec::new();
+        group.bench_function(
+            BenchmarkId::new("phase", format!("batch{batch}-rows{rows}")),
+            |b| {
+                b.iter(|| {
+                    let (_answers, timings) = answerer
+                        .answer_batch_sync_with_timings(&gpu_matrix, &queries)
+                        .unwrap();
+                    phase_samples.push(timings);
+                });
+            },
+        );
+        print_phase_breakdown(batch, rows, &phase_samples);
         drop(gpu_matrix);
         // CPU reference on the rayon global pool, matching the huge
         // answer_batch cases in benches/protocol.rs.

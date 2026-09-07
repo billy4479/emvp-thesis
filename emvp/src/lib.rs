@@ -26,7 +26,7 @@ pub mod protocol;
 
 pub use code::{CodeError, CyclicCodeScratch, CyclicDualCode};
 #[cfg(feature = "gpu")]
-pub use gpu::{GpuAnswerer, GpuEncryptedMatrix, GpuError};
+pub use gpu::{GpuAnswerer, GpuEncryptedMatrix, GpuError, PhaseTimings};
 pub use mask::{MaskError, RowStackMask, TdmMask};
 pub use params::{
     EmvpParams, POW_MAX_LAMBDA, PROTOCOL_MAX_LAMBDA, ParamsError, pow_ge_pow2, search,

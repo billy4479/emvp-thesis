@@ -13,6 +13,8 @@
 //! on GPU-less machines; on the reference machine it proves the WGSL kernel
 //! bit-identical to the CPU `answer_batch`.
 
+use std::time::Duration;
+
 use emvp::{
     DerivedState, EmvpParams, EncryptedMatrix, EncryptedQuery, GpuAnswerer, GpuError,
     ProtocolError, SecretKey, answer_batch, encrypt, query,
@@ -199,6 +201,62 @@ fn gpu_answer_golden_words_match_the_reference_path() -> Result<(), GpuError> {
         let words: Vec<u32> = answer.values().iter().map(|value| value.to_raw()).collect();
         assert_eq!(words, *expected_words);
     }
+    Ok(())
+}
+
+#[test]
+fn gpu_answer_reuses_scratch_buffers_across_shapes() -> Result<(), GpuError> {
+    let Some(answerer) = gpu_answerer()? else {
+        return Ok(());
+    };
+    // First shape allocates the leased scratch set.
+    assert_gpu_matches_cpu(&answerer, &protocol_fixture::<MODULUS>(8, 8, 2, 5, 2, 0x60));
+    // More rows and a bigger batch grow both reused capacities in place:
+    // the answer buffers are replaced, the set is leased again afterwards.
+    assert_gpu_matches_cpu(
+        &answerer,
+        &protocol_fixture::<MODULUS>(8, 8, 2, 37, 4, 0x61),
+    );
+    // A smaller batch afterwards must reuse the grown buffers untouched and
+    // stay bit-identical to the CPU path; stale words from the previous,
+    // larger batch beyond the live slice must not leak into the answers.
+    assert_gpu_matches_cpu(&answerer, &protocol_fixture::<MODULUS>(8, 8, 2, 9, 1, 0x62));
+    // A second matrix instance against the same pooled buffers.
+    assert_gpu_matches_cpu(
+        &answerer,
+        &protocol_fixture::<MODULUS>(8, 8, 2, 12, 3, 0x63),
+    );
+    Ok(())
+}
+
+#[test]
+fn gpu_answer_timings_report_every_phase() -> Result<(), GpuError> {
+    let Some(answerer) = gpu_answerer()? else {
+        return Ok(());
+    };
+    let fixture = protocol_fixture::<MODULUS>(8, 8, 2, 4, 2, 0x64);
+    let gpu_matrix = answerer
+        .upload_matrix_sync(&fixture.params, &fixture.encrypted)
+        .unwrap();
+    let (gpu, timings) = answerer
+        .answer_batch_sync_with_timings(&gpu_matrix, &fixture.queries)
+        .unwrap();
+    let cpu = answer_batch(&fixture.params, &fixture.encrypted, &fixture.queries).unwrap();
+    assert_eq!(gpu.len(), cpu.len());
+    for (gpu_answer, cpu_answer) in gpu.iter().zip(&cpu) {
+        assert_eq!(gpu_answer, cpu_answer);
+    }
+    // A blocking call pays the wait phase at minimum, and the reported
+    // total must reflect real elapsed host time.
+    assert!(timings.wait_readback > Duration::ZERO);
+    assert_eq!(
+        timings.total(),
+        timings.prepare_buffers
+            + timings.encode_upload_queries
+            + timings.dispatch_submit
+            + timings.wait_readback
+            + timings.reconstruct
+    );
     Ok(())
 }
 

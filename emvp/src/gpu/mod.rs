@@ -15,8 +15,8 @@
 //! Montgomery residue `a * 2^32 mod p`. The WGSL kernel in
 //! [`ANSWER_WGSL`] reproduces the crate's Montgomery multiplication (REDC)
 //! on those raw words, so uploads and readbacks move the words as-is:
-//! [`GpuAnswerer::upload_matrix`] copies the raw words out of the encrypted
-//! matrix, and [`GpuAnswerer::answer_batch`] wraps the returned words with
+//! [`GpuAnswerer::upload_matrix`] streams the raw words into the device
+//! buffer, and [`GpuAnswerer::answer_batch`] wraps the returned words with
 //! [`prime_field_layer::FieldElement::from_raw`]. The results are
 //! bit-identical to the CPU [`answer_batch`](crate::answer_batch), which
 //! remains the reference implementation; the parity tests in
@@ -44,17 +44,36 @@
 //! row-major encrypted matrix into a device-side storage buffer held by the
 //! returned [`GpuEncryptedMatrix`]. [`answer_batch`] then uploads the
 //! query batch, dispatches one thread per output element, and reads the
-//! answers back through a staging buffer. The upload path converts
-//! [`FieldElement`] words with a safe element-wise copy (the workspace
-//! denies `unsafe` and the copy is dwarfed by the `PCIe` transfer); the same
-//! applies to the little-endian byte staging, because all wgpu-supported
-//! hosts are little-endian.
+//! answers back through a staging buffer.
+//!
+//! The per-batch device buffers (queries, uniform, output, staging
+//! readback) are not created per call: each batch pops a scratch set from
+//! a pool inside the answerer, grows it only when the batch exceeds every
+//! shape the set has ever served, and pushes it back when the call
+//! completes. A batch that errors discards its set instead, which only
+//! costs the next call a fresh allocation. A set's capacities never shrink,
+//! so a server answering steady shapes allocates device memory once.
+//! Batches that run concurrently pop distinct sets, so the pool grows to
+//! the concurrency level and stays there. Uploads go through `Queue::write_buffer_with` staging views, so
+//! the `FieldElement::to_raw` word pass, the little-endian byte conversion,
+//! and the staging copy are fused into a single pass with no intermediate
+//! allocation (all wgpu-supported hosts are little-endian, and the
+//! workspace denies `unsafe`). Readbacks map only the live slice of the
+//! staging buffer, and the per-query answer vectors are reconstructed in
+//! one pass over the mapped bytes.
+//!
+//! # Phase timings
+//!
+//! [`GpuAnswerer::answer_batch_with_timings`] (and its `_sync` form)
+//! reports the host-side wall-clock breakdown of a batch in
+//! [`PhaseTimings`]; the `gpu_answer/phase/*` benchmark cases in
+//! `emvp/benches/gpu.rs` print the breakdown next to the totals.
 //!
 //! The `answer_*_sync` wrappers block the calling thread with
 //! [`pollster`]; the async methods exist so servers can integrate with
 //! async executors, but note that the device wait inside
-//! [`GpuAnswerer::answer_batch`] is itself a blocking poll, so latency-
-//! sensitive executors should run the future on a blocking thread.
+//! [`GpuAnswerer::answer_batch_with_timings`] is itself a blocking poll, so
+//! latency-sensitive executors should run the future on a blocking thread.
 //!
 //! # Errors
 //!
@@ -71,7 +90,8 @@
 
 use std::collections::HashMap;
 use std::fmt;
-use std::sync::Mutex;
+use std::sync::{Mutex, MutexGuard};
+use std::time::{Duration, Instant};
 
 use prime_field_layer::{FieldElement, PrimeField};
 
@@ -88,8 +108,15 @@ const WORKGROUP_SIZE: u32 = 256;
 /// [`WORKGROUP_SIZE`] as a host word count.
 const WORKGROUP_SIZE_USIZE: usize = WORKGROUP_SIZE as usize;
 
+/// Bytes in one field word; the on-the-wire width of a
+/// [`FieldElement::to_raw`] residue.
+const WORD_BYTES: usize = 4;
+
 /// Words in the `Dims` uniform: six used words plus two padding words.
 const DIMS_UNIFORM_WORDS: usize = 8;
+
+/// [`DIMS_UNIFORM_WORDS`] in bytes; the fixed size of every uniform buffer.
+const DIMS_UNIFORM_BYTES: u64 = (DIMS_UNIFORM_WORDS * WORD_BYTES) as u64;
 
 /// Largest dispatchable workgroup count per dimension guaranteed by wgpu.
 const MAX_WORKGROUPS_PER_DIMENSION: u32 = 65_535;
@@ -207,6 +234,59 @@ impl From<crate::params::ParamsError> for GpuError {
     }
 }
 
+/// Wall-clock host-side breakdown of one
+/// [`GpuAnswerer::answer_batch_with_timings`] call.
+///
+/// Every field is the elapsed [`Instant`] delta measured on the calling
+/// thread while executing that phase, and the phases run sequentially, so
+/// [`Self::total`] approximates the call's wall time across the hot path.
+/// One-time costs are not attributed to any phase: shader compilation on a
+/// modulus's first call happens before the first phase, and every later
+/// call reuses the cached pipeline.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct PhaseTimings {
+    /// Locking the scratch pool and growing the reused device buffers when
+    /// this batch is larger than every batch the leased set has served.
+    /// Steady-state calls pay only the pool lock here; a growth spike means
+    /// a new peak shape arrived.
+    pub prepare_buffers: Duration,
+    /// Streaming the queries into staging memory as little-endian raw
+    /// Montgomery words and scheduling the query and uniform uploads. The
+    /// `FieldElement::to_raw` word pass and the byte conversion are fused
+    /// into the staging write; wgpu does not transfer staged writes until
+    /// the next `Queue::submit`, so the device-side transfer itself is
+    /// waited on in [`Self::wait_readback`].
+    pub encode_upload_queries: Duration,
+    /// Creating the bind group, recording the dispatch and the readback
+    /// copy into a command encoder, and `Queue::submit`. The submit is
+    /// asynchronous by wgpu's contract, so this phase measures host-side
+    /// recording cost only.
+    pub dispatch_submit: Duration,
+    /// `map_async` on the staging slice plus `Device::poll` with
+    /// [`wgpu::PollType::Wait`] on this batch's submission, which blocks
+    /// the calling thread until the device has drained the uploads, the
+    /// dispatch, and the device-to-host copy, and the mapping callback has
+    /// run. This is the phase that waits on GPU execution.
+    pub wait_readback: Duration,
+    /// Reconstructing the per-query answer vectors from the mapped staging
+    /// bytes: the `FieldElement::from_raw` word pass and the split into
+    /// [`AnswerMatrix`]s. Pure host work with no device dependency.
+    pub reconstruct: Duration,
+}
+
+impl PhaseTimings {
+    /// Sum of all phases; approximately the call's wall time across the
+    /// measured hot path.
+    #[must_use]
+    pub fn total(&self) -> Duration {
+        self.prepare_buffers
+            + self.encode_upload_queries
+            + self.dispatch_submit
+            + self.wait_readback
+            + self.reconstruct
+    }
+}
+
 /// An encrypted matrix uploaded to the device as raw Montgomery words.
 ///
 /// The handle owns the device buffer, so the host copy of the ciphertext can
@@ -260,11 +340,17 @@ impl<const MODULUS: u32> fmt::Debug for GpuEncryptedMatrix<MODULUS> {
 }
 
 /// The GPU answer server: a logical device, a command queue, and the
-/// per-modulus pipeline cache.
+/// per-modulus pipeline and buffer caches.
+///
+/// Batches lease reusable buffer sets from [`Self::scratch_pool`], so a
+/// steady workload allocates device memory once per concurrent caller
+/// rather than once per call. See [`AnswerScratch`] for the growth
+/// contract.
 pub struct GpuAnswerer {
     device: wgpu::Device,
     queue: wgpu::Queue,
     pipelines: Mutex<HashMap<u32, wgpu::ComputePipeline>>,
+    scratch_pool: Mutex<Vec<AnswerScratch>>,
 }
 
 impl GpuAnswerer {
@@ -317,6 +403,7 @@ impl GpuAnswerer {
             device,
             queue,
             pipelines: Mutex::new(HashMap::new()),
+            scratch_pool: Mutex::new(Vec::new()),
         })
     }
 
@@ -325,9 +412,13 @@ impl GpuAnswerer {
     /// This is the one-time transfer per matrix: the returned
     /// [`GpuEncryptedMatrix`] owns the device buffer and every later
     /// [`Self::answer_batch`] against it reuses the words in place. The
-    /// upload is a single `write_buffer` of the row-major words. The
-    /// parameters must match the encryption parameters of `matrix`; they
-    /// fix the block structure the kernel answers with.
+    /// upload streams the raw words straight into a
+    /// `Queue::write_buffer_with` staging view and flushes the transfer
+    /// with an immediate empty submission, so the copy overlaps whatever
+    /// the host does next instead of hiding behind the first answer
+    /// batch's submission. The parameters must match the encryption
+    /// parameters of `matrix`; they fix the block structure the kernel
+    /// answers with.
     ///
     /// # Errors
     ///
@@ -358,6 +449,7 @@ impl GpuAnswerer {
             });
         }
         let words = rows.checked_mul(n).ok_or(GpuError::DimensionOverflow)?;
+        check_len("encrypted matrix values", words, matrix.values().len())?;
         // The u32 narrowing doubles as the kernel's u32 index bound: every
         // matrix index is below `rows * n = words`.
         let words_u32 = u32::try_from(words).map_err(|_conversion| GpuError::UploadTooLarge {
@@ -366,25 +458,18 @@ impl GpuAnswerer {
         })?;
         self.check_buffer_words(u64::from(words_u32))?;
 
-        let field = PrimeField::<MODULUS>::new();
-        let mut words_buffer = vec![0_u32; words];
-        field
-            .write_raw_words(matrix.values(), &mut words_buffer)
-            .map_err(|_field_error| GpuError::LengthMismatch {
-                name: "encrypted matrix values",
-                expected: words,
-                actual: matrix.values().len(),
-            })?;
-        let bytes = words_to_le_bytes(&words_buffer);
-        drop(words_buffer);
-
         let buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("emvp-encrypted-matrix"),
             size: byte_len_of_words(words_u32),
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
-        self.queue.write_buffer(&buffer, 0, &bytes);
+        let mut view = staged_write_view(&self.queue, &buffer, words_u32)?;
+        fill_matrix_view(&mut view, matrix.values());
+        drop(view);
+        // Flush the one-time upload now rather than leaving it queued behind
+        // the next answer batch's submission.
+        self.queue.submit([]);
 
         Ok(GpuEncryptedMatrix {
             buffer,
@@ -403,7 +488,9 @@ impl GpuAnswerer {
     /// output `(query, row, block)` the kernel accumulates `b` Montgomery
     /// products with field additions, writing one canonical word per element
     /// of the query-major answer arena. Validation is all-or-nothing and
-    /// mirrors the CPU path; results are bit-identical to it.
+    /// mirrors the CPU path; results are bit-identical to it. Buffers are
+    /// leased from the answerer's scratch pool and returned afterwards, so
+    /// steady-state calls allocate nothing.
     ///
     /// # Errors
     ///
@@ -411,18 +498,43 @@ impl GpuAnswerer {
     /// malformed, the batch is empty, any query has the wrong length or a
     /// foreign instance identifier, an index or size would overflow, or the
     /// query/output buffers exceed the device's capacity.
-    #[expect(
-        clippy::unused_async,
-        reason = "the async surface stays uniform across the answerer API so callers integrate it with executors uniformly"
-    )]
     pub async fn answer_batch<const MODULUS: u32>(
         &self,
         matrix: &GpuEncryptedMatrix<MODULUS>,
         queries: &[EncryptedQuery<MODULUS>],
     ) -> Result<Vec<AnswerMatrix<MODULUS>>, GpuError> {
+        self.answer_batch_with_timings(matrix, queries)
+            .await
+            .map(|(answers, _timings)| answers)
+    }
+
+    /// [`Self::answer_batch`] with the host-side phase breakdown of
+    /// [`PhaseTimings`] attached.
+    ///
+    /// The timings make the host-versus-device split of one batch
+    /// observable: how long the host spends preparing and submitting device
+    /// work ([`PhaseTimings::prepare_buffers`],
+    /// [`PhaseTimings::encode_upload_queries`],
+    /// [`PhaseTimings::dispatch_submit`]), how long the calling thread
+    /// blocks on the device ([`PhaseTimings::wait_readback`]), and how long
+    /// the host spends reconstructing the answers afterwards
+    /// ([`PhaseTimings::reconstruct`]).
+    ///
+    /// # Errors
+    ///
+    /// Returns the same errors as [`Self::answer_batch`].
+    #[expect(
+        clippy::unused_async,
+        reason = "the async surface stays uniform across the answerer API so callers integrate it with executors uniformly"
+    )]
+    pub async fn answer_batch_with_timings<const MODULUS: u32>(
+        &self,
+        matrix: &GpuEncryptedMatrix<MODULUS>,
+        queries: &[EncryptedQuery<MODULUS>],
+    ) -> Result<(Vec<AnswerMatrix<MODULUS>>, PhaseTimings), GpuError> {
         check_modulus::<MODULUS>()?;
         let shape = self.answer_shape(matrix, queries)?;
-        let query_bytes = encode_query_words::<MODULUS>(shape.n, queries)?;
+        let pipeline = self.answer_pipeline::<MODULUS>();
         let (workgroups_x, workgroups_y) = dispatch_grid(shape.answer_words)?;
         let uniform_bytes = dims_uniform_bytes(
             shape.n,
@@ -432,40 +544,57 @@ impl GpuAnswerer {
             shape.batch,
             workgroups_x,
         )?;
-        let pipeline = self.answer_pipeline::<MODULUS>();
-        let (query_buffer, uniform_buffer, output_buffer, staging_buffer) = self
-            .create_answer_buffers(
-                &query_bytes,
-                shape.query_words_u32,
-                shape.answer_words_u32,
-                &uniform_bytes,
+        let mut timings = PhaseTimings::default();
+        let mut scratch = lock_recovered(&self.scratch_pool).pop().unwrap_or_else(|| {
+            AnswerScratch::new(&self.device, shape.query_words_u32, shape.answer_words_u32)
+        });
+        let (query_buffer, uniform_buffer, output_buffer, staging_buffer) = {
+            let start = Instant::now();
+            let buffers =
+                scratch.prepare(&self.device, shape.query_words_u32, shape.answer_words_u32);
+            timings.prepare_buffers = start.elapsed();
+            buffers
+        };
+
+        timings.encode_upload_queries = {
+            let start = Instant::now();
+            let mut view = staged_write_view(&self.queue, query_buffer, shape.query_words_u32)?;
+            fill_query_view(&mut view, queries);
+            drop(view);
+            self.queue.write_buffer(uniform_buffer, 0, &uniform_bytes);
+            start.elapsed()
+        };
+
+        let answer_bytes = byte_len_of_words(shape.answer_words_u32);
+        let submission = {
+            let start = Instant::now();
+            let submission = self.submit_answer_dispatch::<MODULUS>(
+                matrix,
+                &pipeline,
+                (query_buffer, uniform_buffer, output_buffer, staging_buffer),
+                (workgroups_x, workgroups_y),
+                answer_bytes,
             );
-        self.submit_answer_dispatch::<MODULUS>(
-            matrix,
-            &pipeline,
-            (
-                &query_buffer,
-                &uniform_buffer,
-                &output_buffer,
-                &staging_buffer,
-            ),
-            (workgroups_x, workgroups_y),
-        );
-        let answer_values =
-            self.read_answer_values::<MODULUS>(&staging_buffer, shape.answer_words)?;
-        Ok(answer_values
-            .chunks_exact(shape.answer_words_per_query)
-            .zip(queries)
-            .map(|(values, query)| {
-                AnswerMatrix::from_parts(
-                    matrix.instance_id(),
-                    query.query_id(),
-                    values.to_vec(),
-                    shape.rows,
-                    shape.s,
-                )
-            })
-            .collect())
+            timings.dispatch_submit = start.elapsed();
+            submission
+        };
+
+        {
+            let start = Instant::now();
+            self.wait_for_staged_slice(staging_buffer, answer_bytes, submission)?;
+            timings.wait_readback = start.elapsed();
+        }
+
+        let answers = {
+            let start = Instant::now();
+            let answers = read_staged_answers(matrix, queries, staging_buffer, &shape)?;
+            timings.reconstruct = start.elapsed();
+            answers
+        };
+        // Return the set to the pool. Error paths above drop it instead,
+        // which only costs the next call a fresh allocation.
+        lock_recovered(&self.scratch_pool).push(scratch);
+        Ok((answers, timings))
     }
 
     /// Blocking single-threaded wrapper around [`Self::new`].
@@ -503,6 +632,19 @@ impl GpuAnswerer {
         pollster::block_on(self.answer_batch(matrix, queries))
     }
 
+    /// Blocking wrapper around [`Self::answer_batch_with_timings`].
+    ///
+    /// # Errors
+    ///
+    /// Returns the same errors as [`Self::answer_batch_with_timings`].
+    pub fn answer_batch_sync_with_timings<const MODULUS: u32>(
+        &self,
+        matrix: &GpuEncryptedMatrix<MODULUS>,
+        queries: &[EncryptedQuery<MODULUS>],
+    ) -> Result<(Vec<AnswerMatrix<MODULUS>>, PhaseTimings), GpuError> {
+        pollster::block_on(self.answer_batch_with_timings(matrix, queries))
+    }
+
     /// Returns the cached answer pipeline for this modulus, compiling it on
     /// first use.
     fn answer_pipeline<const MODULUS: u32>(&self) -> wgpu::ComputePipeline {
@@ -510,24 +652,12 @@ impl GpuAnswerer {
         // mid-insert cannot have corrupted anything: recover the guard. The
         // guard is dropped before compilation so concurrent batches are not
         // blocked behind shader work.
-        let cached = {
-            let pipelines = match self.pipelines.lock() {
-                Ok(pipelines) => pipelines,
-                Err(poisoned) => poisoned.into_inner(),
-            };
-            pipelines.get(&MODULUS).cloned()
-        };
+        let cached = lock_recovered(&self.pipelines).get(&MODULUS).cloned();
         if let Some(pipeline) = cached {
             return pipeline;
         }
         let pipeline = Self::build_pipeline::<MODULUS>(&self.device);
-        {
-            let mut pipelines = match self.pipelines.lock() {
-                Ok(pipelines) => pipelines,
-                Err(poisoned) => poisoned.into_inner(),
-            };
-            pipelines.insert(MODULUS, pipeline.clone());
-        }
+        lock_recovered(&self.pipelines).insert(MODULUS, pipeline.clone());
         pipeline
     }
 
@@ -689,51 +819,16 @@ impl GpuAnswerer {
         })
     }
 
-    /// Creates the per-call buffers and fills the query and uniform ones.
-    fn create_answer_buffers(
-        &self,
-        query_bytes: &[u8],
-        query_words_u32: u32,
-        answer_words_u32: u32,
-        uniform_bytes: &[u8],
-    ) -> (wgpu::Buffer, wgpu::Buffer, wgpu::Buffer, wgpu::Buffer) {
-        let query_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("emvp-answer-queries"),
-            size: byte_len_of_words(query_words_u32),
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-        self.queue.write_buffer(&query_buffer, 0, query_bytes);
-        let uniform_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("emvp-answer-dims"),
-            size: uniform_bytes.len() as wgpu::BufferAddress,
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-        self.queue.write_buffer(&uniform_buffer, 0, uniform_bytes);
-        let output_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("emvp-answer-output"),
-            size: byte_len_of_words(answer_words_u32),
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
-            mapped_at_creation: false,
-        });
-        let staging_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("emvp-answer-staging"),
-            size: output_buffer.size(),
-            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-        (query_buffer, uniform_buffer, output_buffer, staging_buffer)
-    }
-
-    /// Records the compute dispatch and the readback copy and submits them.
+    /// Records the compute dispatch and the readback copy, submits them,
+    /// and returns the submission index the readback wait blocks on.
     fn submit_answer_dispatch<const MODULUS: u32>(
         &self,
         matrix: &GpuEncryptedMatrix<MODULUS>,
         pipeline: &wgpu::ComputePipeline,
         buffers: (&wgpu::Buffer, &wgpu::Buffer, &wgpu::Buffer, &wgpu::Buffer),
         workgroups: (u32, u32),
-    ) {
+        copy_bytes: u64,
+    ) -> wgpu::SubmissionIndex {
         let (query_buffer, uniform_buffer, output_buffer, staging_buffer) = buffers;
         let (workgroups_x, workgroups_y) = workgroups;
         let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -788,45 +883,36 @@ impl GpuAnswerer {
             compute_pass.set_bind_group(0, &bind_group, &[]);
             compute_pass.dispatch_workgroups(workgroups_x, workgroups_y, 1);
         }
-        encoder.copy_buffer_to_buffer(output_buffer, 0, staging_buffer, 0, staging_buffer.size());
-        self.queue.submit([encoder.finish()]);
+        encoder.copy_buffer_to_buffer(output_buffer, 0, staging_buffer, 0, copy_bytes);
+        self.queue.submit([encoder.finish()])
     }
 
-    /// Blocks until the staging buffer holds the answers and converts the
-    /// little-endian words into canonical Montgomery field elements.
-    fn read_answer_values<const MODULUS: u32>(
+    /// Maps `byte_len` of the staging buffer and blocks the calling thread
+    /// until that mapping is valid, which for
+    /// [`wgpu::PollType::wait_indefinitely`] means the device has drained
+    /// the given submission: the staged uploads, the dispatch, and the
+    /// device-to-host copy.
+    fn wait_for_staged_slice(
         &self,
         staging_buffer: &wgpu::Buffer,
-        words: usize,
-    ) -> Result<Vec<FieldElement<MODULUS>>, GpuError> {
-        // Block until the submission completes and the mapping callback has
-        // run; the wgpu polling model makes the wait synchronous by design.
+        byte_len: u64,
+        submission: wgpu::SubmissionIndex,
+    ) -> Result<(), GpuError> {
+        let slice = staging_buffer.slice(0..byte_len);
         let (sender, receiver) = std::sync::mpsc::channel();
-        staging_buffer
-            .slice(..)
-            .map_async(wgpu::MapMode::Read, move |result| {
-                let _delivery = sender.send(result.map_err(|error| error.to_string()));
-            });
+        slice.map_async(wgpu::MapMode::Read, move |result| {
+            let _delivery = sender.send(result.map_err(|error| error.to_string()));
+        });
         self.device
-            .poll(wgpu::PollType::wait_indefinitely())
+            .poll(wgpu::PollType::Wait {
+                submission_index: Some(submission),
+                timeout: None,
+            })
             .map_err(|error| GpuError::Submission(error.to_string()))?;
         receiver
             .recv()
             .map_err(|_dropped| GpuError::Map("mapping callback result unavailable".into()))?
-            .map_err(GpuError::Map)?;
-        let data = staging_buffer
-            .slice(..)
-            .get_mapped_range()
-            .map_err(|error| GpuError::Map(error.to_string()))?;
-        let mut answer_values = Vec::with_capacity(words);
-        for chunk in data.chunks_exact(4) {
-            let mut word = [0_u8; 4];
-            word.copy_from_slice(chunk);
-            answer_values.push(FieldElement::from_raw(u32::from_le_bytes(word)));
-        }
-        drop(data);
-        staging_buffer.unmap();
-        Ok(answer_values)
+            .map_err(GpuError::Map)
     }
 }
 
@@ -852,45 +938,271 @@ struct AnswerShape {
     answer_words_per_query: usize,
 }
 
-/// Copies `values` into a little-endian byte buffer for `write_buffer`.
+/// A reusable set of device buffers for one answer batch.
 ///
-/// All wgpu-supported hosts are little-endian, so this is the on-the-wire
-/// encoding of the raw words. The element-wise copy is the safe (workspace
-/// `unsafe`-denying) alternative to reinterpreting the slice and is
-/// negligible next to the transfers it feeds.
-fn words_to_le_bytes(words: &[u32]) -> Vec<u8> {
-    let mut bytes = Vec::with_capacity(words.len() * 4);
-    for word in words {
-        bytes.extend_from_slice(&word.to_le_bytes());
-    }
-    bytes
+/// The set is leased from a [`GpuAnswerer`]'s pool, so consecutive batches
+/// skip device allocation entirely. Growth contract: each buffer remembers
+/// the largest word count its set has served; a call needing more replaces
+/// the affected buffers and raises the record. Capacities never shrink, so
+/// pooled memory stays at the peak a server actually uses. Every set owns
+/// its uniform buffer because the `Dims` contents of an in-flight batch
+/// must not be overwritten by a concurrent one.
+#[derive(Debug)]
+struct AnswerScratch {
+    /// Query words (`batch * n`), `STORAGE | COPY_DST`.
+    query_buffer: wgpu::Buffer,
+    /// The `Dims` uniform; fixed [`DIMS_UNIFORM_BYTES`] size.
+    uniform_buffer: wgpu::Buffer,
+    /// Answer words (`batch * rows * s`), `STORAGE | COPY_SRC`.
+    output_buffer: wgpu::Buffer,
+    /// Readback copy of the answers, `MAP_READ | COPY_DST`.
+    staging_buffer: wgpu::Buffer,
+    query_capacity_words: u32,
+    answer_capacity_words: u32,
 }
 
-/// Encodes a query batch into little-endian raw Montgomery words.
-///
-/// Validation has already fixed every query at length `n`, so a
-/// [`FieldError::LengthMismatch`] here is unreachable; it is mapped into the
-/// matching [`GpuError`] anyway to stay fail-closed.
-fn encode_query_words<const MODULUS: u32>(
-    n: usize,
-    queries: &[EncryptedQuery<MODULUS>],
-) -> Result<Vec<u8>, GpuError> {
-    let word_count = queries
-        .len()
-        .checked_mul(n)
-        .ok_or(GpuError::DimensionOverflow)?;
-    let field = PrimeField::<MODULUS>::new();
-    let mut query_word_buffer = vec![0_u32; word_count];
-    for (slot, query) in query_word_buffer.chunks_mut(n).zip(queries) {
-        field
-            .write_raw_words(query.values(), slot)
-            .map_err(|_field_error| GpuError::LengthMismatch {
-                name: "encrypted query",
-                expected: n,
-                actual: query.values().len(),
-            })?;
+impl AnswerScratch {
+    /// Creates a set whose buffers start sized for `query_words` and
+    /// `answer_words`; both capacities are valid device-side sizes because
+    /// the shape validation ran first.
+    fn new(device: &wgpu::Device, query_words: u32, answer_words: u32) -> Self {
+        Self {
+            query_buffer: device.create_buffer(&answer_buffer_descriptor(
+                "emvp-answer-queries",
+                query_words,
+                wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            )),
+            uniform_buffer: device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("emvp-answer-dims"),
+                size: DIMS_UNIFORM_BYTES,
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            }),
+            output_buffer: device.create_buffer(&answer_buffer_descriptor(
+                "emvp-answer-output",
+                answer_words,
+                wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+            )),
+            staging_buffer: device.create_buffer(&answer_buffer_descriptor(
+                "emvp-answer-staging",
+                answer_words,
+                wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            )),
+            query_capacity_words: query_words,
+            answer_capacity_words: answer_words,
+        }
     }
-    Ok(words_to_le_bytes(&query_word_buffer))
+
+    /// Grows the reused buffers to cover `query_words` and `answer_words`
+    /// when the request exceeds the set's recorded peaks, and returns the
+    /// ready buffers. Steady-state calls take the no-growth fast path.
+    fn prepare(
+        &mut self,
+        device: &wgpu::Device,
+        query_words: u32,
+        answer_words: u32,
+    ) -> (&wgpu::Buffer, &wgpu::Buffer, &wgpu::Buffer, &wgpu::Buffer) {
+        if query_words > self.query_capacity_words {
+            self.query_buffer = device.create_buffer(&answer_buffer_descriptor(
+                "emvp-answer-queries",
+                query_words,
+                wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            ));
+            self.query_capacity_words = query_words;
+        }
+        if answer_words > self.answer_capacity_words {
+            self.output_buffer = device.create_buffer(&answer_buffer_descriptor(
+                "emvp-answer-output",
+                answer_words,
+                wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+            ));
+            self.staging_buffer = device.create_buffer(&answer_buffer_descriptor(
+                "emvp-answer-staging",
+                answer_words,
+                wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            ));
+            self.answer_capacity_words = answer_words;
+        }
+        (
+            &self.query_buffer,
+            &self.uniform_buffer,
+            &self.output_buffer,
+            &self.staging_buffer,
+        )
+    }
+}
+
+/// Locks `mutex`, recovering from poisoning: the guarded values (pipeline
+/// cache, buffer pool) are immutable or self-consistent between calls, so a
+/// panic in another thread mid-insert cannot have corrupted anything.
+fn lock_recovered<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    match mutex.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    }
+}
+
+/// Buffer descriptor for a reusable answer buffer of `words` words.
+fn answer_buffer_descriptor(
+    label: &'static str,
+    words: u32,
+    usage: wgpu::BufferUsages,
+) -> wgpu::BufferDescriptor<'static> {
+    wgpu::BufferDescriptor {
+        label: Some(label),
+        size: byte_len_of_words(words),
+        usage,
+        mapped_at_creation: false,
+    }
+}
+
+/// Opens a write-only staging view over the first `words` words of `buffer`
+/// for a `Queue::write_buffer_with` upload.
+///
+/// The view writes straight into wgpu's staging memory: uploading costs one
+/// pass over the data with no intermediate byte `Vec` and no separate
+/// `write_buffer` staging copy. The staged transfer is flushed to the
+/// device by the next `Queue::submit`.
+///
+/// # Errors
+///
+/// Returns [`GpuError::UploadTooLarge`] when the byte length does not fit
+/// the staging API's u32 size, and [`GpuError::Submission`] when wgpu
+/// refuses to allocate the staging memory.
+fn staged_write_view(
+    queue: &wgpu::Queue,
+    buffer: &wgpu::Buffer,
+    words: u32,
+) -> Result<wgpu::QueueWriteBufferView, GpuError> {
+    let size = wgpu::BufferSize::new(byte_len_of_words(words)).ok_or(GpuError::UploadTooLarge {
+        elements: words as usize,
+        max_elements: (u32::MAX as usize) / WORD_BYTES,
+    })?;
+    queue.write_buffer_with(buffer, 0, size).ok_or_else(|| {
+        GpuError::Submission("the queue refused to allocate staging memory for an upload".into())
+    })
+}
+
+/// Streams the matrix's raw Montgomery words into the staged upload view as
+/// little-endian bytes.
+///
+/// `view` is exactly `values.len()` words of `WORD_BYTES` bytes by
+/// construction, so the write fills it completely. This fuses the `to_raw`
+/// word pass, the byte conversion, and the staging copy into a single pass
+/// with no intermediate allocation; the element-wise walk is the safe
+/// (workspace `unsafe`-denying) alternative to reinterpreting the slice and
+/// is dominated by the `PCIe` transfer it feeds.
+fn fill_matrix_view<const MODULUS: u32>(
+    view: &mut wgpu::QueueWriteBufferView,
+    values: &[FieldElement<MODULUS>],
+) {
+    let (word_bytes, _tail) = view.slice(..).into_chunks::<WORD_BYTES>();
+    word_bytes.write_iter(values.iter().map(|element| element.to_raw().to_le_bytes()));
+}
+
+/// Streams the query batch's raw Montgomery words into the staged upload
+/// view as little-endian bytes.
+///
+/// `view` is exactly `batch * n` words of `WORD_BYTES` bytes by
+/// construction, so the flattened per-query words fill it completely and
+/// `WriteOnly::write_iter`'s length check cannot trip. Same fused single
+/// pass as [`fill_matrix_view`].
+fn fill_query_view<const MODULUS: u32>(
+    view: &mut wgpu::QueueWriteBufferView,
+    queries: &[EncryptedQuery<MODULUS>],
+) {
+    let (word_bytes, _tail) = view.slice(..).into_chunks::<WORD_BYTES>();
+    word_bytes.write_iter(
+        queries
+            .iter()
+            .flat_map(|query| query.values().iter())
+            .map(|element| element.to_raw().to_le_bytes()),
+    );
+}
+
+/// Converts the mapped staging bytes into one [`AnswerMatrix`] per
+/// query and releases the mapping.
+///
+/// The mapping is released on every path after it succeeded, so a pooled
+/// scratch set is always returned to the pool unmapped.
+fn read_staged_answers<const MODULUS: u32>(
+    matrix: &GpuEncryptedMatrix<MODULUS>,
+    queries: &[EncryptedQuery<MODULUS>],
+    staging_buffer: &wgpu::Buffer,
+    shape: &AnswerShape,
+) -> Result<Vec<AnswerMatrix<MODULUS>>, GpuError> {
+    let byte_len = byte_len_of_words(shape.answer_words_u32);
+    let data = match staging_buffer.slice(0..byte_len).get_mapped_range() {
+        Ok(data) => data,
+        Err(error) => {
+            staging_buffer.unmap();
+            return Err(GpuError::Map(error.to_string()));
+        }
+    };
+    let answers = match reconstruct_answers(matrix, queries, shape, &data) {
+        Ok(answers) => answers,
+        Err(error) => {
+            drop(data);
+            staging_buffer.unmap();
+            return Err(error);
+        }
+    };
+    drop(data);
+    staging_buffer.unmap();
+    Ok(answers)
+}
+
+/// Splits the staged answer bytes into one [`AnswerMatrix`] per query.
+///
+/// Infallible by the validated shape: `bytes` holds exactly
+/// `queries.len() * words_per_query` little-endian words in query-major
+/// order (the kernel's arena layout), so a length mismatch is unreachable;
+/// the check exists to stay fail-closed.
+///
+/// Each per-query `collect` runs over a trusted-length iterator
+/// (`chunks_exact` over an exact-multiple slice), so it performs one
+/// allocation and writes the [`FieldElement`]s directly: no intermediate
+/// answer arena, no per-element growth, and no later per-query copy.
+fn reconstruct_answers<const MODULUS: u32>(
+    matrix: &GpuEncryptedMatrix<MODULUS>,
+    queries: &[EncryptedQuery<MODULUS>],
+    shape: &AnswerShape,
+    bytes: &[u8],
+) -> Result<Vec<AnswerMatrix<MODULUS>>, GpuError> {
+    let bytes_per_query = shape
+        .answer_words_per_query
+        .checked_mul(WORD_BYTES)
+        .ok_or(GpuError::DimensionOverflow)?;
+    let expected = queries
+        .len()
+        .checked_mul(bytes_per_query)
+        .ok_or(GpuError::DimensionOverflow)?;
+    if bytes.len() != expected {
+        return Err(GpuError::LengthMismatch {
+            name: "staged answer bytes",
+            expected,
+            actual: bytes.len(),
+        });
+    }
+    Ok(queries
+        .iter()
+        .zip(bytes.chunks_exact(bytes_per_query))
+        .map(|(query, chunk)| {
+            let values: Vec<FieldElement<MODULUS>> = chunk
+                .chunks_exact(WORD_BYTES)
+                .map(|word| {
+                    FieldElement::from_raw(u32::from_le_bytes([word[0], word[1], word[2], word[3]]))
+                })
+                .collect();
+            AnswerMatrix::from_parts(
+                matrix.instance_id(),
+                query.query_id(),
+                values,
+                shape.rows,
+                shape.s,
+            )
+        })
+        .collect())
 }
 
 /// Folds the linear output count into a 2D workgroup dispatch that stays
@@ -923,11 +1235,11 @@ fn dims_uniform_bytes(
     rows: usize,
     batch: usize,
     workgroups_x: u32,
-) -> Result<[u8; DIMS_UNIFORM_WORDS * 4], GpuError> {
-    let mut bytes = [0_u8; DIMS_UNIFORM_WORDS * 4];
+) -> Result<[u8; DIMS_UNIFORM_WORDS * WORD_BYTES], GpuError> {
+    let mut bytes = [0_u8; DIMS_UNIFORM_WORDS * WORD_BYTES];
     for (slot, dimension) in
         bytes
-            .chunks_exact_mut(4)
+            .chunks_exact_mut(WORD_BYTES)
             .zip([n, b, s, rows, batch, workgroups_x as usize])
     {
         let word = u32::try_from(dimension).map_err(|_conversion| GpuError::DimensionOverflow)?;
