@@ -1281,18 +1281,43 @@ fn validate_decode<const MODULUS: u32>(
     Ok((rows, s))
 }
 
+/// Writes each decoded product `M' p' - r'` into `output`.
+///
+/// Rows are independent dot products of length `s`, so large answers
+/// distribute them across rayon workers; the output is identical to the
+/// serial row loop. Smaller answers stay serial.
 fn fill_decoded<const MODULUS: u32>(
     answer: &AnswerMatrix<MODULUS>,
     key: &DecodingKey<MODULUS>,
     output: &mut [FieldElement<MODULUS>],
     s: usize,
 ) {
-    let zero = PrimeField::<MODULUS>::new().element_u32(0);
-    for (row, slot) in output.iter_mut().enumerate() {
-        let mut accumulator = zero;
-        for (block, &p) in key.p_prime.iter().enumerate() {
-            accumulator += answer.values[row * s + block] * p;
+    let threads = rayon::current_num_threads();
+    let rows = output.len();
+    let work = rows.saturating_mul(s);
+    if threads > 1 && rows >= threads.saturating_mul(2) && work >= MIN_PARALLEL_MULTIPLICATIONS {
+        output
+            .par_iter_mut()
+            .enumerate()
+            .for_each(|(row, slot)| *slot = decode_row(answer, key, row, s));
+    } else {
+        for (row, slot) in output.iter_mut().enumerate() {
+            *slot = decode_row(answer, key, row, s);
         }
-        *slot = accumulator - key.r_prime[row];
     }
+}
+
+/// Evaluates one decoded product `M' p' - r'` for answer row `row`.
+fn decode_row<const MODULUS: u32>(
+    answer: &AnswerMatrix<MODULUS>,
+    key: &DecodingKey<MODULUS>,
+    row: usize,
+    s: usize,
+) -> FieldElement<MODULUS> {
+    let zero = PrimeField::<MODULUS>::new().element_u32(0);
+    let mut accumulator = zero;
+    for (block, &p) in key.p_prime.iter().enumerate() {
+        accumulator += answer.values[row * s + block] * p;
+    }
+    accumulator - key.r_prime[row]
 }

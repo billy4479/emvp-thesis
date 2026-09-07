@@ -802,6 +802,35 @@ fn parallel_answer_batch_matches_the_serial_loop() {
     assert_eq!(parallel, serial);
 }
 
+#[test]
+fn parallel_decode_matches_the_serial_row_loop() {
+    // 4096 rows * s = 8 = 32768 multiplications clear the crate's
+    // parallel-work threshold and 4096 >= 2 * 4 rows satisfies the thread
+    // guard, so the four-thread run forces the parallel branch while the
+    // single-thread run takes the serial reference path. Both runs decode
+    // the same answer with the same key.
+    let (rows, ell) = (4096_usize, 8_usize);
+    let mut rng = ChaCha20Rng::seed_from_u64(0x8700);
+    let matrix = random_vector(rows * ell, &mut rng);
+    let q = random_vector(ell, &mut rng);
+    let mut state = derive_toeplitz(rows, ell, 0x87);
+    let encrypted = encrypt(&mut state, &matrix).unwrap();
+    let (encrypted_query, decoding_key) = query(&mut state, &q).unwrap();
+    let answer = answer_matrix(&state.params(), &encrypted, &encrypted_query);
+
+    let decode_with = |threads: usize| {
+        let mut output = vec![field().element_u32(0); rows];
+        pool(threads)
+            .install(|| decode_into(&answer, &decoding_key, &mut output))
+            .unwrap();
+        output
+    };
+    let parallel = decode_with(4);
+    let serial = decode_with(1);
+    assert_eq!(parallel, serial);
+    assert_eq!(parallel, naive_matrix_vector(&matrix, &q, rows, ell));
+}
+
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(16))]
 
