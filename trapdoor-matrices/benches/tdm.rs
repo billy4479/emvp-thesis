@@ -5,7 +5,6 @@
 
 use std::{hint::black_box, time::Duration};
 
-use bench_common as common;
 use criterion::{
     BatchSize, BenchmarkGroup, BenchmarkId, Criterion, Throughput, criterion_group, criterion_main,
     measurement::WallTime,
@@ -179,20 +178,6 @@ fn toeplitz_apply_for(group: &mut BenchmarkGroup<'_, WallTime>, k: usize) {
             });
         },
     );
-
-    // Calibrated the structured/dense dispatch threshold; kept for one-off
-    // re-measurement via EMVP_BENCH_CALIBRATION=1.
-    if k <= 64 && common::calibration_enabled() {
-        let dense = map.materialize().unwrap();
-        let mut dense_output = field_values(k, 0x44);
-        group.bench_function(BenchmarkId::new("direct_dense_crossover", k), |b| {
-            b.iter(|| {
-                black_box(&dense)
-                    .apply(black_box(&input), black_box(&mut dense_output))
-                    .unwrap();
-            });
-        });
-    }
 }
 
 fn toeplitz_materialize_for(group: &mut BenchmarkGroup<'_, WallTime>, k: usize) {
@@ -245,20 +230,6 @@ fn raa_apply_for(group: &mut BenchmarkGroup<'_, WallTime>, k: usize) {
                 .unwrap();
         });
     });
-
-    // Calibrated the structured/dense dispatch threshold; kept for one-off
-    // re-measurement via EMVP_BENCH_CALIBRATION=1.
-    if k <= 64 && common::calibration_enabled() {
-        let dense = map.materialize().unwrap();
-        let mut dense_output = field_values(k, 0x54);
-        group.bench_function(BenchmarkId::new("direct_dense_crossover", k), |b| {
-            b.iter(|| {
-                black_box(&dense)
-                    .apply(black_box(&input), black_box(&mut dense_output))
-                    .unwrap();
-            });
-        });
-    }
 }
 
 fn raa_materialize_for(group: &mut BenchmarkGroup<'_, WallTime>, k: usize) {
@@ -306,10 +277,10 @@ fn all_tdms<const MODULUS: u32>(c: &mut Criterion) {
     }
 
     #[cfg(feature = "bench-quick")]
-    all!(16, 256);
+    all!(256, 1024);
 
     #[cfg(not(feature = "bench-quick"))]
-    all!(16, 64, 256, 1024);
+    all!(256, 1024, 4096, 8192);
 }
 
 fn criterion_config() -> Criterion {
