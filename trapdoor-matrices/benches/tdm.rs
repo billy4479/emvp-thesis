@@ -40,6 +40,10 @@ fn elements(count: usize) -> Throughput {
 }
 
 fn ring_inputs(k: usize) -> (Box<[u32]>, Box<[u32]>, SparseMatrix<MODULUS>) {
+    // Not `IrreducibleRingLpn::sample`: the construction benchmark needs the
+    // raw parts to time `new_unchecked_irreducible` alone, and the sparse
+    // matrix must have an exact column weight so the measured work does not
+    // depend on Bernoulli sampling luck.
     let field = PrimeField::<MODULUS>::new();
     let multiplier = (0..k)
         .map(|_| field.sample_uniform(&mut seeded_rng(0x31, k)).value())
