@@ -48,10 +48,12 @@ fn scalar(c: &mut Criterion) {
 
 fn bench_bulk<const MODULUS: u32>(group: &mut BenchmarkGroup<'_, WallTime>) {
     let field = PrimeField::<MODULUS>::new();
+    // The default path keeps only the LLM-scale vector length; smaller
+    // sizes are noisy and live in the quick mode instead.
     let lengths: &[usize] = if common::is_quick() {
         &[256, 4_096]
     } else {
-        &[256, 4_096, 65_536]
+        &[65_536]
     };
     for &length in lengths {
         group.throughput(Throughput::Elements(length as u64));
@@ -141,9 +143,9 @@ fn batch_inversion(c: &mut Criterion) {
     let mut group = c.benchmark_group("batch_inversion");
     let field = PrimeField::<1_073_479_681>::new();
     let lengths: &[usize] = if common::is_quick() {
-        &[4_096]
+        &[16, 256]
     } else {
-        &[16, 64, 256, 4_096]
+        &[4_096]
     };
     for &length in lengths {
         group.throughput(Throughput::Elements(length as u64));

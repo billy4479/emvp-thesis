@@ -12,9 +12,15 @@ use prime_field_layer::{ExtensionField, PolynomialReductionPlan};
 
 const MODULUS: u32 = 1_073_479_681;
 
+// `X^k - 11` is irreducible over this field for every benched degree: 11
+// is a primitive root, so the binomial irreducibility criterion holds for
+// every `k` whose prime factors divide `MODULUS - 1` (Lidl &
+// Niederreiter, *Finite Fields*, Thm 3.75). The previous generator
+// `X^k - 3` was reducible for all benched degrees: 3 has order
+// `2^16 * 273`, so `gcd(k, (MODULUS - 1)/ord(3)) > 1`.
 fn irreducible_binomial(degree: usize) -> Vec<u32> {
     let mut polynomial = vec![0; degree + 1];
-    polynomial[0] = MODULUS - 3;
+    polynomial[0] = MODULUS - 11;
     polynomial[degree] = 1;
     polynomial
 }
@@ -54,9 +60,17 @@ fn extension_multiplication(c: &mut Criterion) {
         Duration::from_secs(1),
         Duration::from_secs(2),
     );
-    multiplication_for_degree::<16>(&mut group);
-    multiplication_for_degree::<24>(&mut group);
-    multiplication_for_degree::<256>(&mut group);
+    // Default degrees are the extension degrees of the LLM-scale Ring-LPN
+    // mask blocks (n = 8192/16384); the small degrees around the
+    // schoolbook/NTT crossover stay in the quick mode.
+    if common::is_quick() {
+        multiplication_for_degree::<16>(&mut group);
+        multiplication_for_degree::<24>(&mut group);
+        multiplication_for_degree::<256>(&mut group);
+    } else {
+        multiplication_for_degree::<8_192>(&mut group);
+        multiplication_for_degree::<16_384>(&mut group);
+    }
     group.finish();
 }
 
@@ -93,9 +107,14 @@ fn fixed_monic_reduction(c: &mut Criterion) {
         Duration::from_secs(1),
         Duration::from_secs(2),
     );
-    reduction_for_degree::<16>(&mut group);
-    reduction_for_degree::<24>(&mut group);
-    reduction_for_degree::<256>(&mut group);
+    if common::is_quick() {
+        reduction_for_degree::<16>(&mut group);
+        reduction_for_degree::<24>(&mut group);
+        reduction_for_degree::<256>(&mut group);
+    } else {
+        reduction_for_degree::<8_192>(&mut group);
+        reduction_for_degree::<16_384>(&mut group);
+    }
     group.finish();
 }
 

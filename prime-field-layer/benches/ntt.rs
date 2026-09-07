@@ -15,7 +15,14 @@ use prime_field_layer::{NegacyclicPlan, NttPlan, linear_convolution};
 
 fn plan_construction(c: &mut Criterion) {
     let mut group = c.benchmark_group("ntt_plan_setup_inclusive");
-    for length in [256, 4_096] {
+    // Default lengths are the transform sizes the LLM-scale protocol
+    // parameters (n = 8192/16384) actually build plans for.
+    let lengths: &[usize] = if common::is_quick() {
+        &[256, 4_096]
+    } else {
+        &[16_384, 32_768]
+    };
+    for &length in lengths {
         group.bench_function(BenchmarkId::new("p1073479681", length), |b| {
             b.iter(|| NttPlan::<1_073_479_681>::new(black_box(length)).unwrap());
         });
@@ -95,11 +102,18 @@ fn transforms_for_modulus<const MODULUS: u32>(c: &mut Criterion, length: usize) 
 }
 
 fn transforms(c: &mut Criterion) {
-    for length in [1_024, 4_096, 16_384, 65_536] {
+    // Default lengths are the transform sizes the LLM-scale protocol
+    // parameters (n = 8192/16384) actually run.
+    let lengths: &[usize] = if common::is_quick() {
+        &[1_024, 4_096]
+    } else {
+        &[16_384, 32_768]
+    };
+    for &length in lengths {
         transforms_for_modulus::<1_073_479_681>(c, length);
+        transforms_for_modulus::<2_013_265_921>(c, length);
+        transforms_for_modulus::<2_281_701_377>(c, length);
     }
-    transforms_for_modulus::<2_013_265_921>(c, 4_096);
-    transforms_for_modulus::<2_281_701_377>(c, 4_096);
 }
 
 fn bench_linear(
@@ -131,12 +145,13 @@ fn bench_linear(
 
 fn convolutions(c: &mut Criterion) {
     let mut group = c.benchmark_group("convolution_p1073479681");
-    // Small cases expose the schoolbook/NTT crossover; 4096 remains a
-    // representative production-sized transform without an O(N^2) baseline.
+    // Default lengths are the transform sizes the LLM-scale protocol
+    // parameters (n = 8192/16384) actually run; the small schoolbook/NTT
+    // crossover shapes live in the calibration-only crossover bench.
     let lengths: &[usize] = if common::is_quick() {
         &[64, 256, 4_096]
     } else {
-        &[16, 64, 128, 256, 4_096]
+        &[16_384, 32_768]
     };
     for &transform_length in lengths {
         let linear_lhs = common::values(transform_length / 2, 1_073_479_681, 97);
@@ -180,6 +195,7 @@ fn convolutions(c: &mut Criterion) {
 fn fixed_operand_convolutions_for_modulus<const MODULUS: u32>(c: &mut Criterion) {
     // A fixed Toeplitz matrix reduces to convolution with fixed diagonal data;
     // repeated calls vary only the input vector and reuse the transformed data.
+    // Default shapes are the LLM-scale mask blocks (n = 8192/16384).
     let mut group = c.benchmark_group(format!("fixed_operand_linear_convolution_p{MODULUS}"));
     common::tune_group(
         &mut group,
@@ -188,9 +204,9 @@ fn fixed_operand_convolutions_for_modulus<const MODULUS: u32>(c: &mut Criterion)
         Duration::from_secs(2),
     );
     let lengths: &[(usize, usize)] = if common::is_quick() {
-        &[(257, 256), (2_049, 2_048)]
+        &[(65, 64), (257, 256)]
     } else {
-        &[(65, 64), (257, 256), (1_025, 1_024), (4_097, 4_096)]
+        &[(8_193, 8_192), (16_385, 16_384)]
     };
 
     for &(fixed_length, input_length) in lengths {

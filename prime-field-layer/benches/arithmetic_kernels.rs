@@ -24,10 +24,12 @@ fn field_elements<const MODULUS: u32>(length: usize, offset: u64) -> Vec<FieldEl
 }
 
 fn bench_weighted_scan<const MODULUS: u32>(group: &mut BenchmarkGroup<'_, WallTime>) {
+    // The default path keeps only the LLM-scale vector length; smaller
+    // sizes are noisy and live in the quick mode instead.
     let lengths: &[usize] = if common::is_quick() {
         &[256, 4_096]
     } else {
-        &[256, 4_096, 65_536]
+        &[65_536]
     };
 
     for &length in lengths {
@@ -87,7 +89,7 @@ fn bench_sparse_accumulation<const MODULUS: u32>(group: &mut BenchmarkGroup<'_, 
     let counts: &[usize] = if common::is_quick() {
         &[64, 1_024]
     } else {
-        &[64, 1_024, 16_384]
+        &[16_384]
     };
 
     for &count in counts {
