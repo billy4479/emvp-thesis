@@ -39,6 +39,11 @@
             samply
 
             gnuplot
+
+            # Runtime loader and diagnostics for the GPU answer path
+            # (wgpu/Vulkan); `vulkaninfo` validates the target machine.
+            vulkan-loader
+            vulkan-tools
           ];
         };
       }

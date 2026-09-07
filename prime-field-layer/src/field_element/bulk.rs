@@ -2,6 +2,38 @@ use super::FieldElement;
 use crate::{FieldError, PrimeField};
 
 impl<const MODULUS: u32> PrimeField<MODULUS> {
+    /// Copies the raw Montgomery words of `values` into `output`.
+    ///
+    /// Each element's Montgomery residue `a * 2^32 mod MODULUS`, as returned
+    /// by [`FieldElement::to_raw`], is written to the matching word of
+    /// `output`. This is the bulk form of the zero-copy interchange used to
+    /// move field elements into external buffers, such as GPU uploads, where
+    /// the device reproduces the crate's Montgomery arithmetic natively.
+    ///
+    /// [`FieldElement`] is `#[repr(transparent)]` over its word, so a pointer
+    /// cast could alias the slice without copying, but the workspace denies
+    /// `unsafe` and this element-wise copy compiles to a plain word-wise
+    /// `memcpy` in release builds. Its cost is negligible next to the `PCIe`
+    /// transfer that motivates it. The operation allocates nothing.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FieldError::LengthMismatch`] when the slices differ in
+    /// length. `output` is left unchanged in that case.
+    pub fn write_raw_words(
+        &self,
+        values: &[FieldElement<MODULUS>],
+        output: &mut [u32],
+    ) -> Result<(), FieldError> {
+        if values.len() != output.len() {
+            return Err(FieldError::LengthMismatch);
+        }
+        for (element, word) in values.iter().zip(output.iter_mut()) {
+            *word = element.to_raw();
+        }
+        Ok(())
+    }
+
     /// Writes the multiplicative inverses of `values` to `output`.
     ///
     /// This uses one field inversion and `3(n - 1)` multiplications. The

@@ -38,11 +38,41 @@ impl<const MODULUS: u32> FieldElement<MODULUS> {
     /// Returns this element as its canonical residue in `0..MODULUS`.
     ///
     /// This performs one Montgomery reduction in constant space. Prefer
-    /// keeping intermediate values as `FieldElement`s and converting only at
+    /// keeping intermediate values as [`FieldElement`]s and converting only at
     /// an external boundary or after an inverse NTT.
     #[must_use]
     pub fn value(self) -> u32 {
         PrimeField::<MODULUS>::from_montgomery(self.montgomery)
+    }
+
+    /// Returns the raw Montgomery residue stored in this element.
+    ///
+    /// The returned word is `a * 2^32 mod MODULUS` for the canonical value
+    /// `a`, which is exactly the representation [`FieldElement`] keeps
+    /// internally. This exposes that word without conversion so callers can
+    /// stream field elements into external buffers, such as GPU uploads, in
+    /// the native representation and read them back with [`Self::from_raw`].
+    /// The word is always a canonical residue, so equality on raw words
+    /// matches equality on elements.
+    #[inline(always)]
+    #[must_use]
+    pub const fn to_raw(self) -> u32 {
+        self.montgomery
+    }
+
+    /// Wraps a raw Montgomery residue into an element without conversion.
+    ///
+    /// `raw` must be the canonical Montgomery residue `a * 2^32 mod MODULUS`
+    /// of some canonical `a`, that is, a word in `0..MODULUS` as produced by
+    /// [`Self::to_raw`]. This is the inverse of [`Self::to_raw`]. The
+    /// precondition cannot be checked without a reduction, which would defeat
+    /// the zero-copy interchange this constructor exists for, so it is a
+    /// caller obligation: every other operation, including the Montgomery
+    /// kernels, bounds its arithmetic on the operands being canonical.
+    #[inline(always)]
+    #[must_use]
+    pub const fn from_raw(raw: u32) -> Self {
+        Self::from_montgomery(raw)
     }
 
     /// Returns the zero-sized field value for this element's modulus.

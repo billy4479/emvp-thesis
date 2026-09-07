@@ -7,11 +7,13 @@ edition = "2024"
 bench = false
 
 [dependencies]
+pollster = { version = "1", optional = true }
 prime-field-layer = { path = "../prime-field-layer" }
 rand_chacha = { workspace = true }
 rand_core = { workspace = true }
 rayon = { workspace = true }
 trapdoor-matrices = { path = "../trapdoor-matrices" }
+wgpu = { version = "30", optional = true }
 
 [dev-dependencies]
 allocation-counter = { workspace = true }
@@ -21,6 +23,11 @@ proptest = { workspace = true }
 
 [features]
 bench-huge = ["bench-common/huge"]
+# Server-side GPU answer path. Everything the GPU touches is public
+# (encrypted) protocol data, so this feature never affects client secrecy.
+# `pollster` backs the blocking `_sync` wrappers, which are library API, so
+# it is an optional regular dependency rather than a dev-dependency.
+gpu = ["dep:wgpu", "dep:pollster"]
 
 [lints]
 workspace = true
@@ -28,3 +35,8 @@ workspace = true
 [[bench]]
 name = "protocol"
 harness = false
+
+[[bench]]
+name = "gpu"
+harness = false
+required-features = ["gpu"]

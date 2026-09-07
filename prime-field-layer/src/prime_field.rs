@@ -68,7 +68,7 @@ impl<const MODULUS: u32> Default for PrimeField<MODULUS> {
 impl<const MODULUS: u32> PrimeField<MODULUS> {
     const VALID_MODULUS: () = assert!(Self::is_prime(MODULUS), "field modulus must be prime");
     const MODULUS_U64: u64 = MODULUS as u64;
-    pub(crate) const MONTGOMERY_NEG_INV: u32 = Self::montgomery_neg_inv();
+    pub(crate) const MONTGOMERY_NEG_INV: u32 = Self::calculate_montgomery_neg_inv();
     const MONTGOMERY_R2: u32 = if MODULUS <= 1 {
         0
     } else {
@@ -146,7 +146,7 @@ impl<const MODULUS: u32> PrimeField<MODULUS> {
         true
     }
 
-    const fn montgomery_neg_inv() -> u32 {
+    const fn calculate_montgomery_neg_inv() -> u32 {
         if MODULUS <= 2 {
             return 0;
         }
@@ -216,5 +216,30 @@ impl<const MODULUS: u32> PrimeField<MODULUS> {
     #[must_use]
     pub const fn reduce_u32(&self, value: u32) -> u32 {
         value % MODULUS
+    }
+
+    /// Returns the Montgomery REDC constant `-MODULUS^{-1} mod 2^32`.
+    ///
+    /// The Montgomery reduction multiplies the low word of the running value
+    /// by this constant to cancel the low 32 bits before the division by
+    /// `2^32`. This is exposed so external accelerators, such as GPU compute
+    /// kernels, can replicate the crate's Montgomery multiplication exactly.
+    /// It is zero for `MODULUS = 2`, where no Montgomery form exists; every
+    /// other prime modulus yields a valid constant.
+    #[must_use]
+    pub const fn montgomery_neg_inv(&self) -> u32 {
+        Self::MONTGOMERY_NEG_INV
+    }
+
+    /// Returns the Montgomery conversion constant `2^64 mod MODULUS`.
+    ///
+    /// Multiplying a canonical residue by this constant under the Montgomery
+    /// reduction yields the Montgomery residue `a * 2^32 mod MODULUS`. This
+    /// is exposed alongside [`Self::montgomery_neg_inv`] so external
+    /// accelerators can convert between canonical and Montgomery words with
+    /// the same constants the crate uses.
+    #[must_use]
+    pub const fn montgomery_r2(&self) -> u32 {
+        Self::MONTGOMERY_R2
     }
 }

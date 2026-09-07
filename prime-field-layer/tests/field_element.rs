@@ -1,6 +1,6 @@
 use std::mem::size_of;
 
-use prime_field_layer::{FieldElement, PrimeField};
+use prime_field_layer::{FieldElement, FieldError, PrimeField};
 
 #[test]
 fn construction_reduces_to_a_canonical_residue() {
@@ -62,4 +62,61 @@ fn assignment_operators_use_montgomery_arithmetic() {
 #[test]
 fn element_has_no_runtime_field_pointer() {
     assert_eq!(size_of::<FieldElement<1_073_479_681>>(), size_of::<u32>());
+}
+
+#[test]
+fn raw_words_round_trip_without_conversion() {
+    let field = PrimeField::<998_244_353>::new();
+    for value in [0_u32, 1, 2, 998_244_351, 998_244_352] {
+        let element = field.element_u32(value);
+        // The raw word is the Montgomery residue of the canonical value,
+        // `a * 2^32 mod MODULUS`.
+        assert_eq!(
+            element.to_raw(),
+            ((u64::from(value) << 32) % 998_244_353) as u32
+        );
+        // from_raw is the exact inverse, and arithmetic round-trips through it.
+        assert_eq!(
+            FieldElement::<998_244_353>::from_raw(element.to_raw()).value(),
+            value
+        );
+        assert_eq!(
+            FieldElement::<998_244_353>::from_raw(element.to_raw()),
+            element
+        );
+    }
+    // Products computed on raw words match the canonical product, so a GPU
+    // kernel working on to_raw words and returning from_raw values is
+    // indistinguishable from element arithmetic.
+    let (a, b) = (
+        field.element_u32(123_456_789),
+        field.element_u32(987_654_321),
+    );
+    let product_from_raw = FieldElement::from_raw(a.to_raw()) * FieldElement::from_raw(b.to_raw());
+    assert_eq!(product_from_raw, a * b);
+    assert_eq!(
+        product_from_raw.value(),
+        field.mul(123_456_789, 987_654_321)
+    );
+}
+
+#[test]
+fn write_raw_words_copies_the_montgomery_words() {
+    let field = PrimeField::<998_244_353>::new();
+    let values: Vec<_> = [0_u32, 1, 500_000_000, 998_244_352]
+        .iter()
+        .map(|&value| field.element_u32(value))
+        .collect();
+    let mut output = vec![0_u32; values.len()];
+    field.write_raw_words(&values, &mut output).unwrap();
+    let expected: Vec<_> = values.iter().map(|element| element.to_raw()).collect();
+    assert_eq!(output, expected);
+
+    // Length mismatches are rejected before any word is written.
+    let mut unchanged = vec![7_u32; 4];
+    assert!(matches!(
+        field.write_raw_words(&values[..2], &mut unchanged),
+        Err(FieldError::LengthMismatch)
+    ));
+    assert_eq!(unchanged, vec![7; 4]);
 }
