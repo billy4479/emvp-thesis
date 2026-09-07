@@ -9,7 +9,6 @@ bench = false
 
 [features]
 quick = []
-huge = []
 
 [dependencies]
 criterion = { workspace = true }
