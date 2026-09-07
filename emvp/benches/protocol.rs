@@ -43,6 +43,13 @@ const SERVER_ROW_COUNTS: [usize; 3] = [128, 1024, 8192];
 const ANSWER_CALIBRATION_ROW_COUNTS: [usize; 3] = [16, 31, 32];
 // Covers both sides of the n-row mask-block boundary during derivation.
 const DERIVE_ROW_COUNTS: [usize; 4] = [32, 128, 1024, 1025];
+// Huge row counts for the 12-core, 31GB reference machine, opt-in via the
+// `bench-huge` feature. Client cases stop at 65536 rows because the state
+// re-derived every iteration already dominates their cost, while the
+// server fixtures reach 262144 rows, a ~1GiB encrypted matrix.
+const HUGE_DERIVE_ROW_COUNTS: [usize; 2] = [4096, 16384];
+const HUGE_CLIENT_ROW_COUNTS: [usize; 2] = [16384, 65536];
+const HUGE_SERVER_ROW_COUNTS: [usize; 2] = [65536, 262_144];
 
 // LLM-scale record lengths: the model's hidden dimension, so `ell = 4096`
 // matches 7B-class weight matrices and `ell = 8192` 70B-class ones. Each
@@ -73,6 +80,16 @@ const TARGET_COLUMN_WEIGHT: usize = 16;
 fn benchmark_pool() -> &'static ThreadPool {
     static POOL: OnceLock<ThreadPool> = OnceLock::new();
     POOL.get_or_init(|| ThreadPoolBuilder::new().num_threads(8).build().unwrap())
+}
+
+// Server-phase helpers either install the fixed eight-thread pool that
+// keeps saved baselines comparable or, for the huge cases, run directly on
+// the rayon global pool a deployment would use.
+fn run_with_pool<R: Send>(pool: Option<&ThreadPool>, task: impl FnOnce() -> R + Send) -> R {
+    match pool {
+        Some(pool) => pool.install(task),
+        None => task(),
+    }
 }
 
 fn seeded_rng(domain: u8, size: usize) -> ChaCha20Rng {
@@ -237,6 +254,7 @@ fn bench_plaintext(
     tag: &str,
     params: EmvpParams,
     rows: usize,
+    pool: Option<&ThreadPool>,
 ) {
     let matrix = field_values(rows * params.ell, 0x0a);
     let query = field_values(params.ell, 0x0b);
@@ -247,7 +265,7 @@ fn bench_plaintext(
         BenchmarkId::from_parameter(bench_parameter(tag, rows)),
         |b| {
             b.iter(|| {
-                benchmark_pool().install(|| {
+                run_with_pool(pool, || {
                     output
                         .par_iter_mut()
                         .zip(matrix.par_chunks(params.ell))
@@ -288,6 +306,7 @@ fn bench_answer(
     tag: &str,
     params: EmvpParams,
     rows: usize,
+    pool: Option<&ThreadPool>,
 ) {
     let (encrypted, encrypted_query, _decoding_key) = protocol_fixtures(params, rows);
     let zero = PrimeField::<MODULUS>::new().element_u32(0);
@@ -297,17 +316,66 @@ fn bench_answer(
         BenchmarkId::from_parameter(bench_parameter(tag, rows)),
         |b| {
             b.iter(|| {
-                benchmark_pool()
-                    .install(|| {
-                        answer_into(
-                            black_box(&params),
-                            black_box(&encrypted),
-                            black_box(&encrypted_query),
-                            black_box(&mut output),
-                        )
-                    })
-                    .unwrap();
+                run_with_pool(pool, || {
+                    answer_into(
+                        black_box(&params),
+                        black_box(&encrypted),
+                        black_box(&encrypted_query),
+                        black_box(&mut output),
+                    )
+                })
+                .unwrap();
                 black_box(&output);
+            });
+        },
+    );
+}
+
+// Huge answer cases revive the historical variant pair over one shared
+// fixture set: `toeplitz_into` reuses caller-owned storage like the
+// production server path, while `toeplitz` allocates a fresh output every
+// iteration, matching the allocating wrapper the library dropped. Both run
+// on the rayon global pool; `answer_into` parallelizes through it
+// internally.
+fn bench_huge_answer(group: &mut BenchmarkGroup<'_, WallTime>, params: EmvpParams, rows: usize) {
+    let (encrypted, encrypted_query, _decoding_key) = protocol_fixtures(params, rows);
+    let zero = PrimeField::<MODULUS>::new().element_u32(0);
+    let mut output = vec![zero; rows * params.blocks().unwrap()];
+    group.throughput(elements(rows * params.n().unwrap()));
+
+    // One iteration performs rows * n modular MACs: 268435456 at the top
+    // size, ~0.5 s at ~2 ns per MAC across the twelve global-pool threads.
+    // Both huge sizes stay under a 1 s iteration, so the default 20-sample
+    // configuration stands.
+    group.bench_function(
+        BenchmarkId::new("toeplitz_into", bench_parameter("huge", rows)),
+        |b| {
+            b.iter(|| {
+                answer_into(
+                    black_box(&params),
+                    black_box(&encrypted),
+                    black_box(&encrypted_query),
+                    black_box(&mut output),
+                )
+                .unwrap();
+                black_box(&output);
+            });
+        },
+    );
+
+    group.bench_function(
+        BenchmarkId::new("toeplitz", bench_parameter("huge", rows)),
+        |b| {
+            b.iter(|| {
+                let mut fresh = vec![zero; rows * params.blocks().unwrap()];
+                answer_into(
+                    black_box(&params),
+                    black_box(&encrypted),
+                    black_box(&encrypted_query),
+                    black_box(&mut fresh),
+                )
+                .unwrap();
+                black_box(fresh);
             });
         },
     );
@@ -408,11 +476,11 @@ fn run_suite(criterion: &mut Criterion, tag: &str, params: EmvpParams, counts: &
     {
         let mut answer_group = suite_group(criterion, "answer", huge);
         for &rows in counts.server {
-            bench_answer(&mut answer_group, tag, params, rows);
+            bench_answer(&mut answer_group, tag, params, rows, Some(benchmark_pool()));
         }
         if !huge && common::calibration_enabled() {
             for &rows in &ANSWER_CALIBRATION_ROW_COUNTS {
-                bench_answer(&mut answer_group, tag, params, rows);
+                bench_answer(&mut answer_group, tag, params, rows, Some(benchmark_pool()));
             }
         }
         answer_group.finish();
@@ -429,7 +497,97 @@ fn run_suite(criterion: &mut Criterion, tag: &str, params: EmvpParams, counts: &
     {
         let mut plaintext_group = suite_group(criterion, "plaintext", huge);
         for &rows in counts.server {
-            bench_plaintext(&mut plaintext_group, tag, params, rows);
+            bench_plaintext(
+                &mut plaintext_group,
+                tag,
+                params,
+                rows,
+                Some(benchmark_pool()),
+            );
+        }
+        plaintext_group.finish();
+    }
+}
+
+// Huge standard-parameter cases sized for the 12-core, 31GB reference
+// machine, gated on `bench-huge`. The server phases run on the rayon
+// global pool a deployment would use instead of the fixed eight-thread
+// pool kept for baseline comparability; decode is single-threaded and
+// touches no pool, while the client phases reuse their single-threaded
+// helpers unchanged. The default sample size stands because no huge
+// iteration is estimated to cross one second.
+fn huge_benches(criterion: &mut Criterion) {
+    {
+        let mut derive_group = criterion.benchmark_group("derive");
+        for &rows in &HUGE_DERIVE_ROW_COUNTS {
+            bench_derive_for(
+                &mut derive_group,
+                "huge",
+                "toeplitz",
+                PARAMS,
+                rows,
+                toeplitz_block,
+            );
+            bench_derive_for(&mut derive_group, "huge", "raa", PARAMS, rows, raa_block);
+            bench_derive_for(&mut derive_group, "huge", "ring", PARAMS, rows, ring_block);
+        }
+        derive_group.finish();
+    }
+
+    {
+        let mut encrypt_group = criterion.benchmark_group("encrypt");
+        for &rows in &HUGE_CLIENT_ROW_COUNTS {
+            bench_encrypt_for(
+                &mut encrypt_group,
+                "huge",
+                "toeplitz",
+                PARAMS,
+                rows,
+                toeplitz_block,
+            );
+            bench_encrypt_for(&mut encrypt_group, "huge", "raa", PARAMS, rows, raa_block);
+            bench_encrypt_for(&mut encrypt_group, "huge", "ring", PARAMS, rows, ring_block);
+        }
+        encrypt_group.finish();
+    }
+
+    {
+        let mut query_group = criterion.benchmark_group("query");
+        for &rows in &HUGE_CLIENT_ROW_COUNTS {
+            bench_query_for(
+                &mut query_group,
+                "huge",
+                "toeplitz",
+                PARAMS,
+                rows,
+                toeplitz_block,
+            );
+            bench_query_for(&mut query_group, "huge", "raa", PARAMS, rows, raa_block);
+            bench_query_for(&mut query_group, "huge", "ring", PARAMS, rows, ring_block);
+        }
+        query_group.finish();
+    }
+
+    {
+        let mut answer_group = criterion.benchmark_group("answer");
+        for &rows in &HUGE_SERVER_ROW_COUNTS {
+            bench_huge_answer(&mut answer_group, PARAMS, rows);
+        }
+        answer_group.finish();
+    }
+
+    {
+        let mut decode_group = criterion.benchmark_group("decode");
+        for &rows in &HUGE_SERVER_ROW_COUNTS {
+            bench_decode(&mut decode_group, "huge", PARAMS, rows);
+        }
+        decode_group.finish();
+    }
+
+    {
+        let mut plaintext_group = criterion.benchmark_group("plaintext");
+        for &rows in &HUGE_SERVER_ROW_COUNTS {
+            bench_plaintext(&mut plaintext_group, "huge", PARAMS, rows, None);
         }
         plaintext_group.finish();
     }
@@ -459,10 +617,12 @@ fn llm_benches(criterion: &mut Criterion) {
 
 fn protocol_benches(c: &mut Criterion) {
     run_suite(c, "", PARAMS, &STANDARD_ROWS);
-    if common::skip_unless_huge("llm") {
-        return;
+    if !common::skip_unless_huge("huge") {
+        huge_benches(c);
     }
-    llm_benches(c);
+    if !common::skip_unless_huge("llm") {
+        llm_benches(c);
+    }
 }
 
 fn criterion_config() -> Criterion {
