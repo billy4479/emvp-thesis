@@ -24,10 +24,17 @@
 use std::fmt;
 
 use prime_field_layer::{FieldElement, PrimeField};
+use rayon::prelude::*;
 use trapdoor_matrices::{
     DenseMatrix, IrreducibleRingLpn, RaaScratch, RaaWeightedProduct, RingLpnScratch, TdmError,
     ToeplitzFastProduct, ToeplitzScratch,
 };
+
+/// Minimum estimated field multiplications before mask evaluation or
+/// materialization switches to rayon; smaller workloads stay serial. The
+/// value mirrors the crossover calibrated for the answer phase in
+/// [`crate::protocol`].
+const MIN_PARALLEL_MULTIPLICATIONS: usize = 32 * 1024;
 
 /// A rejected mask construction or evaluation.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -99,6 +106,16 @@ const fn check_len(name: &'static str, expected: usize, actual: usize) -> Result
 /// for user-supplied blocks. Every block is `rows x columns`; the shipped
 /// constructions are square `K x K`.
 ///
+/// # Thread-safety contract
+///
+/// Implementations must be usable from several threads at once (`Send` plus
+/// `Sync`, with a `Send` scratch): large [`RowStackMask`] applications and
+/// materializations run across rayon workers, which hold `&self` while
+/// moving disjoint output slices and [`Self::Scratch`] buffers between
+/// threads. Every shipped construction is a plain-data structure, so the
+/// bounds cost nothing for it; user-supplied blocks must uphold the same
+/// contract to remain usable as stack blocks.
+///
 /// # Cryptographic contract
 ///
 /// Protocol implementations must use independently sampled blocks whose
@@ -106,9 +123,12 @@ const fn check_len(name: &'static str, expected: usize, actual: usize) -> Result
 /// [`Self::apply`], [`Self::materialize`], and
 /// [`Self::materialize_top_rows`] must all represent the same linear map.
 /// The type system cannot verify either requirement for user implementations.
-pub trait TdmMask<const MODULUS: u32> {
+pub trait TdmMask<const MODULUS: u32>: Send + Sync {
     /// Reusable storage for allocation-free evaluation.
-    type Scratch;
+    ///
+    /// It must be `Send` because parallel evaluation hands one scratch value
+    /// to whichever worker owns the matching block.
+    type Scratch: Send;
 
     /// Returns the matrix dimensions `(rows, columns)`.
     #[must_use]
@@ -147,7 +167,12 @@ pub trait TdmMask<const MODULUS: u32> {
     ///
     /// Implementations may override this to make work proportional to the
     /// requested rows. The default avoids a full dense allocation and uses
-    /// structured evaluation once per column.
+    /// structured evaluation once per column. Columns are independent, so
+    /// wide masks evaluate them across rayon workers, each owning its own
+    /// scratch, input, and output buffers: results land in a column-major
+    /// staging buffer of disjoint per-column slices, and one linear pass
+    /// transposes them into the row-major output. The result is identical
+    /// to the serial column loop.
     ///
     /// # Errors
     ///
@@ -169,21 +194,51 @@ pub trait TdmMask<const MODULUS: u32> {
             return self.materialize();
         }
 
+        let field = PrimeField::<MODULUS>::new();
+        let zero = field.element_u32(0);
+        let one = field.element_u32(1);
         let length = rows
             .checked_mul(columns)
             .ok_or(MaskError::DimensionOverflow)?;
-        let zero = PrimeField::<MODULUS>::new().element_u32(0);
-        let one = PrimeField::<MODULUS>::new().element_u32(1);
-        let mut values = vec![zero; length];
-        let mut input = vec![zero; columns];
-        let mut output = vec![zero; full_rows];
-        let mut scratch = self.scratch();
-        for column in 0..columns {
-            input.fill(zero);
-            input[column] = one;
-            self.apply(&input, &mut output, &mut scratch)?;
-            for row in 0..rows {
-                values[row * columns + column] = output[row];
+        let mut staged = vec![zero; length];
+        // One structured evaluation applies the full mask: a conservative
+        // estimate of `columns * full_rows * columns` multiplications.
+        let threads = rayon::current_num_threads();
+        let work = columns.saturating_mul(full_rows).saturating_mul(columns);
+        if threads > 1
+            && columns >= threads.saturating_mul(2)
+            && work >= MIN_PARALLEL_MULTIPLICATIONS
+        {
+            staged
+                .par_chunks_mut(rows)
+                .enumerate()
+                .map_init(
+                    || (self.scratch(), vec![zero; columns], vec![zero; full_rows]),
+                    |(scratch, input, output), (column, staged_column)| {
+                        input.fill(zero);
+                        input[column] = one;
+                        self.apply(input, output, scratch)?;
+                        staged_column.copy_from_slice(&output[..rows]);
+                        Ok(())
+                    },
+                )
+                .try_for_each(|result: Result<(), MaskError>| result)?;
+        } else {
+            let mut input = vec![zero; columns];
+            let mut output = vec![zero; full_rows];
+            let mut scratch = self.scratch();
+            for (column, staged_column) in staged.chunks_mut(rows).enumerate() {
+                input.fill(zero);
+                input[column] = one;
+                self.apply(&input, &mut output, &mut scratch)?;
+                staged_column.copy_from_slice(&output[..rows]);
+            }
+        }
+
+        let mut values = Vec::with_capacity(length);
+        for row in 0..rows {
+            for column in 0..columns {
+                values.push(staged[column * rows + row]);
             }
         }
         Ok(DenseMatrix::new(rows, columns, values)?)
@@ -411,10 +466,13 @@ impl<M: TdmMask<MODULUS>, const MODULUS: u32> TdmMask<MODULUS> for RowStackMask<
     ///
     /// Every block multiplies the full input; block `i` writes rows
     /// `[i n, (i + 1) n)` of the output, and the last block writes only its
-    /// top `total_rows - (block_count - 1) * n` rows into the tail. All
-    /// protocol-level lengths are checked before `output` is mutated; a
-    /// failure raised by an individual block evaluation can leave the rows
-    /// of earlier blocks in place.
+    /// top `total_rows - (block_count - 1) * n` rows into the tail. The
+    /// full blocks write disjoint output slices, so large stacks evaluate
+    /// them across rayon workers while the tail block keeps its
+    /// scratch-mediated truncation serial; the output is identical to the
+    /// serial block loop. All protocol-level lengths are checked before
+    /// `output` is mutated; a failure raised by an individual block
+    /// evaluation can leave the rows of earlier blocks in place.
     ///
     /// # Errors
     ///
@@ -439,22 +497,46 @@ impl<M: TdmMask<MODULUS>, const MODULUS: u32> TdmMask<MODULUS> for RowStackMask<
         check_len("mask scratch tail", expected_tail, scratch.1.len())?;
 
         let last = self.blocks.len() - 1;
-        for (index, block) in self.blocks[..last].iter().enumerate() {
-            block.apply(
-                input,
-                &mut output[index * block_rows..(index + 1) * block_rows],
-                &mut scratch.0[index],
-            )?;
+        let tail_rows = self.total_rows - last * block_rows;
+        // The tail block goes through scratch only when it must truncate;
+        // otherwise it is an ordinary full block and joins the others.
+        let full_blocks = if tail_rows == block_rows {
+            self.blocks.len()
+        } else {
+            last
+        };
+
+        // Every block multiplies the full input: a conservative estimate of
+        // `block_count * n * n` multiplications.
+        let threads = rayon::current_num_threads();
+        let work = self
+            .blocks
+            .len()
+            .saturating_mul(block_rows)
+            .saturating_mul(block_rows);
+        if threads > 1
+            && full_blocks >= threads.saturating_mul(2)
+            && work >= MIN_PARALLEL_MULTIPLICATIONS
+        {
+            let (full_output, _tail_output) = output.split_at_mut(full_blocks * block_rows);
+            self.blocks[..full_blocks]
+                .par_iter()
+                .zip(scratch.0[..full_blocks].par_iter_mut())
+                .zip(full_output.par_chunks_mut(block_rows))
+                .try_for_each(|((block, block_scratch), block_output)| {
+                    block.apply(input, block_output, block_scratch)
+                })?;
+        } else {
+            for (index, block) in self.blocks[..full_blocks].iter().enumerate() {
+                block.apply(
+                    input,
+                    &mut output[index * block_rows..(index + 1) * block_rows],
+                    &mut scratch.0[index],
+                )?;
+            }
         }
 
-        let tail_rows = self.total_rows - last * block_rows;
-        if tail_rows == block_rows {
-            self.blocks[last].apply(
-                input,
-                &mut output[last * block_rows..],
-                &mut scratch.0[last],
-            )?;
-        } else {
+        if full_blocks == last {
             self.blocks[last].apply(input, &mut scratch.1, &mut scratch.0[last])?;
             output[last * block_rows..].copy_from_slice(&scratch.1[..tail_rows]);
         }
@@ -463,6 +545,11 @@ impl<M: TdmMask<MODULUS>, const MODULUS: u32> TdmMask<MODULUS> for RowStackMask<
 
     /// Stacks the dense block matrices vertically and truncates the last
     /// block to its top `total_rows mod n` rows.
+    ///
+    /// The blocks materialize independently into disjoint output slabs, so
+    /// large stacks run them across rayon workers; the indexed parallel
+    /// collect preserves block order and the result is identical to the
+    /// serial loop. The truncated tail block stays serial.
     ///
     /// # Errors
     ///
@@ -482,13 +569,29 @@ impl<M: TdmMask<MODULUS>, const MODULUS: u32> TdmMask<MODULUS> for RowStackMask<
             return Ok(matrix);
         }
 
-        let first = self.blocks[0].materialize()?;
-        check_len("materialized block rows", block_rows, first.rows())?;
-        check_len("materialized block columns", block_rows, first.columns())?;
-        let mut values = first.into_values();
-        values.reserve(length - values.len());
-        for block in &self.blocks[1..last] {
-            let matrix = block.materialize()?;
+        // One block materialization applies the block to every basis vector:
+        // a conservative estimate of `n * n * n` multiplications per block.
+        let threads = rayon::current_num_threads();
+        let work = last
+            .saturating_mul(block_rows)
+            .saturating_mul(block_rows)
+            .saturating_mul(block_rows);
+        let fulls: Vec<DenseMatrix<MODULUS>> = if threads > 1
+            && last >= threads.saturating_mul(2)
+            && work >= MIN_PARALLEL_MULTIPLICATIONS
+        {
+            self.blocks[..last]
+                .par_iter()
+                .map(M::materialize)
+                .collect::<Result<Vec<_>, MaskError>>()?
+        } else {
+            self.blocks[..last]
+                .iter()
+                .map(M::materialize)
+                .collect::<Result<Vec<_>, MaskError>>()?
+        };
+        let mut values = Vec::with_capacity(length);
+        for matrix in &fulls {
             check_len("materialized block rows", block_rows, matrix.rows())?;
             check_len("materialized block columns", block_rows, matrix.columns())?;
             values.extend_from_slice(matrix.values());

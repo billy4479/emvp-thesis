@@ -378,6 +378,31 @@ fn partial_toeplitz_materialization_matches_full_row_prefix() {
 }
 
 #[test]
+fn parallel_toeplitz_top_rows_matches_serial_and_the_full_prefix() {
+    // k = 64: 8 * 64 * 64 = 32768 estimated multiplications clear the
+    // parallel-work threshold and 8 >= 2 * 4 rows satisfy the thread guard,
+    // so the four-thread run forces the parallel branch while the
+    // single-thread run takes the serial reference path.
+    let mut rng = ChaCha20Rng::seed_from_u64(0x7a00);
+    let product = ToeplitzFastProduct::<1_073_479_681>::sample(64, &mut rng).unwrap();
+
+    let run = |threads: usize| {
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(threads)
+            .build()
+            .unwrap()
+            .install(|| product.materialize_top_rows(8))
+            .unwrap()
+    };
+    let parallel = run(4);
+    let serial = run(1);
+    assert_eq!(parallel, serial);
+
+    let full = product.materialize().unwrap();
+    assert_eq!(parallel.values(), &full.values()[..8 * 64]);
+}
+
+#[test]
 fn full_toeplitz_product_length_errors_leave_output_unchanged() {
     let product = explicit_fast_product();
     let mut scratch = product.scratch();

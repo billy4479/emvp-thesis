@@ -7,8 +7,14 @@
 
 use prime_field_layer::{FieldElement, NttBackend, NttPerformanceWarning, NttPlan, PrimeField};
 use rand_core::CryptoRng;
+use rayon::prelude::*;
 
 use crate::{DenseMatrix, Permutation, TdmError, error::check_len};
+
+/// Minimum estimated field multiplications before a materialization switches
+/// to rayon; smaller workloads stay on the serial path. The value mirrors the
+/// crossover calibrated for the emvp answer phase.
+const MIN_PARALLEL_MULTIPLICATIONS: usize = 32 * 1024;
 
 /// A rectangular Toeplitz linear map evaluated through a cached cyclic NTT.
 ///
@@ -487,6 +493,10 @@ impl<const MODULUS: u32> ToeplitzFastProduct<MODULUS> {
     ///
     /// This applies the transposed product to `rows` basis vectors, so work
     /// and output storage scale with the requested row count rather than `K`.
+    /// Rows are independent and write disjoint output slices, so large
+    /// requests run across rayon workers, each owning its own scratch,
+    /// input, and output buffers; the result is identical to the serial row
+    /// loop.
     ///
     /// # Errors
     ///
@@ -506,26 +516,52 @@ impl<const MODULUS: u32> ToeplitzFastProduct<MODULUS> {
         let field = PrimeField::<MODULUS>::new();
         let zero = field.element_u32(0);
         let one = field.element_u32(1);
-        let mut values = Vec::with_capacity(
-            rows.checked_mul(self.k)
-                .ok_or(TdmError::DimensionOverflow)?,
-        );
-        let mut input = vec![zero; self.k].into_boxed_slice();
-        let mut output = vec![zero; self.k].into_boxed_slice();
-        let mut scratch = self.scratch();
+        let k = self.k;
+        let mut values = vec![zero; rows.checked_mul(k).ok_or(TdmError::DimensionOverflow)?];
         let spectra = ToeplitzTransposeSpectra {
             right: self.s_right.transpose_spectrum(),
             middle: self.middle.transpose_spectrum(),
             left: self.s_left.transpose_spectrum(),
         };
 
-        for row in 0..rows {
-            input.fill(zero);
-            input[row] = one;
-            self.apply_transpose(&input, &mut output, &mut scratch, &spectra)?;
-            values.extend_from_slice(&output);
+        // One transposed evaluation costs at least one `K x K` product, so
+        // `rows * K * K` is a conservative multiplication estimate.
+        let threads = rayon::current_num_threads();
+        let work = rows.saturating_mul(k).saturating_mul(k);
+        if threads > 1 && rows >= threads.saturating_mul(2) && work >= MIN_PARALLEL_MULTIPLICATIONS
+        {
+            values
+                .par_chunks_mut(k)
+                .enumerate()
+                .map_init(
+                    || {
+                        (
+                            self.scratch(),
+                            vec![zero; k].into_boxed_slice(),
+                            vec![zero; k].into_boxed_slice(),
+                        )
+                    },
+                    |(scratch, input, output), (row, output_row)| {
+                        input.fill(zero);
+                        input[row] = one;
+                        self.apply_transpose(input, output, scratch, &spectra)?;
+                        output_row.copy_from_slice(output);
+                        Ok(())
+                    },
+                )
+                .try_for_each(|result: Result<(), TdmError>| result)?;
+        } else {
+            let mut input = vec![zero; k].into_boxed_slice();
+            let mut output = vec![zero; k].into_boxed_slice();
+            let mut scratch = self.scratch();
+            for (row, output_row) in values.chunks_mut(k).enumerate() {
+                input.fill(zero);
+                input[row] = one;
+                self.apply_transpose(&input, &mut output, &mut scratch, &spectra)?;
+                output_row.copy_from_slice(&output);
+            }
         }
-        DenseMatrix::new(rows, self.k, values)
+        DenseMatrix::new(rows, k, values)
     }
 }
 

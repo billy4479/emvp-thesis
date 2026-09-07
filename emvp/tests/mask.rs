@@ -8,6 +8,7 @@ use prime_field_layer::{FieldElement, PrimeField};
 use proptest::prelude::*;
 use rand_chacha::ChaCha20Rng;
 use rand_core::SeedableRng;
+use rayon::{ThreadPool, ThreadPoolBuilder};
 use trapdoor_matrices::{
     DenseMatrix, IrreducibleRingLpn, RaaWeightedProduct, SparseMatrix, TdmError,
     ToeplitzFastProduct,
@@ -564,4 +565,89 @@ proptest! {
             prop_assert_eq!(field_values(&structured), field_values(&expected));
         }
     }
+}
+
+fn pool(threads: usize) -> ThreadPool {
+    ThreadPoolBuilder::new()
+        .num_threads(threads)
+        .build()
+        .unwrap()
+}
+
+// A stack of `k = 64` Toeplitz blocks large enough that the parallel guards
+// clear at the crate's 32768-multiplication threshold under a four-thread
+// pool.
+fn wide_toeplitz_stack(
+    blocks: usize,
+    total_rows: usize,
+    seed: u64,
+) -> RowStackMask<ToeplitzFastProduct<MODULUS>, MODULUS> {
+    let mut rng = ChaCha20Rng::seed_from_u64(seed);
+    let stacked: Vec<_> = (0..blocks)
+        .map(|_| ToeplitzFastProduct::sample(64, &mut rng).unwrap())
+        .collect();
+    RowStackMask::new(stacked, total_rows).unwrap()
+}
+
+#[test]
+fn parallel_stack_apply_matches_the_serial_block_loop_and_dense_oracle() {
+    // 16 blocks * 64 * 64 = 65536 estimated multiplications clear the work
+    // threshold and the 15 full blocks satisfy the 2 * 4-threads guard,
+    // while the ragged tail keeps the serial tail path exercised in both
+    // runs.
+    let total_rows = 15 * 64 + 32;
+    let stack = wide_toeplitz_stack(16, total_rows, 0x6a00);
+    let mut rng = ChaCha20Rng::seed_from_u64(0x6a01);
+    let input = random_vector::<MODULUS>(64, &mut rng);
+
+    let run = |threads: usize| {
+        let mut structured = zeros::<MODULUS>(total_rows);
+        let mut scratch = stack.scratch();
+        pool(threads)
+            .install(|| stack.apply(&input, &mut structured, &mut scratch))
+            .unwrap();
+        structured
+    };
+    let parallel = run(4);
+    let serial = run(1);
+    assert_eq!(field_values(&parallel), field_values(&serial));
+
+    let mut expected = zeros::<MODULUS>(total_rows);
+    stacked_dense(&stack).apply(&input, &mut expected).unwrap();
+    assert_eq!(field_values(&parallel), field_values(&expected));
+}
+
+#[test]
+fn parallel_stack_materialize_matches_the_serial_stack_and_dense_oracle() {
+    // 15 full blocks * 64^3 = 3932160 estimated multiplications clear the
+    // work threshold and the block count satisfies the 2 * 4-threads guard.
+    let total_rows = 15 * 64 + 32;
+    let stack = wide_toeplitz_stack(16, total_rows, 0x6a02);
+    let parallel = pool(4).install(|| stack.materialize()).unwrap();
+    let serial = pool(1).install(|| stack.materialize()).unwrap();
+    assert_eq!(parallel, serial);
+    assert_eq!(parallel, stacked_dense(&stack));
+}
+
+#[test]
+fn parallel_materialize_top_rows_matches_serial_and_the_full_prefix() {
+    // The default structured evaluation runs once per column: k = 33 gives
+    // 33 * 33 * 33 = 35937 estimated multiplications and 33 >= 2 * 4
+    // columns, clearing both guards with top rows strictly below the full
+    // height so the structured path actually runs.
+    let mut rng = ChaCha20Rng::seed_from_u64(0x6a03);
+    let raa: RaaWeightedProduct<MODULUS> =
+        RaaWeightedProduct::sample_nonzero(33, 3, &mut rng).unwrap();
+
+    let run = |threads: usize| {
+        pool(threads)
+            .install(|| TdmMask::materialize_top_rows(&raa, 32))
+            .unwrap()
+    };
+    let parallel = run(4);
+    let serial = run(1);
+    assert_eq!(parallel, serial);
+
+    let full = TdmMask::materialize(&raa).unwrap();
+    assert_eq!(parallel.values(), &full.values()[..32 * 33]);
 }

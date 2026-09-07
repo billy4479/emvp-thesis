@@ -15,6 +15,7 @@ workspace = true
 [dependencies]
 prime-field-layer = { path = "../prime-field-layer" }
 rand_core = { workspace = true }
+rayon = { workspace = true }
 
 [dev-dependencies]
 allocation-counter = { workspace = true }
