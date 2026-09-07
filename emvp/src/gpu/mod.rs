@@ -350,7 +350,13 @@ impl GpuAnswerer {
         let n = params.n()?;
         check_len("encrypted matrix columns", n, matrix.columns())?;
         let rows = matrix.rows();
-        check_len("matrix rows", 1, rows)?;
+        if rows == 0 {
+            return Err(GpuError::LengthMismatch {
+                name: "matrix rows",
+                expected: 1,
+                actual: 0,
+            });
+        }
         let words = rows.checked_mul(n).ok_or(GpuError::DimensionOverflow)?;
         // The u32 narrowing doubles as the kernel's u32 index bound: every
         // matrix index is below `rows * n = words`.

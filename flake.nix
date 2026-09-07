@@ -45,6 +45,13 @@
             vulkan-loader
             vulkan-tools
           ];
+
+          # Cargo-built binaries dlopen libvulkan.so.1 at runtime, so the
+          # loader library must be findable outside the shell's link-time
+          # flags.
+          shellHook = ''
+            export LD_LIBRARY_PATH="${pkgs.vulkan-loader}/lib''${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+          '';
         };
       }
     );
