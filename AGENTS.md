@@ -26,4 +26,4 @@ Let a subagent do this benchmarking work, while you focus on the actual feature.
 
 ## References
 
-Always cite your references, so that I can use them in my bibliography. Keep track of them in `BIBLIOGRAPHY.md`.
+Always cite your references, so that I can use them in my bibliography. Keep track of them in `../BIBLIOGRAPHY.yml`.
