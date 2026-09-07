@@ -18,7 +18,10 @@ use trapdoor_matrices::{
 
 const MODULUS: u32 = 1_073_479_681;
 const RAA_C: usize = 4;
-const TARGET_COLUMN_WEIGHT: usize = 16;
+// Column weight `t` of the secret sparse matrix `E` (the paper's expected
+// nonzero count per column, measured exactly instead of in expectation),
+// sized to the project policy floor `POLICY_WEIGHT_FLOOR`.
+const TARGET_COLUMN_WEIGHT: usize = 192;
 
 fn seeded_rng(domain: u8, size: usize) -> ChaCha20Rng {
     let mut seed = [domain; 32];

@@ -82,8 +82,9 @@ const STANDARD_ROWS: SuiteRows = SuiteRows {
     server: &SERVER_ROW_COUNTS,
 };
 
-// Sparse column weight of the Ring-LPN benchmark blocks.
-const TARGET_COLUMN_WEIGHT: usize = 16;
+// Sparse column weight `t` of the Ring-LPN benchmark blocks' secret `E`,
+// sized to the project policy floor `POLICY_WEIGHT_FLOOR`.
+const TARGET_COLUMN_WEIGHT: usize = 192;
 
 fn benchmark_pool() -> &'static ThreadPool {
     static POOL: OnceLock<ThreadPool> = OnceLock::new();
