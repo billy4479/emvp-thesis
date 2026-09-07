@@ -7,7 +7,7 @@ edition = "2024"
 bench = false
 
 [features]
-bench-quick = []
+bench-quick = ["bench-common/quick"]
 
 [lints]
 workspace = true

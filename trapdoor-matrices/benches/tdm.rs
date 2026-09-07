@@ -5,6 +5,7 @@
 
 use std::{hint::black_box, time::Duration};
 
+use bench_common as common;
 use criterion::{
     BatchSize, BenchmarkGroup, BenchmarkId, Criterion, Throughput, criterion_group, criterion_main,
     measurement::WallTime,
@@ -242,43 +243,40 @@ fn all_tdms<const MODULUS: u32>(c: &mut Criterion) {
     macro_rules! all {
         ($($n:expr),* $(,)?) => {
             bench_group!("ring_lpn", "construction", ring_construction_for, $($n),*);
-            bench_group!("ring_lpn", "materialize", ring_materialize_for, $($n),*);
-            bench_group!("ring_lpn", "apply", ring_apply_for, $($n),*);
-
             bench_group!("toeplitz", "construction", toeplitz_construction_for, $($n),*);
-            bench_group!("toeplitz", "materialize", toeplitz_materialize_for, $($n),*);
-            bench_group!("toeplitz", "apply", toeplitz_apply_for, $($n),*);
-
             bench_group!("raa", "construction", raa_construction_for, $($n),*);
-            bench_group!("raa", "materialize", raa_materialize_for, $($n),*);
+
+            bench_group!("ring_lpn", "apply", ring_apply_for, $($n),*);
+            bench_group!("toeplitz", "apply", toeplitz_apply_for, $($n),*);
             bench_group!("raa", "apply", raa_apply_for, $($n),*);
         };
     }
 
-    #[cfg(feature = "bench-quick")]
-    all!(256, 1024);
-
-    #[cfg(not(feature = "bench-quick"))]
-    all!(256, 1024, 4096, 8192);
-}
-
-fn criterion_config() -> Criterion {
-    if cfg!(feature = "bench-quick") {
-        Criterion::default()
-            .sample_size(10)
-            .warm_up_time(Duration::from_millis(250))
-            .measurement_time(Duration::from_secs(1))
-    } else {
-        Criterion::default()
-            .sample_size(20)
-            .warm_up_time(Duration::from_secs(1))
-            .measurement_time(Duration::from_secs(2))
+    macro_rules! all_materialize {
+        ($($n:expr),* $(,)?) => {
+            bench_group!("ring_lpn", "materialize", ring_materialize_for, $($n),*);
+            bench_group!("toeplitz", "materialize", toeplitz_materialize_for, $($n),*);
+            bench_group!("raa", "materialize", raa_materialize_for, $($n),*);
+        };
     }
+
+    // Construction and apply are the protocol-relevant paths; the default
+    // suite uses the LLM-scale block dimensions (the protocol's mask blocks
+    // at the LLM record lengths have n = 8192/16384).
+    if common::is_quick() {
+        all!(256, 1024);
+    } else {
+        all!(8_192, 16_384);
+    }
+    // Materialize is the O(k^2) dense reference path the protocol never
+    // runs (a 16384 x 16384 output costs ~2 min per iteration), so it
+    // always stays at the small reference sizes.
+    all_materialize!(256, 1024);
 }
 
 criterion_group! {
     name = benches;
-    config = criterion_config();
+    config = common::criterion_tuned(20, Duration::from_secs(1), Duration::from_secs(2));
     targets = all_tdms<MODULUS>
 }
 criterion_main!(benches);
