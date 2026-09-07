@@ -12,7 +12,8 @@ use criterion::{
 };
 use emvp::{
     AnswerMatrix, DecodingKey, DerivedState, EmvpParams, EncryptedMatrix, EncryptedQuery,
-    ProtocolError, SecretKey, TdmMask, answer_into, decode_into, encrypt, query, search,
+    ProtocolError, SecretKey, TdmMask, answer_batch, answer_into, decode_into, encrypt, query,
+    search,
 };
 use prime_field_layer::{FieldElement, PrimeField};
 use rand_chacha::ChaCha20Rng;
@@ -50,6 +51,13 @@ const DERIVE_ROW_COUNTS: [usize; 4] = [32, 128, 1024, 1025];
 const HUGE_DERIVE_ROW_COUNTS: [usize; 2] = [4096, 16384];
 const HUGE_CLIENT_ROW_COUNTS: [usize; 2] = [16384, 65536];
 const HUGE_SERVER_ROW_COUNTS: [usize; 2] = [65536, 262_144];
+// Batched server answers as (batch size, rows) pairs. Each iteration
+// performs B * rows * n = 536870912 modular MACs, ~1.1 s at the ~2 ns per
+// MAC planning figure, just under the ~1.2 s per-iteration cap that keeps
+// the default sample size, so no case is shrunk.
+const HUGE_ANSWER_BATCH_CASES: [(usize, usize); 2] = [(8, 65536), (32, 16384)];
+// Batch size of the standard-suite answer_batch cases.
+const ANSWER_BATCH: usize = 4;
 
 // LLM-scale record lengths: the model's hidden dimension, so `ell = 4096`
 // matches 7B-class weight matrices and `ell = 8192` 70B-class ones. Each
@@ -283,8 +291,32 @@ fn bench_plaintext(
     );
 }
 
-// One client run producing the server and client fixtures for the answer
-// and decode phases.
+// One client run producing the encrypted matrix plus `count` queries with
+// decoding keys, shared by the answer and decode phases. Fixture building
+// happens once per case, never per iteration.
+fn protocol_fixtures_batch(
+    params: EmvpParams,
+    rows: usize,
+    count: usize,
+) -> (
+    EncryptedMatrix<MODULUS>,
+    Vec<EncryptedQuery<MODULUS>>,
+    Vec<DecodingKey<MODULUS>>,
+) {
+    let mut state = derive_with(params, rows, 0x06, toeplitz_block);
+    let matrix = field_values(rows * params.ell, 0x07);
+    let record = field_values(params.ell, 0x08);
+    let encrypted = encrypt(&mut state, &matrix).unwrap();
+    let mut queries = Vec::with_capacity(count);
+    let mut decoding_keys = Vec::with_capacity(count);
+    for _ in 0..count {
+        let (encrypted_query, decoding_key) = query(&mut state, &record).unwrap();
+        queries.push(encrypted_query);
+        decoding_keys.push(decoding_key);
+    }
+    (encrypted, queries, decoding_keys)
+}
+
 fn protocol_fixtures(
     params: EmvpParams,
     rows: usize,
@@ -293,12 +325,12 @@ fn protocol_fixtures(
     EncryptedQuery<MODULUS>,
     DecodingKey<MODULUS>,
 ) {
-    let mut state = derive_with(params, rows, 0x06, toeplitz_block);
-    let matrix = field_values(rows * params.ell, 0x07);
-    let record = field_values(params.ell, 0x08);
-    let encrypted = encrypt(&mut state, &matrix).unwrap();
-    let (encrypted_query, decoding_key) = query(&mut state, &record).unwrap();
-    (encrypted, encrypted_query, decoding_key)
+    let (encrypted, mut queries, mut decoding_keys) = protocol_fixtures_batch(params, rows, 1);
+    (
+        encrypted,
+        queries.pop().unwrap(),
+        decoding_keys.pop().unwrap(),
+    )
 }
 
 fn bench_answer(
@@ -326,6 +358,36 @@ fn bench_answer(
                 })
                 .unwrap();
                 black_box(&output);
+            });
+        },
+    );
+}
+
+// The batched server answer answers `batch` queries against one encrypted
+// matrix, allocating one output arena per iteration and parallelizing the
+// flattened (query, row) grid internally.
+fn bench_answer_batch(
+    group: &mut BenchmarkGroup<'_, WallTime>,
+    tag: &str,
+    params: EmvpParams,
+    rows: usize,
+    batch: usize,
+    pool: Option<&ThreadPool>,
+) {
+    let (encrypted, queries, _decoding_keys) = protocol_fixtures_batch(params, rows, batch);
+    group.throughput(elements(batch * rows * params.n().unwrap()));
+    group.bench_function(
+        BenchmarkId::new(format!("batch{batch}"), bench_parameter(tag, rows)),
+        |b| {
+            b.iter(|| {
+                run_with_pool(pool, || {
+                    answer_batch(
+                        black_box(&params),
+                        black_box(&encrypted),
+                        black_box(&queries),
+                    )
+                })
+                .unwrap();
             });
         },
     );
@@ -478,6 +540,16 @@ fn run_suite(criterion: &mut Criterion, tag: &str, params: EmvpParams, counts: &
         for &rows in counts.server {
             bench_answer(&mut answer_group, tag, params, rows, Some(benchmark_pool()));
         }
+        for &rows in counts.server {
+            bench_answer_batch(
+                &mut answer_group,
+                tag,
+                params,
+                rows,
+                ANSWER_BATCH,
+                Some(benchmark_pool()),
+            );
+        }
         if !huge && common::calibration_enabled() {
             for &rows in &ANSWER_CALIBRATION_ROW_COUNTS {
                 bench_answer(&mut answer_group, tag, params, rows, Some(benchmark_pool()));
@@ -572,6 +644,9 @@ fn huge_benches(criterion: &mut Criterion) {
         let mut answer_group = criterion.benchmark_group("answer");
         for &rows in &HUGE_SERVER_ROW_COUNTS {
             bench_huge_answer(&mut answer_group, PARAMS, rows);
+        }
+        for &(batch, rows) in &HUGE_ANSWER_BATCH_CASES {
+            bench_answer_batch(&mut answer_group, "huge", PARAMS, rows, batch, None);
         }
         answer_group.finish();
     }

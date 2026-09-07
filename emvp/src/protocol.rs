@@ -220,6 +220,11 @@ const fn check_len(
     }
 }
 
+/// Minimum estimated field multiplications before a protocol kernel switches
+/// to rayon; smaller workloads stay serial. The answer-phase crossover this
+/// value calibrates was measured once when sizing the benchmark thread pool.
+const MIN_PARALLEL_MULTIPLICATIONS: usize = 32 * 1024;
+
 fn fill_answer_row<const MODULUS: u32>(
     matrix_row: &[FieldElement<MODULUS>],
     query: &[FieldElement<MODULUS>],
@@ -776,7 +781,10 @@ impl<const MODULUS: u32> AnswerMatrix<MODULUS> {
 /// Encrypts a row-major `rows x ell` matrix for the server.
 ///
 /// The mask is materialized into the `rows x n` ciphertext allocation and
-/// overwritten row by row after encoding and permutation. This is the offline
+/// overwritten row by row after encoding and permutation. Rows are
+/// independent, so large matrices run the encode-mask-permute pipeline
+/// across rayon workers, each owning fresh code scratch and a row buffer;
+/// the ciphertext is identical to the serial row loop. This is the offline
 /// phase of the protocol. A derived state can encrypt exactly one matrix.
 ///
 /// # Errors
@@ -800,26 +808,85 @@ pub fn encrypt<const MODULUS: u32, M: TdmMask<MODULUS>>(
     check_len("input matrix", expected, matrix.len())?;
 
     let mut encoded = state.mask.materialize()?.into_values();
-    let zero = PrimeField::<MODULUS>::new().element_u32(0);
-    let mut row = vec![zero; n];
-    for row_index in 0..rows {
-        state.code.dual_encode_row(
-            &matrix[row_index * ell..(row_index + 1) * ell],
-            &mut row,
-            &mut state.online_scratch.code,
-        )?;
-        let output_row = &mut encoded[row_index * n..(row_index + 1) * n];
-        for (slot, &masked) in row.iter_mut().zip(output_row.iter()) {
-            *slot += masked;
-        }
-        state.permutation.apply(&row, output_row)?;
-    }
+    fill_encrypted_rows(
+        &state.code,
+        &state.permutation,
+        matrix,
+        &mut encoded,
+        ell,
+        n,
+        rows,
+    )?;
     let encrypted = EncryptedMatrix {
         matrix: DenseMatrix::new(rows, n, encoded)?,
         instance_id: state.instance_id,
     };
     state.encrypted = true;
     Ok(encrypted)
+}
+
+/// Fills the ciphertext rows: dual-encode each plaintext row, add the
+/// materialized mask row, and apply the public gather permutation.
+///
+/// One row costs at least one `n`-element convolution, mask addition, and
+/// gather, so `rows * n` is a conservative multiplication estimate for the
+/// parallel guard. Workers initialize one code scratch and one row buffer
+/// per thread, and every row writes a disjoint ciphertext slice.
+fn fill_encrypted_rows<const MODULUS: u32>(
+    code: &CyclicDualCode<MODULUS>,
+    permutation: &Permutation,
+    matrix: &[FieldElement<MODULUS>],
+    encoded: &mut [FieldElement<MODULUS>],
+    ell: usize,
+    n: usize,
+    rows: usize,
+) -> Result<(), ProtocolError> {
+    let zero = PrimeField::<MODULUS>::new().element_u32(0);
+    let threads = rayon::current_num_threads();
+    let work = rows.saturating_mul(n);
+    if threads > 1 && rows >= threads.saturating_mul(2) && work >= MIN_PARALLEL_MULTIPLICATIONS {
+        encoded
+            .par_chunks_mut(n)
+            .zip(matrix.par_chunks(ell))
+            .map_init(
+                || (code.scratch(), vec![zero; n]),
+                |(scratch, row), (output_row, matrix_row)| {
+                    encode_masked_row(code, permutation, matrix_row, row, output_row, scratch)
+                },
+            )
+            .try_for_each(|result| result)
+    } else {
+        let mut scratch = code.scratch();
+        let mut row = vec![zero; n];
+        for (output_row, matrix_row) in encoded.chunks_mut(n).zip(matrix.chunks(ell)) {
+            encode_masked_row(
+                code,
+                permutation,
+                matrix_row,
+                &mut row,
+                output_row,
+                &mut scratch,
+            )?;
+        }
+        Ok(())
+    }
+}
+
+/// Encodes one plaintext row, masks it with the materialized row, and
+/// gathers it through the public permutation into `output_row`.
+fn encode_masked_row<const MODULUS: u32>(
+    code: &CyclicDualCode<MODULUS>,
+    permutation: &Permutation,
+    matrix_row: &[FieldElement<MODULUS>],
+    row: &mut [FieldElement<MODULUS>],
+    output_row: &mut [FieldElement<MODULUS>],
+    scratch: &mut CyclicCodeScratch<MODULUS>,
+) -> Result<(), ProtocolError> {
+    code.dual_encode_row(matrix_row, row, scratch)?;
+    for (slot, &masked) in row.iter_mut().zip(output_row.iter()) {
+        *slot += masked;
+    }
+    Ok(permutation.apply(row, output_row)?)
 }
 
 /// Generates an encrypted query for `q` plus the client's decoding key.
@@ -1014,6 +1081,16 @@ fn validate_answer<const MODULUS: u32>(
     let s = params.blocks()?;
     let rows = matrix.rows();
     check_len("encrypted matrix columns", n, matrix.columns())?;
+    validate_query_against_matrix(n, matrix, query)?;
+    Ok((n, b, s, rows))
+}
+
+/// Checks one query's length and instance identifier against the matrix.
+fn validate_query_against_matrix<const MODULUS: u32>(
+    n: usize,
+    matrix: &EncryptedMatrix<MODULUS>,
+    query: &EncryptedQuery<MODULUS>,
+) -> Result<(), ProtocolError> {
     check_len("encrypted query", n, query.values.len())?;
     if query.instance_id != matrix.instance_id {
         return Err(ProtocolError::InstanceMismatch {
@@ -1022,7 +1099,7 @@ fn validate_answer<const MODULUS: u32>(
             actual: query.instance_id,
         });
     }
-    Ok((n, b, s, rows))
+    Ok(())
 }
 
 fn fill_answer<const MODULUS: u32>(
@@ -1034,7 +1111,6 @@ fn fill_answer<const MODULUS: u32>(
     s: usize,
     rows: usize,
 ) {
-    const MIN_PARALLEL_MULTIPLICATIONS: usize = 32 * 1024;
     let threads = rayon::current_num_threads();
     let work = rows.saturating_mul(n);
     if threads > 1 && rows >= threads.saturating_mul(2) && work >= MIN_PARALLEL_MULTIPLICATIONS {
@@ -1047,6 +1123,100 @@ fn fill_answer<const MODULUS: u32>(
     } else {
         for (output_row, matrix_row) in output.chunks_exact_mut(s).zip(matrix.values().chunks(n)) {
             fill_answer_row(matrix_row, &query.values, b, output_row);
+        }
+    }
+}
+
+/// Answers a batch of encrypted queries against one encrypted matrix.
+///
+/// Every query is answered exactly as [`answer_into`] answers it alone:
+/// the server performs `s` column-block matrix-vector products per row,
+/// for `queries.len() * m * n` field multiplications in total. The answers
+/// are written into one query-major arena whose flattened (query, row) grid
+/// runs across rayon workers when it clears the crate's parallel-work
+/// threshold; smaller batches stay on the serial row loop.
+///
+/// # Errors
+///
+/// Validation is all-or-nothing, matching [`answer_into`]: parameters are
+/// checked once, and every query must have length `n` and carry the
+/// matrix's instance identifier before any output is produced. An empty
+/// batch is rejected with a `queries` length mismatch, consistent with how
+/// the crate treats empty block lists and row counts elsewhere.
+pub fn answer_batch<const MODULUS: u32>(
+    params: &EmvpParams,
+    matrix: &EncryptedMatrix<MODULUS>,
+    queries: &[EncryptedQuery<MODULUS>],
+) -> Result<Vec<AnswerMatrix<MODULUS>>, ProtocolError> {
+    let Some(first) = queries.first() else {
+        return Err(ProtocolError::LengthMismatch {
+            name: "queries",
+            expected: 1,
+            actual: 0,
+        });
+    };
+    let (n, b, s, rows) = validate_answer(params, matrix, first)?;
+    for query in &queries[1..] {
+        validate_query_against_matrix(n, matrix, query)?;
+    }
+    let answer_len = rows
+        .checked_mul(s)
+        .ok_or(ProtocolError::DimensionOverflow)?;
+    let arena_len = queries
+        .len()
+        .checked_mul(answer_len)
+        .ok_or(ProtocolError::DimensionOverflow)?;
+    let zero = PrimeField::<MODULUS>::new().element_u32(0);
+    let mut arena = vec![zero; arena_len];
+    fill_answer_batch(matrix, queries, &mut arena, n, b, s, rows);
+    Ok(arena
+        .chunks_exact(answer_len)
+        .zip(queries.iter())
+        .map(|(values, query)| {
+            AnswerMatrix::from_parts(
+                matrix.instance_id(),
+                query.query_id(),
+                values.to_vec(),
+                rows,
+                s,
+            )
+        })
+        .collect())
+}
+
+/// Fills a query-major arena holding each batch answer back to back.
+///
+/// The arena splits into `queries.len() * rows` disjoint answer rows, so
+/// the flattened grid parallelizes without nested pools and every row
+/// reuses the single-query row kernel.
+fn fill_answer_batch<const MODULUS: u32>(
+    matrix: &EncryptedMatrix<MODULUS>,
+    queries: &[EncryptedQuery<MODULUS>],
+    arena: &mut [FieldElement<MODULUS>],
+    n: usize,
+    b: usize,
+    s: usize,
+    rows: usize,
+) {
+    let threads = rayon::current_num_threads();
+    let grid = queries.len().saturating_mul(rows);
+    let work = grid.saturating_mul(n);
+    if threads > 1 && grid >= threads.saturating_mul(2) && work >= MIN_PARALLEL_MULTIPLICATIONS {
+        arena
+            .par_chunks_mut(s)
+            .enumerate()
+            .for_each(|(flat_row, answer_row)| {
+                let query = &queries[flat_row / rows];
+                let matrix_row_index = flat_row % rows;
+                let matrix_row = &matrix.values()[matrix_row_index * n..(matrix_row_index + 1) * n];
+                fill_answer_row(matrix_row, &query.values, b, answer_row);
+            });
+    } else {
+        for (flat_row, answer_row) in arena.chunks_mut(s).enumerate() {
+            let query = &queries[flat_row / rows];
+            let matrix_row_index = flat_row % rows;
+            let matrix_row = &matrix.values()[matrix_row_index * n..(matrix_row_index + 1) * n];
+            fill_answer_row(matrix_row, &query.values, b, answer_row);
         }
     }
 }

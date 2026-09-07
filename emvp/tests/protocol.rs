@@ -5,12 +5,14 @@
 
 use emvp::{
     AnswerMatrix, DecodingKey, DerivedState, EmvpParams, EncryptedMatrix, EncryptedQuery, Prf,
-    ProtocolError, SecretKey, TdmMask, answer_into, decode_into, encrypt, purpose, query,
-    query_with_scratch,
+    ProtocolError, SecretKey, TdmMask, answer_batch, answer_into, decode_into, encrypt, purpose,
+    query, query_with_scratch,
 };
 use prime_field_layer::{FieldElement, PrimeField};
+use proptest::prelude::*;
 use rand_chacha::ChaCha20Rng;
 use rand_core::SeedableRng;
+use rayon::{ThreadPool, ThreadPoolBuilder};
 use trapdoor_matrices::{DenseMatrix, IrreducibleRingLpn, RaaWeightedProduct, ToeplitzFastProduct};
 
 // NTT-friendly prime: 1_073_479_681 - 1 is divisible by 2^18.
@@ -654,4 +656,158 @@ fn decoding_key_debug_is_redacted() {
     assert!(!rendered.contains("FieldElement"));
     assert!(rendered.contains("blocks: 1"));
     assert!(rendered.contains("rows: 1"));
+}
+
+fn pool(threads: usize) -> ThreadPool {
+    ThreadPoolBuilder::new()
+        .num_threads(threads)
+        .build()
+        .unwrap()
+}
+
+#[test]
+fn parallel_encrypt_matches_the_serial_row_loop_and_naive_oracle() {
+    // rows * n = 2048 * 16 = 32768 estimated multiplications clear the
+    // crate's parallel-work threshold and 2048 >= 2 * 4 rows satisfies the
+    // thread guard, so the four-thread run forces the parallel branch while
+    // the single-thread run takes the serial reference path. Derivation is
+    // deterministic in the key, so both runs hold identical long-term
+    // secrets.
+    let (rows, ell) = (2048_usize, 8_usize);
+    let mut rng = ChaCha20Rng::seed_from_u64(0x8100);
+    let matrix = random_vector(rows * ell, &mut rng);
+
+    let parallel =
+        pool(4).install(|| encrypt(&mut derive_toeplitz(rows, ell, 0x81), &matrix).unwrap());
+    let serial =
+        pool(1).install(|| encrypt(&mut derive_toeplitz(rows, ell, 0x81), &matrix).unwrap());
+    assert_eq!(parallel, serial);
+
+    let state = derive_toeplitz(rows, ell, 0x81);
+    let dense_mask = state.mask().materialize().unwrap();
+    let expected = naive_encrypt_gathered(&state, &dense_mask, &matrix, rows, ell);
+    assert_eq!(parallel, expected);
+}
+
+#[test]
+fn answer_batch_rejects_malformed_batches_before_answering() {
+    let mut rng = ChaCha20Rng::seed_from_u64(0x8200);
+    let (rows, ell) = (5_usize, 8_usize);
+    let mut state = derive_toeplitz(rows, ell, 0x82);
+    let matrix = random_vector(rows * ell, &mut rng);
+    let q = random_vector(ell, &mut rng);
+    let encrypted = encrypt(&mut state, &matrix).unwrap();
+    let (good_query, _) = query(&mut state, &q).unwrap();
+
+    assert!(matches!(
+        answer_batch(&state.params(), &encrypted, &[]),
+        Err(ProtocolError::LengthMismatch {
+            name: "queries",
+            expected: 1,
+            actual: 0,
+        })
+    ));
+
+    let n = state.params().n().unwrap();
+    let truncated = EncryptedQuery::from_parts(
+        encrypted.instance_id(),
+        good_query.query_id(),
+        vec![field().element_u32(0); n - 1],
+    );
+    assert!(matches!(
+        answer_batch(
+            &state.params(),
+            &encrypted,
+            &[good_query.clone(), truncated]
+        ),
+        Err(ProtocolError::LengthMismatch { .. })
+    ));
+
+    let mut other = SecretKey::<MODULUS>::new_insecure(test_params(ell), [0x83; 32])
+        .unwrap()
+        .restore(state.instance_nonce(), 0, rows, toeplitz_block)
+        .unwrap();
+    let (foreign_query, _) = query(&mut other, &q).unwrap();
+    assert!(matches!(
+        answer_batch(&state.params(), &encrypted, &[good_query, foreign_query]),
+        Err(ProtocolError::InstanceMismatch { .. })
+    ));
+}
+
+#[test]
+fn parallel_answer_batch_matches_the_serial_loop() {
+    // 16 queries * 128 rows * n = 16 = 32768 estimated multiplications
+    // clear the crate's parallel-work threshold and the 2048-row grid
+    // satisfies the 2 * 4-threads guard, so the four-thread run forces the
+    // parallel branch while the single-thread run takes the serial path.
+    let (rows, ell, batch) = (128_usize, 8_usize, 16_usize);
+    let params = test_params(ell);
+    let mut rng = ChaCha20Rng::seed_from_u64(0x8400);
+    let matrix = random_vector(rows * ell, &mut rng);
+    let q = random_vector(ell, &mut rng);
+    let zero = field().element_u32(0);
+    let mut state = derive_toeplitz(rows, ell, 0x85);
+    let encrypted = encrypt(&mut state, &matrix).unwrap();
+    let blocks = params.blocks().unwrap();
+
+    let mut queries = Vec::new();
+    let mut expected = Vec::new();
+    for _ in 0..batch {
+        let (encrypted_query, _key) = query(&mut state, &q).unwrap();
+        let mut answer_values = vec![zero; rows * blocks];
+        answer_into(&params, &encrypted, &encrypted_query, &mut answer_values).unwrap();
+        queries.push(encrypted_query);
+        expected.extend_from_slice(&answer_values);
+    }
+
+    let flatten = |answers: Vec<AnswerMatrix<MODULUS>>| {
+        answers
+            .iter()
+            .flat_map(|answer| answer.values().iter().copied())
+            .collect::<Vec<_>>()
+    };
+    let parallel =
+        flatten(pool(4).install(|| answer_batch(&params, &encrypted, &queries).unwrap()));
+    let serial = flatten(pool(1).install(|| answer_batch(&params, &encrypted, &queries).unwrap()));
+    assert_eq!(parallel, expected);
+    assert_eq!(parallel, serial);
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(16))]
+
+    #[test]
+    fn answer_batch_matches_sequential_single_query_answers(
+        ell in 1_usize..=8_usize,
+        rows in 1_usize..=24_usize,
+        batch in 1_usize..=4_usize,
+    ) {
+        let params = test_params(ell);
+        let mut rng = ChaCha20Rng::seed_from_u64(0x8300);
+        let mut state = derive_toeplitz(rows, ell, 0x84);
+        let matrix = random_vector(rows * ell, &mut rng);
+        let q = random_vector(ell, &mut rng);
+        let encrypted = encrypt(&mut state, &matrix).unwrap();
+        let blocks = params.blocks().unwrap();
+        let zero = field().element_u32(0);
+
+        let mut queries = Vec::new();
+        let mut expected = Vec::new();
+        for _ in 0..batch {
+            let (encrypted_query, _key) = query(&mut state, &q).unwrap();
+            let mut answer_values = vec![zero; rows * blocks];
+            answer_into(&params, &encrypted, &encrypted_query, &mut answer_values).unwrap();
+            queries.push(encrypted_query);
+            expected.extend_from_slice(&answer_values);
+        }
+
+        let batched = answer_batch(&params, &encrypted, &queries).unwrap();
+        prop_assert_eq!(batched.len(), batch);
+        for (answer, answer_values) in batched.iter().zip(expected.chunks(rows * blocks)) {
+            prop_assert_eq!(answer.values(), answer_values);
+            prop_assert_eq!(answer.rows(), rows);
+            prop_assert_eq!(answer.blocks(), blocks);
+            prop_assert_eq!(answer.instance_id(), encrypted.instance_id());
+        }
+    }
 }
