@@ -735,6 +735,35 @@ fn answer_batch_rejects_malformed_batches_before_answering() {
 }
 
 #[test]
+fn parallel_derive_matches_the_serial_block_loop() {
+    // rows = 2 * n + 1 stacks three mask blocks and clears the two-block
+    // parallel guard, so the four-thread run constructs blocks across
+    // rayon workers while the single-thread run takes the serial loop.
+    // Derivation is deterministic in the key and nonce, so both runs must
+    // hold identical long-term secrets and produce identical artifacts.
+    let (rows, ell) = (2 * 16 + 1, 8_usize);
+    let mut rng = ChaCha20Rng::seed_from_u64(0x8600);
+    let matrix = random_vector(rows * ell, &mut rng);
+    let q = random_vector(ell, &mut rng);
+
+    let artifacts_with = |threads: usize| {
+        pool(threads).install(|| {
+            let mut state = derive_toeplitz(rows, ell, 0x86);
+            let instance_id = state.instance_id();
+            let encrypted = encrypt(&mut state, &matrix).unwrap();
+            let (encrypted_query, decoding_key) = query(&mut state, &q).unwrap();
+            (instance_id, encrypted, encrypted_query, decoding_key)
+        })
+    };
+    let (parallel_id, parallel_encrypted, parallel_query, parallel_key) = artifacts_with(4);
+    let (serial_id, serial_encrypted, serial_query, serial_key) = artifacts_with(1);
+    assert_eq!(parallel_id, serial_id);
+    assert_eq!(parallel_encrypted, serial_encrypted);
+    assert_eq!(parallel_query, serial_query);
+    assert_eq!(parallel_key, serial_key);
+}
+
+#[test]
 fn parallel_answer_batch_matches_the_serial_loop() {
     // 16 queries * 128 rows * n = 16 = 32768 estimated multiplications
     // clear the crate's parallel-work threshold and the 2048-row grid

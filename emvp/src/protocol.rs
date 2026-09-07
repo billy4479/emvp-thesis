@@ -302,6 +302,8 @@ impl<const MODULUS: u32> SecretKey<MODULUS> {
     /// many square mask blocks are stacked. `build_block` constructs one
     /// mask block from the block's PRF stream and index, which is how the
     /// caller picks a trapdoored-matrix construction and its parameters.
+    /// Stacks of two or more blocks construct them across rayon workers, so
+    /// the closure must be callable from several threads (`Fn` plus `Sync`).
     ///
     /// # Errors
     ///
@@ -311,16 +313,16 @@ impl<const MODULUS: u32> SecretKey<MODULUS> {
         self,
         rows: usize,
         rng: &mut R,
-        mut build_block: F,
+        build_block: F,
     ) -> Result<DerivedState<MODULUS, M>, ProtocolError>
     where
         M: TdmMask<MODULUS>,
-        F: FnMut(&mut ChaCha20Rng, usize) -> Result<M, ProtocolError>,
+        F: Fn(&mut ChaCha20Rng, usize) -> Result<M, ProtocolError> + Sync,
         R: CryptoRng + ?Sized,
     {
         let mut nonce = [0_u8; 16];
         rng.fill_bytes(&mut nonce);
-        self.derive_inner(u128::from_le_bytes(nonce), 0, rows, false, &mut build_block)
+        self.derive_inner(u128::from_le_bytes(nonce), 0, rows, false, &build_block)
     }
 
     /// Restores query state for an already encrypted matrix.
@@ -337,19 +339,13 @@ impl<const MODULUS: u32> SecretKey<MODULUS> {
         instance_nonce: u128,
         next_query_index: u64,
         rows: usize,
-        mut build_block: F,
+        build_block: F,
     ) -> Result<DerivedState<MODULUS, M>, ProtocolError>
     where
         M: TdmMask<MODULUS>,
-        F: FnMut(&mut ChaCha20Rng, usize) -> Result<M, ProtocolError>,
+        F: Fn(&mut ChaCha20Rng, usize) -> Result<M, ProtocolError> + Sync,
     {
-        self.derive_inner(
-            instance_nonce,
-            next_query_index,
-            rows,
-            true,
-            &mut build_block,
-        )
+        self.derive_inner(instance_nonce, next_query_index, rows, true, &build_block)
     }
 
     fn derive_inner<M, F>(
@@ -358,11 +354,11 @@ impl<const MODULUS: u32> SecretKey<MODULUS> {
         next_query_index: u64,
         rows: usize,
         encrypted: bool,
-        build_block: &mut F,
+        build_block: &F,
     ) -> Result<DerivedState<MODULUS, M>, ProtocolError>
     where
         M: TdmMask<MODULUS>,
-        F: FnMut(&mut ChaCha20Rng, usize) -> Result<M, ProtocolError>,
+        F: Fn(&mut ChaCha20Rng, usize) -> Result<M, ProtocolError> + Sync,
     {
         let k = self.params.k;
         let n = self.params.n()?;
@@ -389,11 +385,29 @@ impl<const MODULUS: u32> SecretKey<MODULUS> {
         let last_block = u64::try_from(block_count - 1)
             .map_err(|_conversion_error| ProtocolError::DimensionOverflow)?;
         Prf::check_index(last_block)?;
-        let mut blocks = Vec::with_capacity(block_count);
-        for block_index in 0..block_count {
-            let mut stream = prf.stream(purpose::TDM, block_index as u64)?;
-            blocks.push(build_block(&mut stream, block_index)?);
-        }
+        // Every block seeds its own PRF stream, so the constructions are
+        // independent and an indexed parallel collect preserves block order;
+        // the result is identical to the serial loop. Block construction
+        // always seeds a CSPRNG and builds trapdoor state (cached NTT plans,
+        // spectra, or sparse secrets), comfortably above rayon scheduling
+        // overhead, so any stack of two or more blocks parallelizes.
+        let threads = rayon::current_num_threads();
+        let blocks: Vec<M> = if threads > 1 && block_count >= 2 {
+            (0..block_count)
+                .into_par_iter()
+                .map(|block_index| {
+                    let mut stream = prf.stream(purpose::TDM, block_index as u64)?;
+                    build_block(&mut stream, block_index)
+                })
+                .collect::<Result<Vec<_>, ProtocolError>>()?
+        } else {
+            let mut blocks = Vec::with_capacity(block_count);
+            for block_index in 0..block_count {
+                let mut stream = prf.stream(purpose::TDM, block_index as u64)?;
+                blocks.push(build_block(&mut stream, block_index)?);
+            }
+            blocks
+        };
         let mask = RowStackMask::new(blocks, rows)?;
         check_len("mask columns", n, mask.dims().1)?;
         let online_scratch = QueryScratch {
