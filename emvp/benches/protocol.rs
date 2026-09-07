@@ -13,7 +13,7 @@ use criterion::{
 use emvp::{
     AnswerMatrix, DecodingKey, DerivedState, EmvpParams, EncryptedMatrix, EncryptedQuery,
     ProtocolError, SecretKey, TdmMask, answer_batch, answer_into, decode_into, encrypt, query,
-    search,
+    query_batch, search,
 };
 use prime_field_layer::{FieldElement, PrimeField};
 use rand_chacha::ChaCha20Rng;
@@ -58,6 +58,8 @@ const HUGE_SERVER_ROW_COUNTS: [usize; 2] = [65536, 262_144];
 const HUGE_ANSWER_BATCH_CASES: [(usize, usize); 2] = [(8, 65536), (32, 16384)];
 // Batch size of the standard-suite answer_batch cases.
 const ANSWER_BATCH: usize = 4;
+// Batch size of the standard-suite query_batch cases.
+const QUERY_BATCH: usize = 4;
 
 // LLM-scale record lengths: the model's hidden dimension, so `ell = 4096`
 // matches 7B-class weight matrices and `ell = 8192` 70B-class ones. Each
@@ -256,6 +258,41 @@ fn bench_query_for<M: TdmMask<MODULUS>>(
             black_box((encrypted_query, decoding_key))
         });
     });
+}
+
+// One query batch per iteration, either through `query_batch` on the rayon
+// global pool or, as the pre-batch reference, through a sequential
+// `query` loop holding the same derived state. The counter keeps advancing
+// across iterations, so both variants generate fresh randomness each time.
+fn bench_query_batch_for<M: TdmMask<MODULUS>>(
+    group: &mut BenchmarkGroup<'_, WallTime>,
+    tag: &str,
+    params: EmvpParams,
+    rows: usize,
+    batch: usize,
+    build_block: BlockBuilder<M>,
+) {
+    let mut state = derive_with(params, rows, 0x03, build_block);
+    let record = field_values(params.ell, 0x04);
+    let queries: Vec<&[FieldElement<MODULUS>]> = (0..batch).map(|_| record.as_slice()).collect();
+    group.throughput(elements(batch * params.ell));
+    group.bench_function(
+        BenchmarkId::new(format!("batch{batch}"), bench_parameter(tag, rows)),
+        |b| {
+            b.iter(|| black_box(query_batch(black_box(&mut state), &queries).unwrap()));
+        },
+    );
+    group.bench_function(
+        BenchmarkId::new(format!("serial{batch}"), bench_parameter(tag, rows)),
+        |b| {
+            b.iter(|| {
+                for _ in 0..batch {
+                    let artifacts = query(black_box(&mut state), black_box(&record)).unwrap();
+                    black_box(artifacts);
+                }
+            });
+        },
+    );
 }
 
 fn bench_plaintext(
@@ -480,6 +517,37 @@ fn bench_decode(
     );
 }
 
+// Query phase for one parameter set: single queries for every block
+// construction plus batched toeplitz cases in both parallel and sequential
+// loop variants.
+fn run_query_suite(criterion: &mut Criterion, tag: &str, params: EmvpParams, counts: &SuiteRows) {
+    let huge = !tag.is_empty();
+    let mut query_group = suite_group(criterion, "query", huge);
+    for &rows in counts.client {
+        bench_query_for(
+            &mut query_group,
+            tag,
+            "toeplitz",
+            params,
+            rows,
+            toeplitz_block,
+        );
+        bench_query_for(&mut query_group, tag, "raa", params, rows, raa_block);
+        bench_query_for(&mut query_group, tag, "ring", params, rows, ring_block);
+    }
+    for &rows in counts.client {
+        bench_query_batch_for(
+            &mut query_group,
+            tag,
+            params,
+            rows,
+            QUERY_BATCH,
+            toeplitz_block,
+        );
+    }
+    query_group.finish();
+}
+
 // All phases for one parameter set. The empty tag marks the standard
 // parameter set and unlocks its calibration cases.
 fn run_suite(criterion: &mut Criterion, tag: &str, params: EmvpParams, counts: &SuiteRows) {
@@ -519,22 +587,7 @@ fn run_suite(criterion: &mut Criterion, tag: &str, params: EmvpParams, counts: &
         encrypt_group.finish();
     }
 
-    {
-        let mut query_group = suite_group(criterion, "query", huge);
-        for &rows in counts.client {
-            bench_query_for(
-                &mut query_group,
-                tag,
-                "toeplitz",
-                params,
-                rows,
-                toeplitz_block,
-            );
-            bench_query_for(&mut query_group, tag, "raa", params, rows, raa_block);
-            bench_query_for(&mut query_group, tag, "ring", params, rows, ring_block);
-        }
-        query_group.finish();
-    }
+    run_query_suite(criterion, tag, params, counts);
 
     {
         let mut answer_group = suite_group(criterion, "answer", huge);
@@ -637,6 +690,16 @@ fn huge_benches(criterion: &mut Criterion) {
             );
             bench_query_for(&mut query_group, "huge", "raa", PARAMS, rows, raa_block);
             bench_query_for(&mut query_group, "huge", "ring", PARAMS, rows, ring_block);
+        }
+        for &rows in &HUGE_CLIENT_ROW_COUNTS {
+            bench_query_batch_for(
+                &mut query_group,
+                "huge",
+                PARAMS,
+                rows,
+                QUERY_BATCH,
+                toeplitz_block,
+            );
         }
         query_group.finish();
     }

@@ -6,7 +6,7 @@
 use emvp::{
     AnswerMatrix, DecodingKey, DerivedState, EmvpParams, EncryptedMatrix, EncryptedQuery, Prf,
     ProtocolError, SecretKey, TdmMask, answer_batch, answer_into, decode_into, encrypt, purpose,
-    query, query_with_scratch,
+    query, query_batch, query_with_scratch,
 };
 use prime_field_layer::{FieldElement, PrimeField};
 use proptest::prelude::*;
@@ -831,8 +831,82 @@ fn parallel_decode_matches_the_serial_row_loop() {
     assert_eq!(parallel, naive_matrix_vector(&matrix, &q, rows, ell));
 }
 
+#[test]
+fn query_batch_rejects_malformed_batches_without_consuming_ids() {
+    let mut rng = ChaCha20Rng::seed_from_u64(0x8800);
+    let (rows, ell) = (5_usize, 8_usize);
+    let mut state = derive_toeplitz(rows, ell, 0x88);
+
+    assert!(matches!(
+        query_batch(&mut state, &[]),
+        Err(ProtocolError::LengthMismatch {
+            name: "queries",
+            expected: 1,
+            actual: 0,
+        })
+    ));
+
+    let short = random_vector(ell - 1, &mut rng);
+    let good = random_vector(ell, &mut rng);
+    assert_eq!(
+        query_batch(&mut state, &[&good, &short]),
+        Err(ProtocolError::LengthMismatch {
+            name: "query vector",
+            expected: ell,
+            actual: ell - 1,
+        })
+    );
+    assert_eq!(
+        state.next_query_index(),
+        0,
+        "no identifiers may be consumed"
+    );
+
+    let batch = query_batch(&mut state, &[&good, &good]).unwrap();
+    assert_eq!(batch.len(), 2);
+    assert_eq!(state.next_query_index(), 2);
+    assert_eq!(batch[0].0.query_id(), 0);
+    assert_eq!(batch[1].0.query_id(), 1);
+}
+
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(16))]
+
+    #[test]
+    fn query_batch_matches_sequential_single_queries(
+        ell in 1_usize..=8_usize,
+        rows in 1_usize..=24_usize,
+        batch in 1_usize..=4_usize,
+    ) {
+        let params = test_params(ell);
+        let mut rng = ChaCha20Rng::seed_from_u64(0x8900);
+        let q = random_vector(ell, &mut rng);
+        let mut state = derive_toeplitz(rows, ell, 0x8a);
+
+        let mut serial = Vec::new();
+        for _ in 0..batch {
+            serial.push(query(&mut state, &q).unwrap());
+        }
+        assert_eq!(state.next_query_index(), batch as u64);
+
+        // A fresh state over the same key and nonce assigns the same
+        // identifier range, so batched artifacts must equal the serial
+        // ones bit for bit.
+        let mut batched_state =
+            SecretKey::<MODULUS>::new_insecure(params, [0x8a; 32])
+                .unwrap()
+                .restore(state.instance_nonce(), 0, rows, toeplitz_block)
+                .unwrap();
+        let queries: Vec<&[FieldElement<MODULUS>]> =
+            (0..batch).map(|_| q.as_slice()).collect();
+        let batched = query_batch(&mut batched_state, &queries).unwrap();
+
+        prop_assert_eq!(batched.len(), batch);
+        for (batched_artifacts, serial_artifacts) in batched.into_iter().zip(serial) {
+            prop_assert_eq!(batched_artifacts.0, serial_artifacts.0);
+            prop_assert_eq!(batched_artifacts.1, serial_artifacts.1);
+        }
+    }
 
     #[test]
     fn answer_batch_matches_sequential_single_query_answers(

@@ -976,6 +976,78 @@ pub fn query_with_scratch<const MODULUS: u32, M: TdmMask<MODULUS>>(
     )
 }
 
+/// Generates encrypted queries for a batch of query vectors plus the
+/// client's decoding keys.
+///
+/// Every query is generated exactly as [`query`] generates it alone: the
+/// batch reserves one contiguous identifier range in a single counter
+/// update, and query `i` carries the identifier the serial loop would have
+/// assigned it, so its artifacts are bit-for-bit identical to the serial
+/// loop's. Generation parallelizes across rayon workers, each owning a
+/// [`QueryScratch`] built once per worker and reused for every query it
+/// receives.
+///
+/// # Errors
+///
+/// Validation is all-or-nothing, matching [`answer_batch`]: every query
+/// vector must have length `ell` before any identifier is reserved, so a
+/// malformed batch consumes nothing. An empty batch is rejected with a
+/// `queries` length mismatch. A later code, mask, or field failure for one
+/// query leaves earlier identifiers reserved; persist
+/// [`DerivedState::next_query_index`] only after the batch succeeds.
+pub fn query_batch<const MODULUS: u32, M: TdmMask<MODULUS>>(
+    state: &mut DerivedState<MODULUS, M>,
+    queries: &[&[FieldElement<MODULUS>]],
+) -> Result<Vec<(EncryptedQuery<MODULUS>, DecodingKey<MODULUS>)>, ProtocolError> {
+    let Some(first) = queries.first() else {
+        return Err(ProtocolError::LengthMismatch {
+            name: "queries",
+            expected: 1,
+            actual: 0,
+        });
+    };
+    check_len("query vector", state.params.ell, first.len())?;
+    for q in &queries[1..] {
+        check_len("query vector", state.params.ell, q.len())?;
+    }
+    let count = u64::try_from(queries.len())
+        .map_err(|_conversion_error| ProtocolError::DimensionOverflow)?;
+    let width = state.params.n()?;
+    let reservations: Vec<QueryReservation> = state.reserve_query_ids(count)?.collect();
+    let borrowed = &*state;
+    let params = borrowed.params;
+    let instance_id = borrowed.instance_id;
+    let prf = &borrowed.prf;
+    let code = &borrowed.code;
+    let permutation = &borrowed.permutation;
+    let mask = &borrowed.mask;
+    let zero = PrimeField::<MODULUS>::new().element_u32(0);
+    queries
+        .par_iter()
+        .zip(reservations)
+        .map_init(
+            || QueryScratch {
+                code: code.scratch(),
+                mask: mask.scratch(),
+                q_tilde: vec![zero; width],
+            },
+            |scratch, (q, reservation)| {
+                query_core(
+                    params,
+                    instance_id,
+                    prf,
+                    code,
+                    permutation,
+                    mask,
+                    q,
+                    reservation.query_id,
+                    scratch,
+                )
+            },
+        )
+        .collect()
+}
+
 #[expect(
     clippy::too_many_arguments,
     reason = "the helper separates immutable long-term state from caller-owned scratch"

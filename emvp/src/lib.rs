@@ -35,5 +35,5 @@ pub use prf::{Prf, PrfError, purpose};
 pub use protocol::{
     AnswerMatrix, DecodingKey, DerivedState, EncryptedMatrix, EncryptedQuery, ProtocolError,
     QueryReservation, QueryReservations, QueryScratch, SecretKey, answer_batch, answer_into,
-    decode_into, encrypt, query, query_with_scratch,
+    decode_into, encrypt, query, query_batch, query_with_scratch,
 };
