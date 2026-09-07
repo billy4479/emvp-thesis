@@ -68,25 +68,11 @@ fn ring_instance(k: usize) -> IrreducibleRingLpn<MODULUS> {
     IrreducibleRingLpn::new_unchecked_irreducible(k, &modulus, &multiplier, sparse).unwrap()
 }
 
-fn ring_label(k: usize) -> String {
-    let rows = 2 * k;
-    let target_weight = k.min(TARGET_COLUMN_WEIGHT);
-    let extension = if k == 16 {
-        String::from("extension_schoolbook")
-    } else {
-        format!("extension_ntt_len{}", (2 * k - 1).next_power_of_two())
-    };
-    format!(
-        "{extension}_target_expected_per_column_t{target_weight}_p{target_weight}_over_{rows}_e_rows{rows}"
-    )
-}
-
 fn ring_construction_for(group: &mut BenchmarkGroup<'_, WallTime>, k: usize) {
     let (modulus, multiplier, sparse) = ring_inputs(k);
     let target_weight = k.min(TARGET_COLUMN_WEIGHT);
     group.throughput(elements(k + 1 + k + k * target_weight));
-    let label = format!("new_unchecked_irreducible_{}", ring_label(k));
-    group.bench_function(BenchmarkId::new(label, k), |b| {
+    group.bench_function(BenchmarkId::from_parameter(k), |b| {
         b.iter_batched(
             || (&multiplier, sparse.clone()),
             |(multiplier, sparse)| {
@@ -111,7 +97,7 @@ fn ring_apply_for(group: &mut BenchmarkGroup<'_, WallTime>, k: usize) {
     let mut output = field_values(k, 0x33);
     let mut scratch = map.scratch();
     group.throughput(elements(k));
-    group.bench_function(BenchmarkId::new(ring_label(k), k), |b| {
+    group.bench_function(BenchmarkId::from_parameter(k), |b| {
         b.iter(|| {
             black_box(&map)
                 .apply(
@@ -127,7 +113,7 @@ fn ring_apply_for(group: &mut BenchmarkGroup<'_, WallTime>, k: usize) {
 fn ring_materialize_for(group: &mut BenchmarkGroup<'_, WallTime>, k: usize) {
     let map = ring_instance(k);
     group.throughput(elements(k * k));
-    group.bench_function(BenchmarkId::new(ring_label(k), k), |b| {
+    group.bench_function(BenchmarkId::from_parameter(k), |b| {
         b.iter(|| black_box(black_box(&map).materialize().unwrap()));
     });
 }
@@ -136,19 +122,9 @@ fn toeplitz_instance(k: usize) -> ToeplitzFastProduct<MODULUS> {
     ToeplitzFastProduct::sample(k, &mut seeded_rng(0x41, k)).unwrap()
 }
 
-fn toeplitz_label(map: &ToeplitzFastProduct<MODULUS>, operation: &str) -> String {
-    format!(
-        "{operation}_{:?}_ntt_len{}",
-        map.middle().backend(),
-        map.middle().transform_length()
-    )
-}
-
 fn toeplitz_construction_for(group: &mut BenchmarkGroup<'_, WallTime>, k: usize) {
-    let map = toeplitz_instance(k);
-    let label = toeplitz_label(&map, "sample_and_cache");
     group.throughput(elements(10 * k - 3));
-    group.bench_function(BenchmarkId::new(label, k), |b| {
+    group.bench_function(BenchmarkId::from_parameter(k), |b| {
         b.iter_batched(
             || seeded_rng(0x41, k),
             |mut rng| {
@@ -168,29 +144,25 @@ fn toeplitz_apply_for(group: &mut BenchmarkGroup<'_, WallTime>, k: usize) {
     let mut output = field_values(k, 0x43);
     let mut scratch = map.scratch();
     group.throughput(elements(k));
-    group.bench_function(
-        BenchmarkId::new(toeplitz_label(&map, "structured"), k),
-        |b| {
-            b.iter(|| {
-                black_box(&map)
-                    .apply(
-                        black_box(&input),
-                        black_box(&mut output),
-                        black_box(&mut scratch),
-                    )
-                    .unwrap();
-            });
-        },
-    );
+    group.bench_function(BenchmarkId::from_parameter(k), |b| {
+        b.iter(|| {
+            black_box(&map)
+                .apply(
+                    black_box(&input),
+                    black_box(&mut output),
+                    black_box(&mut scratch),
+                )
+                .unwrap();
+        });
+    });
 }
 
 fn toeplitz_materialize_for(group: &mut BenchmarkGroup<'_, WallTime>, k: usize) {
     let map = toeplitz_instance(k);
     group.throughput(elements(k * k));
-    group.bench_function(
-        BenchmarkId::new(toeplitz_label(&map, "materialize"), k),
-        |b| b.iter(|| black_box(black_box(&map).materialize().unwrap())),
-    );
+    group.bench_function(BenchmarkId::from_parameter(k), |b| {
+        b.iter(|| black_box(black_box(&map).materialize().unwrap()));
+    });
 }
 
 fn raa_instance(k: usize) -> RaaWeightedProduct<MODULUS> {
