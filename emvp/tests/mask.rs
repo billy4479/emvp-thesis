@@ -182,14 +182,16 @@ impl TdmMask<MODULUS> for BadMaterialization {
         output: &mut [FieldElement<MODULUS>],
         _scratch: &mut Self::Scratch,
     ) -> Result<(), MaskError> {
-        if input.len() != 2 || output.len() != 2 {
+        // The declared height is 2, but the evaluation only accepts one row:
+        // a contract violation the structured materialization must surface.
+        if output.len() != 1 {
             return Err(MaskError::LengthMismatch {
                 name: "bad materialization apply",
-                expected: 2,
-                actual: usize::min(input.len(), output.len()),
+                expected: 1,
+                actual: output.len(),
             });
         }
-        output.copy_from_slice(input);
+        output[0] = input[0];
         Ok(())
     }
 
@@ -374,13 +376,17 @@ fn row_stack_rejects_bad_block_descriptors() {
 
 #[test]
 fn row_stack_rejects_materialization_that_disagrees_with_dimensions() {
+    // The default structured materialization evaluates `apply` once per
+    // column with a full-height output, so a block whose evaluation
+    // disagrees with its declared dimensions is rejected instead of
+    // silently producing a wrong-height matrix.
     let stack = RowStackMask::new(vec![BadMaterialization], 2).unwrap();
     assert!(matches!(
         stack.materialize(),
         Err(MaskError::LengthMismatch {
-            name: "materialized tail rows",
-            expected: 2,
-            actual: 1,
+            name: "bad materialization apply",
+            expected: 1,
+            actual: 2,
         })
     ));
 }
@@ -650,4 +656,46 @@ fn parallel_materialize_top_rows_matches_serial_and_the_full_prefix() {
 
     let full = TdmMask::materialize(&raa).unwrap();
     assert_eq!(parallel.values(), &full.values()[..32 * 33]);
+}
+
+// A stack of `k = 64` RAA blocks, which materialize through the default
+// structured path: 64 columns satisfy the 2 * 4-threads guard and
+// 64 * 64 * 64 clears the work threshold at the full block height.
+fn wide_raa_stack(
+    blocks: usize,
+    total_rows: usize,
+    seed: u64,
+) -> RowStackMask<RaaWeightedProduct<MODULUS>, MODULUS> {
+    let mut rng = ChaCha20Rng::seed_from_u64(seed);
+    let stacked: Vec<_> = (0..blocks)
+        .map(|_| RaaWeightedProduct::sample_nonzero(64, 2, &mut rng).unwrap())
+        .collect();
+    RowStackMask::new(stacked, total_rows).unwrap()
+}
+
+#[test]
+fn parallel_few_large_block_materialize_matches_the_serial_stack_and_dense_oracle() {
+    // Two full blocks keep the across-block guard closed (2 < 2 * 4
+    // threads), so the four-thread run exercises only the per-block column
+    // parallelism that full-height default materializations now use; the
+    // ragged tail keeps the serial tail path exercised in both runs.
+    let total_rows = 2 * 64 + 32;
+    let stack = wide_raa_stack(3, total_rows, 0x6b00);
+    let parallel = pool(4).install(|| stack.materialize()).unwrap();
+    let serial = pool(1).install(|| stack.materialize()).unwrap();
+    assert_eq!(parallel, serial);
+    assert_eq!(parallel, stacked_dense(&stack));
+}
+
+#[test]
+fn full_height_default_materialize_top_rows_matches_materialize() {
+    // Constructions routed through the default `materialize_top_rows` at
+    // their full height must agree with their own dense `materialize`.
+    let mut rng = ChaCha20Rng::seed_from_u64(0x6b01);
+    let raa: RaaWeightedProduct<MODULUS> =
+        RaaWeightedProduct::sample_nonzero(33, 3, &mut rng).unwrap();
+    let top_rows = pool(4)
+        .install(|| TdmMask::materialize_top_rows(&raa, 33))
+        .unwrap();
+    assert_eq!(top_rows, TdmMask::materialize(&raa).unwrap());
 }

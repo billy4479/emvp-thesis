@@ -167,12 +167,14 @@ pub trait TdmMask<const MODULUS: u32>: Send + Sync {
     ///
     /// Implementations may override this to make work proportional to the
     /// requested rows. The default avoids a full dense allocation and uses
-    /// structured evaluation once per column. Columns are independent, so
-    /// wide masks evaluate them across rayon workers, each owning its own
-    /// scratch, input, and output buffers: results land in a column-major
-    /// staging buffer of disjoint per-column slices, and one linear pass
-    /// transposes them into the row-major output. The result is identical
-    /// to the serial column loop.
+    /// structured evaluation once per column, including at the full height.
+    /// Columns are independent, so wide masks evaluate them across rayon
+    /// workers, each owning its own scratch, input, and output buffers:
+    /// results land in a column-major staging buffer of disjoint per-column
+    /// slices, and one linear pass transposes them into the row-major
+    /// output. The result is identical to the serial column loop.
+    /// Constructions whose [`Self::materialize`] is the cheaper full-height
+    /// path should override this method instead of relying on the default.
     ///
     /// # Errors
     ///
@@ -189,9 +191,6 @@ pub trait TdmMask<const MODULUS: u32>: Send + Sync {
                 expected: full_rows,
                 actual: rows,
             });
-        }
-        if rows == full_rows {
-            return self.materialize();
         }
 
         let field = PrimeField::<MODULUS>::new();
@@ -546,10 +545,13 @@ impl<M: TdmMask<MODULUS>, const MODULUS: u32> TdmMask<MODULUS> for RowStackMask<
     /// Stacks the dense block matrices vertically and truncates the last
     /// block to its top `total_rows mod n` rows.
     ///
-    /// The blocks materialize independently into disjoint output slabs, so
-    /// large stacks run them across rayon workers; the indexed parallel
-    /// collect preserves block order and the result is identical to the
-    /// serial loop. The truncated tail block stays serial.
+    /// Every block materializes through [`TdmMask::materialize_top_rows`],
+    /// so constructions without a dedicated dense path evaluate their
+    /// columns across rayon workers even when a stack holds only one or two
+    /// large blocks. Stacks of many blocks additionally run whole blocks
+    /// across workers; the indexed parallel collect preserves block order
+    /// and the result is identical to the serial loop. The truncated tail
+    /// block keeps its scratch-mediated truncation serial.
     ///
     /// # Errors
     ///
@@ -582,12 +584,12 @@ impl<M: TdmMask<MODULUS>, const MODULUS: u32> TdmMask<MODULUS> for RowStackMask<
         {
             self.blocks[..last]
                 .par_iter()
-                .map(M::materialize)
+                .map(|block| block.materialize_top_rows(block_rows))
                 .collect::<Result<Vec<_>, MaskError>>()?
         } else {
             self.blocks[..last]
                 .iter()
-                .map(M::materialize)
+                .map(|block| block.materialize_top_rows(block_rows))
                 .collect::<Result<Vec<_>, MaskError>>()?
         };
         let mut values = Vec::with_capacity(length);
