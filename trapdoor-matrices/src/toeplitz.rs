@@ -124,7 +124,7 @@ impl<const MODULUS: u32> ToeplitzMap<MODULUS> {
     /// Applies the map without allocation.
     ///
     /// Addresses and control flow do not depend on the secret diagonals or
-    /// input values. This code has not received a constant-time audit.
+    /// input values.
     ///
     /// # Errors
     ///
@@ -388,7 +388,7 @@ impl<const MODULUS: u32> ToeplitzFastProduct<MODULUS> {
     ///
     /// All public lengths are checked before output mutation. Memory addresses
     /// and control flow depend only on public dimensions and permutations, not
-    /// on secret diagonals or field values. This has not been audited.
+    /// on secret diagonals or field values.
     ///
     /// # Errors
     ///

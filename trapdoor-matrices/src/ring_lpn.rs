@@ -4,7 +4,7 @@
 //! multiplier `a` are public. The sparse `2K`-by-`K` matrix `E` is secret, and
 //! the materialized matrix is `H E`. No parameter set for this construction is
 //! settled; sampling validates the requested parameters against
-//! [`crate::parameters`] and reports the outcome as warnings while still
+//! [`crate::assess`] and reports the outcome as warnings while still
 //! constructing the instance.
 //!
 //! Sparse evaluation indexes memory using the secret support of `E`. Its memory
@@ -221,7 +221,7 @@ impl<const MODULUS: u32> IrreducibleRingLpn<MODULUS> {
     /// column of `HE` identically zero, so any empty column resamples the
     /// whole matrix. The weight must be positive and at most `K`.
     ///
-    /// The returned warnings carry the [`crate::parameters`] assessment of
+    /// The returned warnings carry the [`crate::assess`] assessment of
     /// `(K, weight)`; the instance is constructed regardless.
     ///
     /// # Errors

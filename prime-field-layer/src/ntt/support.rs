@@ -79,16 +79,14 @@ pub(super) fn shoup_mul<const MODULUS: u32>(value: u32, twiddle: Twiddle) -> u32
 /// This is the wide-input form of Shoup's multiplication (Harvey, J. Symbolic
 /// Comput. 60 (2014), section 3; also Bradbury et al., ePrint 2021/1396,
 /// Theorem 2, for the 32-bit SIMD lanes used here). For a twiddle `w` in
-/// `[0, p)` with precomputed `w' = floor(w * 2^32 / p)`, the quotient
-/// `q = (z * w') >> 32` and product `t = z * w - q * p` satisfy
-/// `0 <= t < 2p` for every input `z` in `[0, 2^32)`, not only reduced inputs:
-/// from `w' <= w * 2^32 / p < w' + 1` follows `q <= z * w / p`, hence `t >= 0`,
-/// and `q > z * w / p - z / 2^32 - 1`, hence
-/// `t < (z / 2^32 + 1) * p < 2p`. The lazy callers have `p < 2^30` and
-/// arbitrary `u32` inputs; the reduced callers have `p < 2^31` and inputs
-/// below `p`. Thus `z * w` and `q * p` are below `2^62`. The quotient product
-/// `z * w'` is below `2^64` for lazy callers and `2^63` for reduced callers,
-/// so every intermediate fits `u64`; `t < 2p < 2^32` fits a `u32` lane.
+/// `[0, p)` with precomputed `w' = floor(w * 2^32 / p)`, the returned
+/// `t = z * w - ((z * w') >> 32) * p` satisfies `0 <= t < 2p` for every input
+/// `z` in `[0, 2^32)`, not only reduced inputs. Bound check: `w' <= w * 2^32 /
+/// p` gives `q <= z * w / p`, hence `t >= 0`, and `q > z * w / p - z / 2^32 - 1`
+/// gives `t < (z / 2^32 + 1) * p < 2p`. Lazy callers have `p < 2^30` and
+/// arbitrary `u32` inputs, so `z * w` and `q * p` stay below `2^62`; reduced
+/// callers have `p < 2^31` and inputs below `p`, keeping them below `2^63`.
+/// Every intermediate fits `u64` and `t < 2p < 2^32` fits a `u32` lane.
 ///
 /// This bound is what lets the lazy butterflies feed unreduced lazy words
 /// straight into the multiplication: a difference planted with a `+2p` offset

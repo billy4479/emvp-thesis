@@ -204,8 +204,8 @@ pub struct SecurityAssessment {
 ///   elimination of roughly `2k^3` field operations.
 /// - *Enumeration:* every weight-`w` support is
 ///   `binom(2k, weight)` candidates.
-/// - *Structure:* degrees below [`RING_DEGREE_FLOOR`] and weights below
-///   [`PLAUSIBILITY_WEIGHT_FLOOR`] are rejected outright.
+/// - *Structure:* degrees below `RING_DEGREE_FLOOR` and weights below
+///   `PLAUSIBILITY_WEIGHT_FLOOR` are rejected outright.
 /// - *Run time:* the NTT length `next_power_of_two(2k - 1)` must fit in the
 ///   field's two-adicity or evaluation fails during extension
 ///   multiplication.

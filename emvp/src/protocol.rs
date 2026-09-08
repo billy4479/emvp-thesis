@@ -1123,19 +1123,12 @@ fn query_core<const MODULUS: u32, M: TdmMask<MODULUS>>(
     ))
 }
 
-/// Answers an encrypted query against an encrypted matrix.
-///
-/// This is the server's online work: `s` column-block matrix-vector
-/// products, `m * n` field multiplications in total.
-///
-/// # Errors
-///
-/// Returns an error before producing output if parameters are malformed, the
-/// matrix columns differ from `n`, or the query length differs from `n`.
 /// Answers an encrypted query into caller-owned row-major storage.
 ///
-/// `output` must contain `matrix.rows() * params.blocks()` elements. This
-/// variant allows servers to reuse allocations across queries.
+/// This is the server's online work: `s` column-block matrix-vector
+/// products, `m * n` field multiplications in total. `output` must contain
+/// `matrix.rows() * params.blocks()` elements. This variant allows servers
+/// to reuse allocations across queries.
 ///
 /// # Errors
 ///

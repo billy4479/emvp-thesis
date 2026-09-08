@@ -213,8 +213,6 @@ impl<const MODULUS: u32> PretransformedLinearOperand<'_, MODULUS> {
     /// Empty input or an empty fixed operand requires empty output. Zero padding
     /// gives the same linear, non-wrapping semantics as
     /// [`NttPlan::linear_convolution`].
-    /// Safe Rust cannot construct overlapping `input` and `output` slices because
-    /// they are borrowed shared and mutable, respectively.
     ///
     /// After [`Self::workspace`] has allocated the work vector, this method
     /// allocates nothing. It performs one forward transform, one pointwise
@@ -394,9 +392,7 @@ impl<const MODULUS: u32> NegacyclicPlan<MODULUS> {
 /// one transform length; that method always uses its existing NTT plan.
 ///
 /// Dispatch depends on public input lengths and modulus, not coefficient
-/// values. The arithmetic kernels are designed
-/// without coefficient-dependent branches but have not been formally audited
-/// as constant-time. Invalid compile-time moduli fail to compile, including on
+/// values. Invalid compile-time moduli fail to compile, including on
 /// the schoolbook and empty-input paths.
 ///
 /// # Errors

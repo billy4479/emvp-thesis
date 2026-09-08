@@ -105,16 +105,13 @@ impl<const MODULUS: u32> NttPlan<MODULUS> {
 
     /// Returns the butterfly backend selected at setup.
     ///
-    /// This `O(1)` diagnostic does not perform runtime detection again. All
-    /// backends have identical transform semantics and ordering.
+    /// All backends have identical transform semantics and ordering.
     #[must_use]
     pub const fn backend(&self) -> NttBackend {
         self.backend
     }
 
     /// Returns a diagnostic for scalar selection or fallback, if applicable.
-    ///
-    /// This `O(1)` accessor allocates nothing.
     #[must_use]
     pub const fn performance_warning(&self) -> Option<NttPerformanceWarning> {
         self.warning
@@ -150,10 +147,7 @@ impl<const MODULUS: u32> NttPlan<MODULUS> {
     /// # Errors
     ///
     /// Returns [`FieldError::LengthMismatch`] without mutation unless
-    /// `values.len()` is
-    /// exactly [`Self::len`]. The arithmetic kernels are designed without
-    /// coefficient-dependent branches, but are not formally audited for
-    /// constant-time behavior.
+    /// `values.len()` is exactly [`Self::len`].
     pub fn forward(&self, values: &mut [FieldElement<MODULUS>]) -> Result<(), FieldError> {
         self.check_length(values.len())?;
         match self.backend {
@@ -181,8 +175,7 @@ impl<const MODULUS: u32> NttPlan<MODULUS> {
     /// # Errors
     ///
     /// Returns [`FieldError::LengthMismatch`] without mutation unless the slice
-    /// length is exactly [`Self::len`]. The arithmetic kernels are designed
-    /// without coefficient-dependent branches, but are not formally audited.
+    /// length is exactly [`Self::len`].
     pub fn inverse(&self, values: &mut [FieldElement<MODULUS>]) -> Result<(), FieldError> {
         self.check_length(values.len())?;
         match self.backend {

@@ -8,7 +8,7 @@
 //! These are experimental constructions, not production cryptographic
 //! primitives. The Ring-LPN construction relies on structured dual-LPN and has
 //! no settled parameter set. [`IrreducibleRingLpn::sample`] therefore sizes
-//! every request against the best-known-attack estimates in [`parameters`]
+//! every request against the best-known-attack estimates of [`assess`]
 //! and returns the outcome as warnings while still constructing the instance.
 //! The Toeplitz and RAA constructions rely on new, speculative
 //! structured-cubic pseudorandomness assumptions. The rejected quasi-cyclic

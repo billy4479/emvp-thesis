@@ -10,11 +10,10 @@ impl<const MODULUS: u32> PrimeField<MODULUS> {
     /// move field elements into external buffers, such as GPU uploads, where
     /// the device reproduces the crate's Montgomery arithmetic natively.
     ///
-    /// [`FieldElement`] is `#[repr(transparent)]` over its word, so a pointer
-    /// cast could alias the slice without copying, but the workspace denies
-    /// `unsafe` and this element-wise copy compiles to a plain word-wise
-    /// `memcpy` in release builds. Its cost is negligible next to the `PCIe`
-    /// transfer that motivates it. The operation allocates nothing.
+    /// [`FieldElement`] is `#[repr(transparent)]` over its word, so this
+    /// element-wise copy compiles to a word-wise `memcpy` in release builds;
+    /// the workspace denies `unsafe`, which rules out a pointer-cast alias.
+    /// The operation allocates nothing.
     ///
     /// # Errors
     ///
@@ -130,10 +129,7 @@ impl<const MODULUS: u32> PrimeField<MODULUS> {
     /// This is the bulk operation used for NTT pointwise products. It takes
     /// O(n) time and allocates nothing. The loop body is branchless portable
     /// Rust over the Montgomery kernel, so compilers may auto-vectorize it on
-    /// targets with suitable instruction sets. Dispatch depends on public
-    /// target, modulus, and length, while arithmetic kernels are designed
-    /// without coefficient-dependent branches; this is not a formal
-    /// constant-time audit. A length mismatch returns
+    /// targets with suitable instruction sets. A length mismatch returns
     /// [`FieldError::LengthMismatch`] before mutating `lhs`.
     ///
     /// # Errors
@@ -159,9 +155,7 @@ impl<const MODULUS: u32> PrimeField<MODULUS> {
     /// This takes `O(n)` time and allocates nothing while retaining Montgomery
     /// representation. The loop body is branchless portable Rust over the
     /// Montgomery kernel, so compilers may auto-vectorize it on targets with
-    /// suitable instruction sets. The implementation is designed
-    /// without coefficient-dependent branches in the arithmetic kernels, but it
-    /// has not been formally audited as a constant-time implementation.
+    /// suitable instruction sets.
     pub fn scalar_mul_elements_assign(
         &self,
         values: &mut [FieldElement<MODULUS>],
