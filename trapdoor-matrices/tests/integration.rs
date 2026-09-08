@@ -652,7 +652,7 @@ fn ring_lpn_sampling_never_produces_empty_columns() {
         let mut rng = ChaCha20Rng::from_seed([domain; 32]);
         let sampled =
             IrreducibleRingLpn::<17>::sample_with_modulus(k, 1, &modulus, &mut rng).unwrap();
-        let offsets = sampled.instance().sparse_matrix().column_offsets();
+        let offsets = sampled.instance().sparse_matrix().offsets();
         assert!(offsets.windows(2).all(|pair| pair[0] < pair[1]));
         assert!(
             sampled

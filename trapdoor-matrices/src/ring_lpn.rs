@@ -102,12 +102,6 @@ impl<const MODULUS: u32> SparseMatrix<MODULUS> {
         &self.offsets
     }
 
-    /// Returns the compressed column offsets.
-    #[must_use]
-    pub fn column_offsets(&self) -> &[usize] {
-        &self.offsets
-    }
-
     /// Returns the row index of each stored entry.
     #[must_use]
     pub fn row_indices(&self) -> &[usize] {
