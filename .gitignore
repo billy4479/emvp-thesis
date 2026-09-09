@@ -11,3 +11,6 @@ perf.data*
 # Added by cargo
 
 /target
+
+# typst watch/build artifacts
+/build/
