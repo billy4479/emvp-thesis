@@ -1,0 +1,546 @@
+emvp2025:
+  type: Misc
+  title: Encrypted Matrix-Vector Products from Secret Dual Codes
+  author:
+    - "Benhamouda, Fabrice"
+    - "Chen, Caicai"
+    - "Halevi, Shai"
+    - "Ishai, Yuval"
+    - "Krawczyk, Hugo"
+    - "Mour, Tamer"
+    - "Rabin, Tal"
+    - "Rosen, Alon"
+  date: 2025
+  serial-number: "IACR ePrint 2025/858"
+  url: https://eprint.iacr.org/2025/858
+
+harvey2014:
+  type: Article
+  title: Faster arithmetic for number-theoretic transforms
+  author: "Harvey, David"
+  date: 2014
+  page-range: 113-119
+  serial-number:
+    doi: 10.1016/j.jsc.2013.09.002
+  note: Used for the Shoup multiplication bounds and reduced and lazy NTT butterflies in `prime-field-layer`.
+  parent:
+    type: Periodical
+    title: Journal of Symbolic Computation
+    volume: 60
+
+bradbury2022:
+  type: Article
+  title: NTT software optimization using an extended Harvey butterfly
+  author: ["Bradbury, Jonathan", "Drucker, Nir", "Hillenbrand, Marius"]
+  date: 2022
+  page-range: 311-334
+  serial-number:
+    doi: 10.46586/tches.v2022.i4.311-334
+  note: Used for the 32-bit SIMD Shoup-product analysis.
+  parent:
+    type: Periodical
+    title: IACR Transactions on Cryptographic Hardware and Embedded Systems
+    volume: 2022
+    issue: 4
+
+montgomery1985:
+  type: Article
+  title: Modular Multiplication Without Trial Division
+  author: "Montgomery, Peter L."
+  date: 1985
+  page-range: 519-521
+  serial-number:
+    doi: 10.2307/2007970
+  note: Used for field-element pointwise multiplication and inverse normalization.
+  parent:
+    type: Periodical
+    title: Mathematics of Computation
+    volume: 44
+    issue: 170
+
+rabin1980:
+  type: Article
+  title: Probabilistic Algorithms in Finite Fields
+  author: "Rabin, Michael O."
+  date: 1980
+  page-range: 273-280
+  serial-number:
+    doi: 10.1137/0209024
+  note: Used for the deterministic Frobenius and polynomial-GCD irreducibility criterion in `prime-field-layer::extension_field`.
+  parent:
+    type: Periodical
+    title: SIAM Journal on Computing
+    volume: 9
+    issue: 2
+
+sutherland2019:
+  type: Misc
+  genre: Lecture notes
+  title: Finite field arithmetic
+  author: "Sutherland, Andrew V."
+  organization: MIT
+  date: 2019
+  url: https://math.mit.edu/classes/18.783/2019/LectureNotes4.pdf
+  note: MIT 18.783 lecture notes 4, sections 4.1-4.2. Used for polynomial reversal, truncated inverse, and fast Euclidean division in fixed monic reduction.
+
+lemire2019:
+  type: Article
+  title: Fast Random Integer Generation in an Interval
+  author: "Lemire, Daniel"
+  date: 2019
+  serial-number:
+    doi: 10.1145/3230636
+    serial: "3"
+  note: Used for the unbiased reduction of fixed-width random words to a bounded integer by rejecting the incomplete range.
+  parent:
+    type: Periodical
+    title: ACM Transactions on Modeling and Computer Simulation
+    volume: 29
+    issue: 1
+
+rfc8439:
+  type: Report
+  title: "ChaCha20 and Poly1305 for IETF Protocols"
+  author: ["Nir, Yoav", "Langley, Adam"]
+  date: 2018-06
+  serial-number: "RFC 8439"
+  publisher: Internet Engineering Task Force
+  url: https://datatracker.ietf.org/doc/html/rfc8439
+  note: "Specification of the ChaCha20 core underlying `emvp::prf`, which reads a 32-byte downstream seed at word position `(purpose << 32) | index * 8`."
+
+boyle2022:
+  type: Misc
+  title: Efficient Pseudorandom Correlation Generators from Ring-LPN
+  author:
+    - "Boyle, Elette"
+    - "Couteau, Geoffroy"
+    - "Gilboa, Niv"
+    - "Ishai, Yuval"
+    - "Kohl, Lisa"
+    - "Scholl, Peter"
+  date: 2022
+  serial-number:
+    doi: 10.1007/978-3-030-56880-1_14
+    serial: "IACR ePrint 2022/1035"
+  url: https://eprint.iacr.org/2022/1035
+  note: Full version of the CRYPTO 2020 publication. Used for the irreducible-extension Ring-LPN assumption and its structural security caveats.
+  parent:
+    type: Conference
+    title: CRYPTO 2020
+
+heyse2012:
+  type: Article
+  title: "Lapin: An Efficient Authentication Protocol Based on Ring-LPN"
+  author:
+    - "Heyse, Stefan"
+    - "Kiltz, Eike"
+    - "Lyubashevsky, Vadim"
+    - "Paar, Christof"
+    - "Pietrzak, Krzysztof"
+  date: 2012
+  page-range: 346-365
+  url: https://www.iacr.org/workshops/fse2012/FSEpreproceedings/PDF/19.pdf
+  note: Used for the conservative choice of an irreducible Ring-LPN modulus.
+  parent:
+    type: Proceedings
+    title: Fast Software Encryption
+    volume: "LNCS 7549"
+
+brehm2024:
+  type: Misc
+  title: "Blaze: Fast SNARKs from Interleaved RAA Codes"
+  author:
+    - "Brehm, Martijn"
+    - "Chen, Binyi"
+    - "Fisch, Ben"
+    - "Resch, Nicolas"
+    - "Rothblum, Ron D."
+    - "Zeilberger, Hadas"
+  date: 2024
+  serial-number: "IACR ePrint 2024/1609"
+  url: https://eprint.iacr.org/2024/1609
+  note: Used only as algorithmic background for repeat-accumulate-accumulate codes; its coding results do not prove pseudorandomness of the weighted TDM.
+  parent:
+    type: Conference
+    title: EUROCRYPT 2025
+
+blelloch1993:
+  type: Chapter
+  title: Prefix Sums and Their Applications
+  author: "Blelloch, Guy E."
+  date: 1993
+  url: https://www.cs.cmu.edu/~guyb/papers/Ble93.pdf
+  note: Used for the weighted-prefix-scan formulation of the RAA evaluator.
+  parent:
+    type: Book
+    title: Synthesis of Parallel Algorithms
+
+rust-mul-epu32:
+  type: Reference
+  title: "core::arch::x86_64::_mm256_mul_epu32"
+  author: The Rust Project Developers
+  url: https://doc.rust-lang.org/core/arch/x86_64/fn._mm256_mul_epu32.html
+  note: Used for the AVX2 unsigned even-lane multiplication semantics and target feature requirement in `prime-field-layer` dot products.
+
+lolcats2024:
+  type: Misc
+  title: "LoLCATs: On Low-Rank Linearizing of Large Language Models"
+  author:
+    - "Zhang, Angelica"
+    - "Wang, Bailin"
+    - "Chen, Jannie"
+    - "Khashabi, Daniel"
+    - "Mavridis, Chris"
+    - "Ahmed, Pritom"
+    - "Bolukbasi, Tolga"
+    - "Bapna, Ankur"
+    - "Meng, Yu"
+    - "Firat, Orhan"
+    - "Su, Pei-Hao"
+    - "Ainslie, Joshua"
+  date: 2024
+  serial-number:
+    arxiv: "2410.10254"
+  url: https://arxiv.org/abs/2410.10254
+  note: Precedent for distilling softmax attention into linear attention, the main candidate for the EMVP-friendly student architecture.
+  parent:
+    type: Conference
+    title: ICLR 2025
+
+katharopoulos2020:
+  type: Article
+  title: "Transformers are RNNs: Fast Autoregressive Transformers with Linear Attention"
+  author:
+    - "Katharopoulos, Angelos"
+    - "Vyas, Apoorv"
+    - "Pappas, Nikolaos"
+    - "Fleuret, François"
+  date: 2020
+  serial-number:
+    arxiv: "2006.16236"
+  url: https://arxiv.org/abs/2006.16236
+  note: Linear attention formulation (feature map replacing softmax) and the elu-based feature map.
+  parent:
+    type: Proceedings
+    title: International Conference on Machine Learning
+
+eldan2023:
+  type: Misc
+  title: "TinyStories: How Small Can Language Models Be and Still Speak Coherent English?"
+  author: ["Eldan, Ronen", "Li, Yuanzhi"]
+  date: 2023
+  serial-number:
+    arxiv: "2305.07759"
+  url: https://arxiv.org/abs/2305.07759
+  note: Candidate training corpus for the small student model.
+
+smollm2:
+  type: Misc
+  title: "SmolLM2: When Smol Goes Big - Data-Centric Training of a Small Language Model"
+  author: ["Ben Allal, Loubna", "Lozhkov, Anton", "Bakouch, Elie"]
+  date: 2025
+  serial-number:
+    arxiv: "2502.02737"
+  url: https://arxiv.org/abs/2502.02737
+  note: "The 135M teacher checkpoint (`HuggingFaceTB/SmolLM2-135M`) used for distillation."
+
+lidl1983:
+  type: Book
+  title: Finite Fields
+  author: "Lidl, Rudolf and Niederreiter, Harald"
+  date: 1983
+  publisher: Addison-Wesley
+  note: Used for the binomial irreducibility criterion (Theorem 3.75) behind the automatic modulus selection in `trapdoor_matrices::parameters::automatic_ring_modulus`.
+
+prange1962:
+  type: Article
+  title: The use of information sets in decoding cyclic codes
+  author: "Prange, Eugene"
+  date: 1962
+  page-range: 5-9
+  note: Baseline information-set-decoding attack; the source of the ~2^t iteration estimate used to size the Ring-LPN TDM column weight.
+  parent:
+    type: Periodical
+    title: IRE Transactions on Information Theory
+    volume: 8
+    issue: 5
+
+may2011:
+  type: Article
+  title: Decoding Random Linear Codes in the Tilde-O of 2^0.054n
+  author: ["May, Alexander", "Meurer, Alexander", "Thomae, Enrico"]
+  date: 2011
+  page-range: 107-124
+  serial-number:
+    doi: 10.1007/978-3-642-20465-4_7
+  note: Information-set-decoding refinement behind the pessimistic exponent discount in the Ring-LPN TDM parameter analysis.
+  parent:
+    type: Proceedings
+    title: "EUROCRYPT 2011, LNCS 6632"
+
+becker2012:
+  type: Article
+  title: "Decoding Random Binary Linear Codes within 2^(n/20): How 1 + 1 = 0 Improves Information Set Decoding"
+  author: ["Becker, Anja", "Joux, Antoine", "May, Alexander", "Meurer, Alexander"]
+  date: 2012
+  page-range: 520-536
+  serial-number:
+    doi: 10.1007/978-3-642-55220-5_30
+  note: Representation-technique ISD refinement behind the pessimistic exponent discount in the Ring-LPN TDM parameter analysis.
+  parent:
+    type: Proceedings
+    title: "EUROCRYPT 2012, LNCS 7237"
+
+blum2003:
+  type: Article
+  title: "Noise-Tolerant Learning, the Parity Problem, and the Statistical Query Model"
+  author: ["Blum, Avrim", "Kalai, Adam", "Wasserman, Hal"]
+  date: 2003
+  page-range: 506-519
+  serial-number:
+    doi: 10.1145/777148.777186
+  note: Source of the sample-hungry BKW attack family; rules out BKW against the dual-LPN TDM because the attacker receives only n samples.
+  parent:
+    type: Periodical
+    title: Journal of the ACM
+    volume: 50
+    issue: 4
+
+kailath1995:
+  type: Article
+  title: "Displacement Structure: Theory and Applications"
+  author: ["Kailath, Thomas", "Sayed, Ali H."]
+  date: 1995
+  page-range: 297-386
+  serial-number:
+    doi: 10.1137/S003614459432063X
+  note: "Displacement rank and the shift-operator framework; used in the Toeplitz TDM analysis to show unpermuted products stay structurally distinguishable (displacement rank at most 6) while interleaving permutations raise it to full rank."
+  parent:
+    type: Periodical
+    title: SIAM Review
+    volume: 37
+    issue: 3
+
+daykin1960:
+  type: Article
+  title: Distribution of bordered persymmetric matrices in a finite field
+  author: "Daykin, David E."
+  date: 1960
+  page-range: 47-54
+  note: Classical finite-field Toeplitz singularity results, background for the singularity analysis of the Toeplitz TDM.
+  parent:
+    type: Periodical
+    title: "Journal fuer die reine und angewandte Mathematik"
+    volume: 203
+
+matsumoto1988:
+  type: Article
+  title: Public Quadratic Polynomial-tuples for Efficient Signature-Verification and Message-Encryption
+  author: ["Matsumoto, Tsutomu", "Imai, Hideki"]
+  date: 1988
+  page-range: 419-453
+  serial-number:
+    doi: 10.1007/3-540-45961-8_39
+  note: The original MQ assumption; ePrint 2025/858 frames its degree-3 pseudorandomness conjecture for the Toeplitz and RAA TDMs as a generalization of MQ.
+  parent:
+    type: Proceedings
+    title: "EUROCRYPT 1988, LNCS 330"
+
+beullens2022:
+  type: Article
+  title: "Breaking Rainbow Takes a Weekend on a Laptop"
+  author: "Beullens, Ward"
+  date: 2022
+  page-range: 95-126
+  serial-number:
+    doi: 10.1007/978-3-031-07085-3_4
+    serial: "IACR ePrint 2022/214"
+  url: https://eprint.iacr.org/2022/214
+  note: Cautionary tale for MQ-flavored assumptions; motivates the research-only status and the conservative-fallback policy for the conjecture-based TDM candidates.
+  parent:
+    type: Proceedings
+    title: "EUROCRYPT 2022 (Part II), LNCS 13276"
+
+druk2014:
+  type: Article
+  title: Linear-time encodable codes meeting the Gilbert-Varshamov bound and their cryptographic applications
+  author: ["Druk, Ernst", "Ishai, Yuval"]
+  date: 2014
+  page-range: 169-182
+  serial-number:
+    doi: 10.1145/2554797.2554813
+  note: Source of the linear uniform-output family (LUOF) behind the linear-size TDM instantiations in ePrint 2025/858, Section 5.2.
+  parent:
+    type: Proceedings
+    title: "ITCS 2014"
+
+ikos2008:
+  type: Article
+  title: Cryptography with constant computational overhead
+  author: ["Ishai, Yuval", "Kushilevitz, Eyal", "Ostrovsky, Rafail", "Sahai, Amit"]
+  date: 2008
+  page-range: 433-442
+  serial-number:
+    doi: 10.1145/1374376.1374438
+  note: Pairwise-independent hash blueprint cited by ePrint 2025/858 for the extractor role of the rectangular secret factor and underlying the [DI14] LUOF construction.
+  parent:
+    type: Proceedings
+    title: "ACM STOC 2008"
+
+braverman2025:
+  type: Misc
+  title: Sublinear-overhead secure linear algebra on a dishonest server
+  author: ["Braverman, Mark", "Newman, Stephen"]
+  date: 2025
+  serial-number:
+    arxiv: "2502.13060"
+  url: https://arxiv.org/abs/2502.13060
+  note: Recursive LPN-based TDM predecessor ([BN25] in ePrint 2025/858); the direct constructions are measured against it.
+
+vaikuntanathan2025:
+  type: Misc
+  title: Improving algorithmic efficiency using cryptography
+  author: ["Vaikuntanathan, Vinod", "Zamir, Or"]
+  date: 2025
+  serial-number:
+    arxiv: "2502.13065"
+  url: https://arxiv.org/abs/2502.13065
+  note: Recursive TDM construction ([VZ25] in ePrint 2025/858); the direct constructions are measured against it.
+
+benedetto1998:
+  type: Article
+  title: "Analysis, design, and iterative decoding of double serially concatenated codes with interleavers"
+  author: ["Benedetto, Sergio", "Divsalar, Dariush", "Montorsi, Guido", "Pollara, S."]
+  date: 1998
+  page-range: 231-244
+  serial-number:
+    doi: 10.1109/49.661110
+  note: Turbo-like code interleaver analysis; background for the permutation placement in the RAA TDM.
+  parent:
+    type: Periodical
+    title: "IEEE Journal on Selected Areas in Communications"
+    volume: 16
+    issue: 2
+
+divsalar1998:
+  type: Article
+  title: "Coding theorems for turbo-like codes"
+  author: ["Divsalar, Dariush", "Jin, Hui", "McEliece, Robert J."]
+  date: 1998
+  page-range: 201-210
+  note: Repeat-accumulate code family results; background for the RAA TDM code structure.
+  parent:
+    type: Proceedings
+    title: "36th Allerton Conference on Communication, Control, and Computing"
+
+guruswami2008:
+  type: Article
+  title: Explicit interleavers for a repeat accumulate accumulate (RAA) code construction
+  author: ["Guruswami, Venkatesan", "Machmouchi, Widad"]
+  date: 2008
+  page-range: 1968-1972
+  serial-number:
+    doi: 10.1109/ISIT.2008.4595296
+  note: Explicit RAA interleavers; background for the permutation families used by the RAA TDM.
+  parent:
+    type: Proceedings
+    title: "IEEE ISIT 2008"
+
+boyle2018:
+  type: Article
+  title: Compressing vector OLE
+  author: ["Boyle, Elette", "Couteau, Geoffroy", "Gilboa, Niv", "Ishai, Yuval"]
+  date: 2018
+  page-range: 896-912
+  serial-number:
+    doi: 10.1145/3243734.3243818
+  note: PCG predecessor line ([BCGI18] in ePrint 2025/858) establishing dual-LPN over linear-time encodable codes.
+  parent:
+    type: Proceedings
+    title: "ACM CCS 2018"
+
+boyle2019:
+  type: Article
+  title: "Efficient pseudorandom correlation generators: Silent OT extension and more"
+  author: ["Boyle, Elette", "Couteau, Geoffroy", "Gilboa, Niv", "Ishai, Yuval", "Kohl, Lisa", "Scholl, Peter"]
+  date: 2019
+  page-range: 489-518
+  serial-number:
+    doi: 10.1007/978-3-030-26951-7_26
+  note: PCG line ([BCG+19b] in ePrint 2025/858) establishing dual-LPN for linear-time encodable codes; the grounded route the RAA TDM report contrasts with the degree-3 conjecture.
+  parent:
+    type: Proceedings
+    title: "CRYPTO 2019 (Part III), LNCS 11694"
+
+bordewijk1956:
+  type: Article
+  title: Interreciprocity applied to electrical networks
+  author: "Bordewijk, Jan L."
+  date: 1956
+  page-range: 1-14
+  note: Classical transposition-principle reference ([Bor56] in ePrint 2025/858) behind dualizing linear-time encoders.
+  parent:
+    type: Periodical
+    title: Applied Scientific Research
+    volume: 6
+    issue: 1
+
+wgsl:
+  type: Misc
+  genre: Specification
+  title: WebGPU Shading Language
+  author: "W3C Web GPU Community Group"
+  organization: W3C
+  date: 2026
+  url: https://www.w3.org/TR/WGSL/
+  note: "Specification of the WGSL compute shader language. Used for the server-side answer kernel in `emvp::gpu`: pipeline-overridable `override` constants for the Montgomery constants, runtime-sized `array<u32>` storage bindings, and the u32-only arithmetic (no 64-bit scalars) that motivates the 16-bit-split 32x32->64 multiplication."
+
+wgpu:
+  type: Misc
+  title: "wgpu: Native WebGPU implementation in Rust"
+  author: "The gfx-rs project contributors"
+  organization: gfx-rs
+  date: 2026
+  url: https://github.com/gfx-rs/wgpu
+  note: "GPU abstraction used for the server-side answer path in `emvp::gpu` (compute pipelines, buffer uploads, staging-buffer readback), with naga as the runtime WGSL compiler."
+
+lidl1997:
+  type: Book
+  title: Finite Fields
+  author: ["Lidl, Rudolf", "Niederreiter, Harald"]
+  date: 1997
+  serial-number:
+    isbn: 978-0-521-39231-0
+  note: "Encyclopedia of Mathematics and its Applications 20, 2nd edition, Cambridge University Press. Theorem 3.75 (binomial irreducibility criterion) backs the `X^k - 11` extension-field benchmark modulus in `prime-field-layer/benches/extension_field.rs` (11 is a primitive root, unlike 3)."
+  parent:
+    type: Series
+    title: Encyclopedia of Mathematics and its Applications
+    volume: 20
+
+ingley2026:
+  type: Misc
+  title: "rpprof: An updated, maintained CPU and memory profiling tool for Rust programs"
+  author:
+    - "Ingley, Michael"
+    - "Keao, Yang"
+  organization: fork of tikv/pprof-rs
+  date: 2026
+  url: https://github.com/mingley/pprof-rs
+  note: "Fork of tikv/pprof-rs published as the `rpprof` crate (v0.18.1), used for opt-in flamegraph profiling of the criterion benchmarks (`--features bench-flamegraph`, then `cargo bench -- --profile-time <secs>`); its built-in criterion integration samples CPU stacks at 1 kHz and renders per-benchmark flamegraphs."
+
+typst:
+  type: Misc
+  title: "Typst: A composable markup language for typesetting"
+  author: "The Typst Project Developers"
+  organization: typst
+  date: 2026
+  url: https://github.com/typst/typst
+  note: "Typesetting system used for `handout/thesis.typ`; built reproducibly via the typix Nix library (`packages.handout`, `apps.build-handout`/`apps.watch-handout`, and the `devShells.typst` shell in `flake.nix`)."
+
+typix:
+  type: Misc
+  title: "typix: Reproducible Typst documents with Nix"
+  author: "Loqusion"
+  date: 2026
+  url: https://github.com/loqusion/typix
+  note: "Nix flake library used for the sandboxed handout build in `flake.nix`: `cleanTypstSource` plus `virtualPaths` (cleanTypstSource drops the Hayagriva YAML bibliography), vendored `@preview` packages via `unstable_typstPackages`, fonts via `fontPaths`, and `buildTypstProject`/`buildTypstProjectLocal`/`watchTypstProject`."
