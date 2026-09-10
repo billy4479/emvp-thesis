@@ -51,7 +51,7 @@ $a = M' p' - r'$ from $(M', q')$, where $q' = (p', r')$ is its decoding key.
 This protocol turns out to be particularly cheap to run compared to doing a matrix-vector
 multiplication in clear text, only being $tilde 1.5$x more costly.
 
-=== Protocol description
+=== Protocol Description
 
 The protocol is made of five algorithms:
 
@@ -183,7 +183,7 @@ too well.
 
 TODO: Expand here
 
-== Related works
+== Related Works
 
 TODO
 
@@ -230,14 +230,15 @@ important that the code is well optimized, as the performance of everything down
 them.
 
 / Vectorization:
-  The whole crate is optimized having in mind that the client has access to an AVX2-capable CPU,
+  The whole crate is optimized having in mind that the client has access to an `AVX2`-capable CPU,
   which allows a substantial speedup in some algebraic kernels, such as computing NTTs,
   convolutions, dot products, and bulk operations in general.
   Interestingly, I found that LLVM optimizer #cite(<llvm>), when instructed to do so by setting
-  `target-cpu = native`, generates faster machine code than handwriting AVX2 intrinsics.
+  `target-cpu = native`, and with some hints and trial and error, generates equivalent or faster
+  machine code than handwriting `AVX2` intrinsics.
   This is great news, since it allows to drop the code complexity greatly, avoid many uses of
-  `unsafe`, expand portability to non-x86_64 platforms, like ARM64, and even support more advanced
-  extensions, like AVX512.
+  `unsafe`, expand portability to non-`x86_64` platforms, like `ARM64`, and even support more
+  advanced extensions, like `AVX512`.
   The only tradeoff is that clients have to compile their own version of the software: as this is
   research software I deemed the tradeoff worth it to see how much I could push the performance
   while keeping the project complexity in scope.
@@ -256,16 +257,100 @@ them.
     project.
   ]
 
-/ Montgomery form:
-  Finally, field elements are represented by the `FieldElement` struct, where they stay in
-  Montgomery form #cite(<montgomery1985>) until `.value()` is called. This allows for faster
-  sequential algebraic operations.
+/ Modular arithmetics:
+  Multiplication runs in the Montgomery domain #cite(<montgomery1985>) so a product costs only
+  multiplies and bit shifts while conversion happens only at the API boundaries.
+  Constant multipliers, such as NTT twiddle factors, instead use Shoup's trick #cite(<shoup2009>):
+  precomputing $floor(w dot 2^32 \/ p)$ replaces the reduction with one extra multiply and subtraction.
+  All conditional corrections are expressed as branchless mask operations rather than
+  comparisons, which lets LLVM vectorize the kernels.
 
 / Number Theoretical Transform:
-  Most of the client's work is computing NTTs, therefore a good amount of time was spent
-  implementing SOTA algorithms for computing them.
-  In particular
+  Instead of repeating the work for each transformation, we construct and hold a "plan" for a fixed
+  length $N$: the plan computes a suitable root of unity, retains the twiddle factors in precomputed
+  tables #cite(<frigo1999>), and picks which butterfly implementation fits the modulus width.
+  The forward transform then walks $log_2 N$ stages in place, applying a butterfly to each pair of
+  values. Each butterfly is Harvey's lazy variant #cite(<harvey2014>): instead of paying a full
+  reduction after every addition and multiplication, residues are carried through in redundant
+  intervals and each butterfly performs a single correction, and the slightly unreduced inputs feed
+  directly into the wide-input form of Shoup's multiplication #cite(<bradbury2021>).
+  A single normalization pass restores canonical residues once, after the last stage.
 
+  Convolutions themselves proceeds in the usual three steps: transform both operands forward,
+  multiply pointwise in Montgomery domain, transform the result back, and scale by $N^(-1)$.
+  For negacyclic products modulo $x^N + 1$, the inputs are additionally twisted by powers of a
+  $2N$-th root of unity before the transforms and untwisted afterwards #cite(<longa2016>).
+  All of this reuses the plan's tables, so repeated products pay only the transforms themselves.
+  Operands small enough that the $O(N log N)$ machinery is not worth it fall back to schoolbook
+  multiplication below a crossover point measured with the benchmark suite.
+
+  Even if this NTT implementation was independently written I compared it to other state of the art
+  libraries which implement the same algorithm #cite(<concrete-ntt>, <fasterntt>).
+
+
+=== Trapdoored Matrices
+
+All TDMs implement the same trait: they need to provide an `apply()` method, which computes the
+matrix vector product using the trapdoor, and a `materialize()` method, which returns the equivalent
+public dense representation.
+Moreover, I `apply()` to be allocation-free, therefore the implementers of the TDM trait should
+provide a reusable scratch buffer.
+
+The trapdoor matrix has less "science" behind it's optimizations: where feasible, intermediates are
+cached and reused, and I use rayon #cite(<rayon>) to parallelize the paths which benchmarks show
+benefit from parallel computation.
+
+=== EMVP Protocol
+
+TODO: rewrite this
+
+This crate glues the previous two layers into the full protocol, so its speed comes less from
+isolated kernels and more from structure: which work runs in which phase, how many times memory is
+touched, and how much is allocated. These are the tricks which survived the benchmarks.
+
+/ Answer kernel:
+  The server's answer $M'$ consists of $m s$ dot products of length $b$ between blocks of $hat(M)$
+  and blocks of $hat(q)$, making it the protocol's hottest loop. Accumulating into a single
+  register serializes every step on the addition latency, so the kernel keeps four independent
+  accumulators and folds them at the end. Each block is also sliced once up front, which removes
+  the per-element bounds checks that the compiler cannot elide across the two operand slices.
+
+/ Measured parallel crossover:
+  Rows in the answer, encryption, and decoding loops are independent, so rayon #cite(<rayon>)
+  distributes them across workers. Every parallel path is gated by a multiplication-count
+  threshold calibrated once with the benchmark suite, plus the requirement of at least two rows
+  per worker thread, so small inputs stay serial instead of paying scheduling overhead. Each
+  worker allocates its scratch buffers once and reuses them for every row it receives, and every
+  parallel path is tested to produce output identical to the serial loop, which lets the switch
+  be made dynamically per workload.
+
+/ Allocation-free online phase:
+  Query and answer threads own reusable scratch structures, so steady-state queries allocate
+  nothing. My favorite micro-trick: in the query algorithm $tilde(q)$ is dead once $r'$ and the
+  permuted query have been computed, so its head doubles as staging for the $alpha_i$, and the
+  decoding key $p' = (alpha_1^(-1), ..., alpha_s^(-1))$ comes out of a single batch inversion
+  #cite(<montgomery1985>) without a fresh allocation. Batched answers for many queries are written
+  into one query-major arena: a single allocation whose flattened (query, row) grid parallelizes
+  without nested thread pools.
+
+/ GPU hand-off:
+  By our assumptions, the server has a GPU. During the answer phase, we can exploit its compute
+  capabilities to compute the result faster.
+  I chose to use WGPU #cite(<wgpu>, <wgsl>) instead of more popular alternatives like CUDA, as WGPU
+  is open-source, cross-vendor, integrates well with Rust, and the performance loss is negligible
+  for the scope of this project.
+  Device buffers hold raw Montgomery residues, so uploads and readbacks move the words as-is: the
+  answers are bit-identical to the CPU path with no conversion or normalization pass.
+  Compute shares are also compiled on the flight for a specialized prime modulus, while the
+  dimensions of each batch travel in a small uniform buffer, so changing protocol parameters never
+  triggers a recompilation.
+  // TODO: change below
+  Device buffers are leased from a grow-only pool, so a server answering steady batch shapes
+  allocates device memory once per concurrent caller; uploads are fused into a single pass over staging
+  memory, and the encrypted matrix crosses the bus once per instance rather than once per batch.
+  Finally, WGSL has no 64-bit integers, so each field product is assembled from four 16-bit
+  partial products, and the query-major output layout gives warps coalesced reads while
+  neighboring workgroups reuse the same matrix row in cache.
 
 == Distillation
 

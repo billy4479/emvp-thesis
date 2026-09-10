@@ -28,14 +28,13 @@ harvey2014:
     title: Journal of Symbolic Computation
     volume: 60
 
-bradbury2022:
-  type: Article
+bradbury2021:
+  type: Misc
   title: NTT software optimization using an extended Harvey butterfly
   author: ["Bradbury, Jonathan", "Drucker, Nir", "Hillenbrand, Marius"]
-  date: 2022
-  page-range: 311-334
-  serial-number:
-    doi: 10.46586/tches.v2022.i4.311-334
+  date: 2021
+  serial-number: "IACR ePrint 2021/1396"
+  url: https://eprint.iacr.org/2021/1396
   note: Theorem 2 analyzes the wide-input lazy Shoup product on 32-bit SIMD lanes with planted offsets in the multiplicand, the setting of the `shoup_mul_lazy_for` kernels in `prime-field-layer/src/ntt/support.rs` (the bound is derived independently in those comments). Its uncorrected product in `[0, 2p)` with the same quotient estimate on canonical inputs backs the reduced Shoup kernel for `2^30 <= p < 2^31`, where one correction keeps every butterfly input and output in `[0, p)`.
 
 scott2017:
@@ -78,7 +77,7 @@ vanderhoeven2024:
   serial-number: "HAL hal-04841449"
   url: https://hal.science/hal-04841449
 
-fasternnt:
+fasterntt:
   type: Repository
   title: "FasterNTT: A Fast Implementation of Number-theoretic Transform"
   author: "NICT Security Fundamentals Laboratory"
@@ -102,6 +101,38 @@ concrete-ntt:
   serial-number: "v0.2.0"
   note: "BSD-3-Clause-Clear Rust NTT crate providing prime, native (multi-prime simulation of wrapping arithmetic), and native binary NTTs over power-of-two sizes, with runtime AVX2 detection and optional nightly AVX512. First released 2023; archived read-only on 2026-02-04. Used only as a bibliographic comparison point; its source was not copied."
 
+shoup2009:
+  type: Book
+  title: "A Computational Introduction to Number Theory and Algebra"
+  author: "Shoup, Victor"
+  date: 2009
+  edition: '2'
+  publisher: Cambridge University Press
+  url: https://shoup.net/ntb/
+  note: "Attributed origin of 'Shoup's trick' (precomputing floor(b * 2^k / p) so a modular product costs one widening multiply, one multiply-high and one subtraction, with no division), as distributed in Shoup's NTL library. `prime-field-layer` uses it for twiddle factors (`NttPlan` twiddle storage), the scalar-multiply bulk kernel (`PrimeField::scalar_mul_assign_canonical`), and, in the wide-input lazy form, the transform butterflies. Harvey 2014 restates the correctness bounds for NTT butterflies and Bradbury et al. 2021 give the precise 32-bit-lane bound."
+
+crandall1992:
+  type: Misc
+  genre: Patent
+  title: "Method and apparatus for public key exchange in a cryptographic system"
+  author: "Crandall, Richard E."
+  date: 1992
+  serial-number: "US Patent 5,159,632"
+  note: "Origin of pseudo-Mersenne primes (p = 2^w - c with tiny c) and the high-half folding reduction ab = a_h * 2^w + a_l -> a_h * c + a_l. `prime-field-layer` applies the 32-bit case, 2^32 = 5 (mod 2^32 - 5), in `dot_pseudo_mersenne_32` with chunked low/high accumulators to stay overflow-free; Bernstein 2006 (Curve25519) later popularized the technique in academic literature."
+
+frigo1999:
+  type: Article
+  title: "A Fast Fourier Transform Compiler"
+  author: ["Frigo, Matteo", "Johnson, Steven G."]
+  date: 1999
+  page-range: 168-177
+  serial-number:
+    doi: 10.1145/301618.301661
+  note: "Origin of the reusable 'plan' object: precompute tables, roots, and algorithm choice once, then run transforms allocation-free in place. `prime-field-layer` follows this pattern with `NttPlan`, `NegacyclicPlan`, `PolynomialReductionPlan`, and pretransformed operands with retained workspaces."
+  parent:
+    type: Proceedings
+    title: "ACM SIGPLAN 1999 Conference on Programming Language Design and Implementation (PLDI '99)"
+
 montgomery1985:
   type: Article
   title: Modular Multiplication Without Trial Division
@@ -110,7 +141,7 @@ montgomery1985:
   page-range: 519-521
   serial-number:
     doi: 10.2307/2007970
-  note: Used for field-element pointwise multiplication and inverse normalization; also underlies the wide-modulus fallback representation already used by `prime-field-layer`.
+  note: "Origin of Montgomery multiplication (REDC) and of 'Montgomery's trick' (simultaneous batch inversion: one inversion plus about 3(n-1) multiplications via prefix products). Used in `prime-field-layer` for field-element pointwise multiplication, inverse normalization, `PrimeField::batch_inv_assign`, and `PrimeField::batch_inv_elements`; also underlies the wide-modulus fallback representation."
   parent:
     type: Periodical
     title: Mathematics of Computation
@@ -818,6 +849,18 @@ zig:
   author: Zig Contributors
   organization: Zig Software Foundation
   url: https://ziglang.org/
+
+rayon:
+  type: Repository
+  title: "rayon: A data parallelism library for Rust"
+  author: "Rayon contributors"
+  organization: rust-lang
+  date: 2026
+  url:
+    value: https://github.com/rust-lang/rayon
+    date: 2026-09-10
+  serial-number: "v1.12.0"
+  note: "Work-stealing data-parallelism library used by `emvp` (protocol, mask) and `trapdoor-matrices` (Toeplitz products) to parallelize per-row and per-block work; version as pinned in `Cargo.lock`, running on `rayon-core` 1.13.0."
 
 hayagriva:
   type: Misc
