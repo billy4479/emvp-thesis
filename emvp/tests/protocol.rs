@@ -19,7 +19,8 @@ use trapdoor_matrices::{DenseMatrix, IrreducibleRingLpn, RaaWeightedProduct, Toe
 const MODULUS: u32 = 1_073_479_681;
 
 // Tiny deliberately-insecure research parameters: k = 8, ell = 8, b = 2,
-// so n = 16 and s = 8. The protocol layer does not re-validate params.
+// so n = 16 and s = 8. `new_insecure` re-validates structural dimensions
+// but skips the concrete attack-cost validation.
 const fn test_params(ell: usize) -> EmvpParams {
     EmvpParams {
         k: 8,

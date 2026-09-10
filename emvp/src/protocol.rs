@@ -818,8 +818,11 @@ impl<const MODULUS: u32> AnswerMatrix<MODULUS> {
 /// # Errors
 ///
 /// Returns an error before any output is produced if the state already
-/// encrypted a matrix, the matrix length differs from `rows * ell`, or a code
-/// or mask operation fails.
+/// encrypted a matrix or the matrix length differs from `rows * ell`; those
+/// checks run before the ciphertext is touched. A code or mask failure after
+/// that point is not possible for validated parameters and scratch, but the
+/// ciphertext allocation may already hold partially written rows if one
+/// occurred.
 pub fn encrypt<const MODULUS: u32, M: TdmMask<MODULUS>>(
     state: &mut DerivedState<MODULUS, M>,
     matrix: &[FieldElement<MODULUS>],
@@ -936,6 +939,9 @@ pub fn query<const MODULUS: u32, M: TdmMask<MODULUS>>(
 ) -> Result<(EncryptedQuery<MODULUS>, DecodingKey<MODULUS>), ProtocolError> {
     check_len("query vector", state.params.ell, q.len())?;
     let Some(reservation) = state.reserve_query_ids(1)?.next() else {
+        // Defensive: `reserve_query_ids(1)` always yields exactly one token,
+        // so this arm is unreachable; matching keeps the reservation protocol
+        // explicit.
         return Err(ProtocolError::DimensionOverflow);
     };
     query_core(
@@ -1110,7 +1116,11 @@ fn query_core<const MODULUS: u32, M: TdmMask<MODULUS>>(
     let mut q_hat = vec![zero; width];
     permutation.apply(&scratch.q_tilde, &mut q_hat)?;
 
-    // Hide each block behind a fresh nonzero scalar.
+    // Hide each block behind a fresh nonzero scalar. At this point `q_tilde`
+    // is dead — both consumers below (`r'` above and the gather above) have
+    // read it — so its head doubles as staging for the alphas, letting the
+    // batch inversion below run without a fresh allocation. Reordering any
+    // consumer after this loop would silently corrupt the query.
     let field = PrimeField::<MODULUS>::new();
     let mut p_prime = vec![zero; block_count];
     for block in 0..block_count {

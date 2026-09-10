@@ -14,7 +14,8 @@
 //!   lambda` keeps the space-unions attack infeasible.
 //! - Structural constraints of the cyclic instantiation: records of length
 //!   `ell <= k` are zero-padded, blocks must divide `n`, and `b >= 2` so
-//!   that more than one block exists.
+//!   that each block carries more than one element (`s = n / b` may be 1;
+//!   `b = n` is the supported single-block shape).
 //! - The protocol needs a noticeable padding slack (`n - k >= lambda^Omega(1)`,
 //!   Fig. 1). With `n = 2k` we take `k >= ceil(lambda / 4)` as a concrete
 //!   stand-in; the paper's own tables keep `k` of the same order as
@@ -377,9 +378,12 @@ impl EmvpParams {
 
     /// The smallest rank acceptable for a security parameter:
     /// `ceil(lambda / 4)`.
+    ///
+    /// The narrowing `lambda as usize` truncates only on platforms with a
+    /// 16-bit `usize`; every caller first rejects `lambda` beyond
+    /// [`PROTOCOL_MAX_LAMBDA`] (256), which fits any `usize` width.
     #[must_use]
     pub const fn rank_floor(lambda: u32) -> usize {
-        // ceil(lambda / 4) in usize arithmetic; lambda <= u32::MAX fits.
         (lambda as usize).div_ceil(4)
     }
 }
