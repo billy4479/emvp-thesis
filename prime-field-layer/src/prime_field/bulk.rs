@@ -165,7 +165,10 @@ impl<const MODULUS: u32> PrimeField<MODULUS> {
     /// Inverts all values using one exponentiation and approximately three
     /// multiplications per value.
     ///
-    /// Inputs may use any `u32` representation. Successful output is canonical.
+    /// Inputs may use any `u32` representation. Successful output is
+    /// canonical. The Montgomery images of the inputs are retained in one
+    /// scratch `Vec` so the reverse pass does not recompute them; this is the
+    /// operation's only allocation.
     ///
     /// # Errors
     ///
@@ -185,6 +188,7 @@ impl<const MODULUS: u32> PrimeField<MODULUS> {
             return Ok(());
         }
 
+        let mut montgomery = Vec::with_capacity(values.len());
         let mut prefixes = Vec::with_capacity(values.len());
         let mut product = Self::MONTGOMERY_ONE;
         for &value in values.iter() {
@@ -194,6 +198,7 @@ impl<const MODULUS: u32> PrimeField<MODULUS> {
             }
             product = Self::montgomery_mul_scalar(product, value);
             prefixes.push(product);
+            montgomery.push(value);
         }
 
         let mut inverse = Self::pow_montgomery(product, u64::from(MODULUS - 2));
@@ -203,9 +208,8 @@ impl<const MODULUS: u32> PrimeField<MODULUS> {
             } else {
                 prefixes[index - 1]
             };
-            let value = Self::to_montgomery(values[index]);
             values[index] = Self::from_montgomery(Self::montgomery_mul_scalar(inverse, previous));
-            inverse = Self::montgomery_mul_scalar(inverse, value);
+            inverse = Self::montgomery_mul_scalar(inverse, montgomery[index]);
         }
         Ok(())
     }
