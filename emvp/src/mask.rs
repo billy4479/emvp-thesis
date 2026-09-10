@@ -30,11 +30,12 @@ use trapdoor_matrices::{
     ToeplitzFastProduct, ToeplitzScratch,
 };
 
-/// Minimum estimated field multiplications before mask evaluation or
-/// materialization switches to rayon; smaller workloads stay serial. The
-/// value mirrors the crossover calibrated for the answer phase in
-/// [`crate::protocol`].
-const MIN_PARALLEL_MULTIPLICATIONS: usize = 32 * 1024;
+use crate::protocol::MIN_PARALLEL_MULTIPLICATIONS;
+
+/// Tile edge for the cache-blocked transpose in the default
+/// [`TdmMask::materialize_top_rows`]: 32 rows x 32 columns keeps both access
+/// streams (a staging column slice and a run of output words) inside L1/L2.
+const TRANSPOSE_TILE: usize = 32;
 
 /// A rejected mask construction or evaluation.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -234,10 +235,23 @@ pub trait TdmMask<const MODULUS: u32>: Send + Sync {
             }
         }
 
-        let mut values = Vec::with_capacity(length);
-        for row in 0..rows {
-            for column in 0..columns {
-                values.push(staged[column * rows + row]);
+        // Row-major output from the column-major staging buffer. The output
+        // vector is preallocated and written by index so the traversal can
+        // be tiled: within a tile both streams walk sequential stretches of
+        // [`TRANSPOSE_TILE`] elements instead of striding the whole staging
+        // buffer, which keeps them inside cache for matrices far larger than
+        // memory. The written values are exactly the direct row-major
+        // traversal.
+        let mut values = vec![zero; length];
+        for row_tile in (0..rows).step_by(TRANSPOSE_TILE) {
+            let row_end = (row_tile + TRANSPOSE_TILE).min(rows);
+            for column_tile in (0..columns).step_by(TRANSPOSE_TILE) {
+                let column_end = (column_tile + TRANSPOSE_TILE).min(columns);
+                for row in row_tile..row_end {
+                    for column in column_tile..column_end {
+                        values[row * columns + column] = staged[column * rows + row];
+                    }
+                }
             }
         }
         Ok(DenseMatrix::new(rows, columns, values)?)
