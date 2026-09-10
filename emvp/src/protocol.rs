@@ -223,7 +223,7 @@ const fn check_len(
 /// Minimum estimated field multiplications before a protocol kernel switches
 /// to rayon; smaller workloads stay serial. The answer-phase crossover this
 /// value calibrates was measured once when sizing the benchmark thread pool.
-const MIN_PARALLEL_MULTIPLICATIONS: usize = 32 * 1024;
+pub(crate) const MIN_PARALLEL_MULTIPLICATIONS: usize = 32 * 1024;
 
 fn fill_answer_row<const MODULUS: u32>(
     matrix_row: &[FieldElement<MODULUS>],
@@ -234,11 +234,25 @@ fn fill_answer_row<const MODULUS: u32>(
     let zero = PrimeField::<MODULUS>::new().element_u32(0);
     for (block, slot) in answer_row.iter_mut().enumerate() {
         let start = block * block_len;
-        let mut accumulator = zero;
-        for offset in 0..block_len {
-            accumulator += matrix_row[start + offset] * query[start + offset];
+        // Slicing each block once removes the per-element bounds checks the
+        // compiler cannot elide across the two operand slices, and the four
+        // independent accumulators break the serial multiply-add dependency
+        // chain (`dot_canonical` uses the same lane layout).
+        let matrix_block = &matrix_row[start..start + block_len];
+        let query_block = &query[start..start + block_len];
+        let mut sums = [zero; 4];
+        for (matrix, query) in matrix_block.chunks_exact(4).zip(query_block.chunks_exact(4)) {
+            sums[0] += matrix[0] * query[0];
+            sums[1] += matrix[1] * query[1];
+            sums[2] += matrix[2] * query[2];
+            sums[3] += matrix[3] * query[3];
         }
-        *slot = accumulator;
+        let matrix_tail = matrix_block.chunks_exact(4).remainder();
+        let query_tail = query_block.chunks_exact(4).remainder();
+        for (&matrix, &query) in matrix_tail.iter().zip(query_tail) {
+            sums[0] += matrix * query;
+        }
+        *slot = sums.into_iter().fold(zero, |total, sum| total + sum);
     }
 }
 
