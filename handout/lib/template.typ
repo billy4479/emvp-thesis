@@ -1,4 +1,4 @@
-#let thesis(
+#let template(
   dedication: none,
   font: none,
   toc: true,
@@ -23,6 +23,10 @@
   set par(justify: true, leading: 1.3em, spacing: 2.4em)
   set heading(numbering: "1.1")
   show heading: set block(above: 2.6em, below: 1.3em)
+
+  show link: it => {
+    text(font: "FiraCode Nerd Font", size: 0.8em)[#underline(it)]
+  }
 
   page(numbering: none, footer: none)[]
   page(numbering: none, footer: none)[]

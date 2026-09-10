@@ -544,3 +544,176 @@ typix:
   date: 2026
   url: https://github.com/loqusion/typix
   note: "Nix flake library used for the sandboxed handout build in `flake.nix`: `cleanTypstSource` plus `virtualPaths` (cleanTypstSource drops the Hayagriva YAML bibliography), vendored `@preview` packages via `unstable_typstPackages`, fonts via `fontPaths`, and `buildTypstProject`/`buildTypstProjectLocal`/`watchTypstProject`."
+
+aero2024:
+  type: Misc
+  title: "AERO: Entropy-Guided Framework for Private LLM Inference"
+  author: ["Jha, Nandan Kumar", "Reagen, Brandon"]
+  date: 2024
+  serial-number:
+    arxiv: "2410.13060"
+  url: https://arxiv.org/abs/2410.13060
+  note: "Head-wise entropy regularization to decide where transformer nonlinearities can be removed for private inference (3.4x communication, 1.4x latency savings); retitled from 'AERO: Softmax-Only LLMs for Efficient Private Inference' in the cited v3."
+  parent:
+    type: Conference
+    title: ICLR 2026
+
+li2025:
+  type: Article
+  title: "An Efficient Private GPT Never Autoregressively Decodes"
+  author:
+    - "Li, Zhengyi"
+    - "Guan, Yue"
+    - "Yang, Kang"
+    - "Feng, Yu"
+    - "Liu, Ning"
+    - "Yu, Yu"
+    - "Leng, Jingwen"
+    - "Guo, Minyi"
+  date: 2025
+  note: "Public-decoding with secure verification for 2PC GPT inference (2.1-6.0x speedup over standard secure decoding via private sampling and distillation-based acceptance-rate tuning)."
+  parent:
+    type: Proceedings
+    title: International Conference on Machine Learning (ICML 2025)
+
+pang2024:
+  type: Article
+  title: "BOLT: Privacy-Preserving, Accurate and Efficient Inference for Transformers"
+  author:
+    - "Pang, Qi"
+    - "Zhu, Jinhao"
+    - "Möllering, Helen"
+    - "Zheng, Wenting"
+    - "Schneider, Thomas"
+  date: 2024
+  page-range: 2131-2149
+  serial-number:
+    doi: 10.1109/SP54263.2024.00130
+  note: "MPC transformer-inference framework (10.91x communication reduction) combining attention-sparsity and MLP-embedding omission with an extension-based GELU protocol."
+  parent:
+    type: Proceedings
+    title: "2024 IEEE Symposium on Security and Privacy (SP)"
+
+hou2023:
+  type: Misc
+  title: "CipherGPT: Secure Two-Party GPT Inference"
+  author:
+    - "Hou, Xiaoyang"
+    - "Liu, Jian"
+    - "Lu, Wen-jie"
+    - "Li, Jingyu"
+    - "Hong, Cheng"
+    - "Ren, Kui"
+  date: 2023
+  serial-number: "IACR ePrint 2023/1147"
+  url: https://eprint.iacr.org/2023/1147
+  note: "First specialized secure two-party GPT-inference framework (Gaussian-coding-based secure GELU and softmax); preprint of the ACM CCS 2024 publication."
+  parent:
+    type: Conference
+    title: ACM CCS 2024
+
+gao2026:
+  type: Misc
+  title: "Euston: Efficient and User-Friendly Secure Transformer Inference with Non-Interactivity"
+  author:
+    - "Gao, Xinwen"
+    - "Fu, Shaojing"
+    - "Liu, Lin"
+    - "Liu, Zhuotao"
+    - "Luo, Yuchuan"
+    - "Wang, Yongjun"
+  date: 2026
+  serial-number: "IACR ePrint 2026/046"
+  url: https://eprint.iacr.org/2026/046
+  note: "Non-interactive (HE-only) transformer inference over RNS-CKKS: SVD-based batched homomorphic matrix multiplication and column-packed nonlinear evaluation, up to 8.8x faster than NEXUS end-to-end."
+
+balogh2026:
+  type: Misc
+  title: "Half the Nonlinearity Is Wasted: Measuring and Reallocating the Transformer's MLP Budget"
+  author: "Balogh, Peter"
+  date: 2026
+  serial-number:
+    arxiv: "2603.03459"
+  url: https://arxiv.org/abs/2603.03459
+  note: "Shows a large share of transformer MLP nonlinearity can be replaced by precomputed linear matrices via a contextual gate (25-56% linear routing at <1% perplexity cost in GPT-2); per-instance routing is not predictable from token identity."
+
+li2024:
+  type: Misc
+  title: "Nimbus: Secure and Efficient Two-Party Inference for Transformers"
+  author:
+    - "Li, Zhengyi"
+    - "Yang, Kang"
+    - "Tan, Jin"
+    - "Lu, Wen-jie"
+    - "Wu, Haoqi"
+    - "Wang, Xiao"
+    - "Yu, Yu"
+    - "Zhao, Derun"
+    - "Zheng, Yancheng"
+    - "Guo, Minyi"
+    - "Leng, Jingwen"
+  date: 2024
+  serial-number:
+    arxiv: "2411.15707"
+  url: https://arxiv.org/abs/2411.15707
+  note: "2PC transformer inference (2.7-4.7x over SOTA) via an outer-product-based secure matrix-multiplication paradigm and input-distribution-aware low-degree polynomial approximation of GELU and Softmax."
+  parent:
+    type: Conference
+    title: NeurIPS 2024
+
+zimerman2026:
+  type: Article
+  title: "PowerSoftmax: Towards Secure LLM Inference over Encrypted Data"
+  author:
+    - "Zimerman, Itamar"
+    - "Adir, Allon"
+    - "Aharoni, Ehud"
+    - "Avitan, Matan"
+    - "Baruch, Moran"
+    - "Drucker, Nir"
+    - "Lerner, Jenny"
+    - "Masalha, Ramy"
+    - "Meiri, Reut"
+    - "Soceanu, Omri"
+  date: 2026
+  note: "HE-friendly polynomial-form self-attention trainable end-to-end; first polynomial LLMs over a billion parameters with reasoning and in-context learning capabilities."
+  parent:
+    type: Proceedings
+    title: "29th International Conference on Artificial Intelligence and Statistics (AISTATS 2026), PMLR 300"
+
+moon2025:
+  type: Article
+  title: "THOR: Secure Transformer Inference with Homomorphic Encryption"
+  author:
+    - "Moon, Jungho"
+    - "Yoo, Dongwoo"
+    - "Jiang, Xiaoqian"
+    - "Kim, Miran"
+  date: 2025
+  serial-number:
+    doi: 10.1145/3719027.3765150
+  note: "Non-interactive HE transformer inference: diagonal-major encoding with compact ciphertext packing for PC-MM/CC-MM, plus adaptive iterative approximation of softmax, LayerNorm, GELU, and Tanh."
+  parent:
+    type: Proceedings
+    title: "2025 ACM SIGSAC Conference on Computer and Communications Security (CCS '25)"
+
+razzhigaev2024:
+  type: Article
+  title: "Your Transformer is Secretly Linear"
+  author:
+    - "Razzhigaev, Anton"
+    - "Mikhalchuk, Matvey"
+    - "Goncharova, Elizaveta"
+    - "Gerasimenko, Nikolai"
+    - "Oseledets, Ivan"
+    - "Dimitrov, Denis"
+    - "Kuznetsov, Andrey"
+  date: 2024
+  page-range: 5376-5384
+  serial-number:
+    arxiv: "2405.12250"
+  url: https://arxiv.org/abs/2405.12250
+  note: "Procrustes similarity 0.99 between adjacent decoder-layer embeddings; removing or linearly approximating the most linear blocks barely affects loss, with a cosine-similarity regularizer to suppress linearity during pretraining."
+  parent:
+    type: Proceedings
+    title: "62nd Annual Meeting of the Association for Computational Linguistics (Volume 1: Long Papers)"

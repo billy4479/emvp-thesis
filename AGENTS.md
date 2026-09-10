@@ -26,4 +26,6 @@ Let a subagent do this benchmarking work, while you focus on the actual feature.
 
 ## References
 
-Always cite your references, so that I can use them in my bibliography. Keep track of them in `../BIBLIOGRAPHY.yml`.
+Always cite your references, so that I can use them in my bibliography.
+Keep track of them in `BIBLIOGRAPHY.yml`.
+This file uses the Hayagriva bibliography format, more information at https://raw.githubusercontent.com/typst/hayagriva/refs/heads/main/docs/file-format.md

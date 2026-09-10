@@ -119,13 +119,12 @@
       parts.push(link(target, [arXiv: #arxiv]))
     }
   }
-  if parts.len() == 0 and url != none { parts.push(link(url, [URL])) }
+  if parts.len() == 0 and url != none { parts.push(link(url, [#url])) }
   if parts.len() == 0 { none } else { parts.join(", ") }
 }
 
 // The serial number, linked when a URL is available, or none.
 #let _serial(entry) = {
-  let url = entry.at("url", default: none)
   let sn = entry.at("serial-number", default: none)
   let serial = if type(sn) == dictionary {
     sn.at("serial", default: none)
@@ -134,9 +133,7 @@
   } else {
     none
   }
-  if serial == none { none } else if url == none { serial } else {
-    link(url, serial)
-  }
+  if serial == none { none } else { serial }
 }
 
 #let _entry-body(entry, et-al) = {
