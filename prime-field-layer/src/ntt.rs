@@ -70,10 +70,6 @@
 //! flow. Dispatch, allocation, errors, and loop counts depend on public modulus,
 //! platform, and slice lengths. This is a code-level timing precaution, not a
 //! claim of a formally audited constant-time implementation.
-//!
-//! The implementation was independently written; no third-party source was
-//! copied. See `NTT_REFERENCES.md` in the crate root for the design literature
-//! and provenance statement.
 
 use std::{fmt, sync::Arc};
 
