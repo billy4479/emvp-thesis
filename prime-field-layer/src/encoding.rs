@@ -132,9 +132,7 @@ impl<const MODULUS: u32> PrimeField<MODULUS> {
         rng: &mut R,
         output: &mut [FieldElement<MODULUS>],
     ) {
-        for value in output {
-            *value = self.sample_uniform(rng);
-        }
+        fill_below(rng, output, MODULUS);
     }
 
     /// Fills `output` with independent uniform elements of `F_q*`.
@@ -147,22 +145,51 @@ impl<const MODULUS: u32> PrimeField<MODULUS> {
         rng: &mut R,
         output: &mut [FieldElement<MODULUS>],
     ) {
+        fill_below(rng, output, MODULUS - 1);
         for value in output {
-            *value = self.sample_uniform_nonzero(rng);
+            *value += FieldElement::from_u32(1);
         }
     }
 }
 
+/// The largest multiple of `cardinality` below `2^32`; sampling words below
+/// this bound and reducing them is unbiased.
+#[inline]
+const fn acceptance_bound(cardinality: u32) -> u64 {
+    let cardinality = cardinality as u64;
+    (1u64 << u32::BITS) / cardinality * cardinality
+}
+
 #[inline]
 fn sample_below<R: CryptoRng + ?Sized>(rng: &mut R, cardinality: u32) -> u32 {
-    let cardinality = u64::from(cardinality);
-    let source_cardinality = 1u64 << u32::BITS;
-    let acceptance_bound = source_cardinality / cardinality * cardinality;
-
+    let acceptance_bound = acceptance_bound(cardinality);
     loop {
         let candidate = u64::from(rng.next_u32());
         if candidate < acceptance_bound {
-            return (candidate % cardinality) as u32;
+            return (candidate % u64::from(cardinality)) as u32;
         }
+    }
+}
+
+/// Fills `output` with uniform values below `cardinality`.
+///
+/// The acceptance bound is computed once for the whole fill, so batched
+/// callers pay the division once instead of per sample; the RNG consumption
+/// is identical to per-sample [`sample_below`] calls.
+fn fill_below<R: CryptoRng + ?Sized, const MODULUS: u32>(
+    rng: &mut R,
+    output: &mut [FieldElement<MODULUS>],
+    cardinality: u32,
+) {
+    let acceptance_bound = acceptance_bound(cardinality);
+    let modulus = u64::from(cardinality);
+    for value in output {
+        let candidate = loop {
+            let word = u64::from(rng.next_u32());
+            if word < acceptance_bound {
+                break (word % modulus) as u32;
+            }
+        };
+        *value = FieldElement::from_u32(candidate);
     }
 }
