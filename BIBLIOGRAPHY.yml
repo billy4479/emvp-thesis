@@ -83,6 +83,17 @@ sutherland2019:
   url: https://math.mit.edu/classes/18.783/2019/LectureNotes4.pdf
   note: MIT 18.783 lecture notes 4, sections 4.1-4.2. Used for polynomial reversal, truncated inverse, and fast Euclidean division in fixed monic reduction.
 
+gathen2013:
+  type: Book
+  title: Modern Computer Algebra
+  author: ["von zur Gathen, Joachim", "Gerhard, Jurgen"]
+  date: 2013
+  edition: '3'
+  publisher: Cambridge University Press
+  serial-number:
+    isbn: 978-1-107-03903-2
+  note: "Chapter 9 (Newton iteration for power-series inversion) backs the `O(K log K)` truncated inverse of the reversed modulus in `prime_field-layer`'s `PolynomialReductionPlan`, replacing the `O(K^2)` schoolbook recurrence that dominated plan construction at large degrees."
+
 lemire2019:
   type: Article
   title: Fast Random Integer Generation in an Interval
@@ -717,3 +728,24 @@ razzhigaev2024:
   parent:
     type: Proceedings
     title: "62nd Annual Meeting of the Association for Computational Linguistics (Volume 1: Long Papers)"
+
+vaswani2017:
+  type: Conference
+  title: "Attention Is All You Need"
+  author:
+    - "Vaswani, Ashish"
+    - "Shazeer, Noam"
+    - "Parmar, Niki"
+    - "Uszkoreit, Jakob"
+    - "Jones, Llion"
+    - "Gomez, Aidan N."
+    - "Kaiser, Lukasz"
+    - "Polosukhin, Illia"
+  date: 2017
+  serial-number:
+    arxiv: "1706.03762"
+  url: https://arxiv.org/abs/1706.03762
+  note: "Original transformer architecture; source of the description of the transformer unit in Section 2.2."
+  parent:
+    type: Proceedings
+    title: "Advances in Neural Information Processing Systems 30 (NIPS 2017)"
