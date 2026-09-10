@@ -121,6 +121,24 @@ const DIMS_UNIFORM_BYTES: u64 = (DIMS_UNIFORM_WORDS * WORD_BYTES) as u64;
 /// Largest dispatchable workgroup count per dimension guaranteed by wgpu.
 const MAX_WORKGROUPS_PER_DIMENSION: u32 = 65_535;
 
+/// Largest answer count the kernel can address without wrapping its `u32`
+/// thread index.
+///
+/// The shader reconstructs each thread's linear index from the `u32`
+/// workgroup coordinates as `((y * workgroups_x) + x) * WORKGROUP_SIZE +
+/// local_id.x`. Padding `answer_words` up to whole workgroups plus the
+/// partial last workgroup row costs at most `WORKGROUP_SIZE` words
+/// horizontally and `MAX_WORKGROUPS_PER_DIMENSION` workgroups vertically, so
+/// the largest issued index is below
+/// `answer_words + MAX_WORKGROUPS_PER_DIMENSION * WORKGROUP_SIZE`. Capping
+/// `answer_words` at `u32::MAX + 1 - MAX_WORKGROUPS_PER_DIMENSION *
+/// WORKGROUP_SIZE` keeps every issued index inside `u32`; larger indices
+/// would wrap around, pass the kernel's `index >= total` guard, and race
+/// other threads' output slots. It also keeps `workgroups_y` far below the
+/// per-dimension dispatch limit.
+const MAX_ANSWER_WORDS: usize =
+    (u32::MAX as usize + 1) - (MAX_WORKGROUPS_PER_DIMENSION as usize) * WORKGROUP_SIZE_USIZE;
+
 /// A rejected GPU operation.
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[non_exhaustive]
@@ -793,12 +811,20 @@ impl GpuAnswerer {
             .ok_or(GpuError::DimensionOverflow)?;
         // The u32 narrowings double as the kernel's u32 index bounds: query
         // indices stay below `batch * n` and answer indices below
-        // `batch * rows * s`.
+        // `batch * rows * s`. The answer count additionally respects
+        // [`MAX_ANSWER_WORDS`] so the kernel's reconstructed thread index
+        // cannot wrap.
         let query_words_u32 =
             u32::try_from(query_words).map_err(|_conversion| GpuError::UploadTooLarge {
                 elements: query_words,
                 max_elements: u32::MAX as usize,
             })?;
+        if answer_words > MAX_ANSWER_WORDS {
+            return Err(GpuError::UploadTooLarge {
+                elements: answer_words,
+                max_elements: MAX_ANSWER_WORDS,
+            });
+        }
         let answer_words_u32 =
             u32::try_from(answer_words).map_err(|_conversion| GpuError::UploadTooLarge {
                 elements: answer_words,
@@ -1209,6 +1235,10 @@ fn reconstruct_answers<const MODULUS: u32>(
 /// within the wgpu-guaranteed 65535 workgroups per dimension. The kernel
 /// reconstructs the linear index from the returned `workgroups_x`, which the
 /// uniform carries.
+///
+/// Callers must have capped `answer_words` at [`MAX_ANSWER_WORDS`], which
+/// keeps every issued thread index (including workgroup padding) inside
+/// `u32` and `workgroups_y` near its lower bound.
 fn dispatch_grid(answer_words: usize) -> Result<(u32, u32), GpuError> {
     let workgroup_total = answer_words.div_ceil(WORKGROUP_SIZE_USIZE);
     let workgroups_x = u32::try_from(workgroup_total)
@@ -1275,4 +1305,49 @@ const fn check_modulus<const MODULUS: u32>() -> Result<(), GpuError> {
 /// Byte length of a buffer holding `words` u32 words.
 fn byte_len_of_words(words: u32) -> wgpu::BufferAddress {
     u64::from(words) * 4
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{MAX_ANSWER_WORDS, MAX_WORKGROUPS_PER_DIMENSION, WORKGROUP_SIZE_USIZE, dispatch_grid};
+
+    /// The largest issued thread index over the whole dispatch must stay
+    /// inside `u32`, or the shader's wrapping index arithmetic would let
+    /// padded threads overwrite real output slots.
+    #[test]
+    fn dispatch_indices_never_wrap_u32() {
+        for answer_words in [
+            1_usize,
+            256,
+            257,
+            MAX_ANSWER_WORDS - 1,
+            MAX_ANSWER_WORDS,
+        ] {
+            let (workgroups_x, workgroups_y) = dispatch_grid(answer_words).unwrap();
+            let issued_threads =
+                u64::from(workgroups_x) * u64::from(workgroups_y) * WORKGROUP_SIZE_USIZE as u64;
+            assert!(issued_threads <= u64::from(u32::MAX) + 1);
+            assert!(workgroups_x <= MAX_WORKGROUPS_PER_DIMENSION);
+            assert!(workgroups_y <= MAX_WORKGROUPS_PER_DIMENSION);
+            assert!(issued_threads >= answer_words as u64);
+        }
+    }
+
+    /// The cap's defining inequality must hold at the extreme: the padded
+    /// thread count for a maximal batch stays within `answer_words +
+    /// MAX_WORKGROUPS_PER_DIMENSION * WORKGROUP_SIZE <= 2^32`, which is
+    /// exactly what keeps the kernel's reconstructed u32 indices from
+    /// wrapping.
+    #[test]
+    fn cap_bound_holds_at_the_extreme() {
+        for answer_words in [1_usize, 256, 257, MAX_ANSWER_WORDS / 2, MAX_ANSWER_WORDS] {
+            let (workgroups_x, workgroups_y) = dispatch_grid(answer_words).unwrap();
+            let issued_threads =
+                u64::from(workgroups_x) * u64::from(workgroups_y) * WORKGROUP_SIZE_USIZE as u64;
+            let padding_allowance =
+                u64::from(MAX_WORKGROUPS_PER_DIMENSION) * WORKGROUP_SIZE_USIZE as u64;
+            assert!(issued_threads <= answer_words as u64 + padding_allowance);
+            assert!(issued_threads <= u64::from(u32::MAX) + 1);
+        }
+    }
 }

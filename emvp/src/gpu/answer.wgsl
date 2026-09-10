@@ -17,7 +17,10 @@
 // the `batch` encrypted queries (`batch x n` words), `n = b * s` is the
 // codeword length, and `b` is the protocol block size. Host code must keep
 // `rows * n <= 2^32` and `batch * n <= 2^32` so every index below fits u32
-// without overflow; the output count additionally bounds the workgrid.
+// without overflow; the output count is additionally capped below
+// `2^32 - 65535 * 256` by the host (see `MAX_ANSWER_WORDS` in gpu/mod.rs) so
+// the reconstructed thread index, which includes workgroup padding, also
+// stays inside u32.
 //
 // All protocol data here is public (encrypted matrix, encrypted queries,
 // answers), so no constant-time discipline is required on the GPU side.
@@ -132,8 +135,10 @@ fn main(
     @builtin(workgroup_id) workgroup: vec3<u32>,
 ) {
     // The host dispatches workgroups_x x workgroups_y workgroups over a
-    // linear work count of ceil(total / WORKGROUP_SIZE), which stays within
-    // u32 for every accepted output count; see the module comment.
+    // linear work count of ceil(total / WORKGROUP_SIZE). All index math is
+    // u32 and cannot wrap for any accepted output count: the host's
+    // `MAX_ANSWER_WORDS` cap keeps the padded thread count below 2^32 (see
+    // the module comment).
     let index =
         ((workgroup.y * dims.workgroups_x) + workgroup.x) * WORKGROUP_SIZE + local_id.x;
     let total = dims.batch * dims.rows * dims.s;
@@ -142,9 +147,12 @@ fn main(
     }
     // Query-major grid matching the CPU answer arena: answers for query 0
     // first, then query 1, and so on. Consecutive threads cover consecutive
-    // blocks of one (query, row) pair, so matrix and query reads are fully
-    // coalesced; the query words are shared across rows and stay L2-resident,
-    // and neighbouring workgroups reuse the same matrix row across queries.
+    // blocks of one (query, row) pair, so each iteration step reads one word
+    // per thread at a stride of `b` words (one block); a warp therefore
+    // touches up to `b` distinct cache lines per step, which is fully
+    // coalesced for small `b`. The `offset` loop revisits the same lines, and
+    // neighbouring workgroups reuse the same matrix row across queries, so
+    // the traffic stays L1/L2-resident.
     let block = index % dims.s;
     let query_row = index / dims.s;
     let row = query_row % dims.rows;
