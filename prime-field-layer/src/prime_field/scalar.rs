@@ -48,21 +48,22 @@ impl<const MODULUS: u32> PrimeField<MODULUS> {
         self.mul(value, value)
     }
 
-    /// Branchless Montgomery multiplication without inline assembly.
+    /// Branchless Montgomery multiplication.
     ///
-    /// The inline-assembly helpers in `constant_time` are opaque to LLVM and
-    /// prevent loop vectorization, so this REDC uses portable wrapping
-    /// arithmetic and mask selections instead. Auto-vectorized loops can
-    /// schedule the whole body with vector compares and multiplies. Callers
-    /// ensure `MODULUS != 2`. Latency-sensitive scalar operations use
+    /// This REDC uses portable wrapping arithmetic and mask selections with
+    /// no coefficient-dependent branches, so auto-vectorized loops can
+    /// schedule the whole body with vector compares and multiplies.
+    /// Latency-sensitive scalar operations use
     /// [`Self::montgomery_mul_scalar`] instead.
     ///
-    /// Bounds: for Montgomery operands `lhs`, `rhs` below `R = 2^32`, the
-    /// product is below `R * p` and the correction `m * p` below `R * p`, so
-    /// the wrapping sum is below `2 * R * p`. The carry out of bit 63 therefore
-    /// belongs in bit 32 of the shifted result, matching an `add`/`sbb`
-    /// sequence, and the shifted value is below `2p`, so one masked
-    /// subtraction restores `[0, p)`.
+    /// Bounds: callers pass canonical Montgomery operands `lhs`, `rhs` below
+    /// `p` (as produced by [`Self::to_montgomery`] and every Montgomery-form
+    /// operation), so the product is below `p^2 < R * p` with `R = 2^32 > p`
+    /// and the correction `m * p` below `R * p`. The wrapping sum is
+    /// therefore below `2 * R * p`; the carry out of bit 63 belongs in
+    /// bit 32 of the shifted result, matching an `add`/`sbb` sequence, and
+    /// the shifted value is below `2p`, so one masked subtraction restores
+    /// `[0, p)`.
     #[inline(always)]
     pub(crate) fn montgomery_mul(lhs: u32, rhs: u32) -> u32 {
         if MODULUS == 2 {

@@ -19,7 +19,7 @@ metadata:
   fed unreduced into the multiplication). Both rely on the paper's observation
   that Shoup's multiplication needs no correction for any input below the word
   size, whose precise 32-bit-lane bound is restated and proved in the comments
-  of `shoup_mul_lazy_for` in `src/ntt.rs`.
+  of `shoup_mul_lazy_for` in `src/ntt/support.rs`.
 - Michael Scott, "A Note on the Implementation of the Number Theoretic
   Transform," (2017), DOI
   [10.1007/978-3-319-71045-7_13](https://doi.org/10.1007/978-3-319-71045-7_13).

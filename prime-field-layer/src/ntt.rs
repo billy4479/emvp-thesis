@@ -206,7 +206,8 @@ pub struct LinearConvolutionWorkspace<const MODULUS: u32> {
 /// length `N`, and retains `N` forward and inverse twist factors. It takes
 /// `O(N + log MODULUS)` field operations and `O(N)` storage. Reuse a plan for
 /// repeated negacyclic products; each product then takes `O(N log N)` time.
-/// Cloning also clones the NTT tables and twist vectors.
+/// Clones share the NTT stage tables through reference counting and clone
+/// the twist vectors.
 #[derive(Clone)]
 pub struct NegacyclicPlan<const MODULUS: u32> {
     ntt: NttPlan<MODULUS>,

@@ -117,11 +117,10 @@ pub(super) fn halve_interval(value: u32, two_p: u32) -> u32 {
 /// The wrapping difference `value - modulus` underflows exactly when
 /// `value < modulus`; `0u32.wrapping_sub(borrow)` then materializes either
 /// all ones or zero, so the expression returns `value - modulus` or `value`
-/// unchanged with no coefficient-dependent branch. This is deliberately
-/// portable Rust rather than the inline assembly of `constant_time`:
-/// assembly is opaque to LLVM and blocks loop vectorization, while this form
-/// lowers to the same `sub`/`cmov` sequence in scalar code and to vector
-/// compares and selects inside auto-vectorized loops.
+/// unchanged with no coefficient-dependent branch. Avoiding the branch is
+/// what makes this form vectorization-friendly: scalar code lowers it to the
+/// same `sub`/`cmov` sequence a branch would produce, while auto-vectorized
+/// loops lower it to vector compares and selects.
 #[inline(always)]
 pub(super) const fn reduce_once(value: u32, modulus: u32) -> u32 {
     let (reduced, borrow) = value.overflowing_sub(modulus);

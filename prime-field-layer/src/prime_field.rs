@@ -205,6 +205,13 @@ impl<const MODULUS: u32> PrimeField<MODULUS> {
     }
 
     /// Reduces an arbitrary 64-bit integer to a canonical residue.
+    ///
+    /// `MODULUS` is a compile-time constant, so the remainder is lowered by
+    /// LLVM to a constant-latency multiply-high/shift sequence (or a
+    /// branchless `cmov` correction for single reductions), never to the
+    /// variable-latency hardware `div` instruction; `--emit asm` builds of
+    /// this crate contain zero `div`/`idiv` in the field kernels. Timings
+    /// are therefore data-independent for secret inputs.
     #[inline(always)]
     #[must_use]
     pub const fn reduce_u64(&self, value: u64) -> u32 {
@@ -212,6 +219,8 @@ impl<const MODULUS: u32> PrimeField<MODULUS> {
     }
 
     /// Reduces an arbitrary 32-bit integer to a canonical residue.
+    ///
+    /// See [`Self::reduce_u64`] for the constant-latency lowering argument.
     #[inline(always)]
     #[must_use]
     pub const fn reduce_u32(&self, value: u32) -> u32 {

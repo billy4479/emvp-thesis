@@ -66,13 +66,13 @@ impl<const MODULUS: u32> NttPlan<MODULUS> {
         normalize(values);
     }
 
-    // Reduced Shoup butterflies for the `2^30 <= p < 2^31` tier, mirroring
-    // the portable kernel that previously served the AVX2 backend. Every
-    // operand and sum fits a `u32`: inputs are canonical, the uncorrected
-    // Shoup product lies in `[0, 2p)`, and `lhs + product` and
-    // `lhs + p - product` stay below `2p < 2^32`. Each result therefore needs
-    // exactly one masked `reduce_once`, avoiding the wide `add_mod` and
-    // `sub_mod` helpers whose inline assembly would block loop vectorization.
+    // Reduced Shoup butterflies for the `2^30 <= p < 2^31` tier, where the
+    // lazy interval no longer fits a `u32`. Every operand and sum fits a
+    // `u32`: inputs are canonical, the uncorrected Shoup product lies in
+    // `[0, 2p)`, and `lhs + product` and `lhs + p - product` stay below
+    // `2p < 2^32`. Each result therefore needs exactly one masked
+    // `reduce_once`, keeping every butterfly operation branchless and
+    // vectorization-friendly.
     pub(super) fn forward_shoup(&self, values: &mut [FieldElement<MODULUS>]) {
         for stage in self.stages.iter() {
             for (block, &twiddle) in stage.forward.iter().enumerate() {
