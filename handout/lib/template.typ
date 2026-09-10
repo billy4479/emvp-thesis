@@ -13,8 +13,7 @@
   )
   set text(
     font: if (font != none) { font } else {
-      ("Arial", "Liberation Sans", "Verdana", "Tahoma", "DejaVu
-    Sans")
+      ("Arial", "Liberation Sans", "Verdana", "Tahoma", "DejaVu Sans")
     },
     size: 12pt,
     lang: lang,

@@ -75,6 +75,19 @@
           // {
             scriptName = "typst-watch-handout";
           };
+
+        # Self-asserting test suite for the bibliography renderer; a failed
+        # assertion fails the build. The raw handout directory is used as
+        # source since cleanTypstSource only keeps files reachable from the
+        # handout entry point.
+        bibliographyTestsDrv = typixLib.buildTypstProject ((builtins.removeAttrs handoutArgs [
+          "src"
+        ]) // {
+          src = ./handout;
+          pname = "bibliography-tests";
+          typstSource = "lib/bibliography-tests.typ";
+          typstOutput = "bibliography-tests.pdf";
+        });
       in
       {
         packages = rec {
@@ -98,6 +111,10 @@
           };
         };
 
+        checks = {
+          bibliography-tests = bibliographyTestsDrv;
+        };
+
         devShells = {
           default = pkgs.mkShell {
             packages = with pkgs; [
@@ -118,6 +135,7 @@
 
               typstyle
               tinymist
+              typst
               handoutWatchScript
             ];
 
