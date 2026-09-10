@@ -3,7 +3,7 @@
     reason = "test inputs establish that these operations must succeed"
 )]
 
-use prime_field_layer::{FieldError, PrimeField};
+use prime_field_layer::{FieldElement, FieldError, PrimeField};
 
 const PSEUDO_MERSENNE_32_MODULUS: u32 = 4_294_967_291;
 
@@ -62,6 +62,27 @@ fn elementwise_kernels_match_scalar_operations() {
     check_elementwise::<4_294_967_291>();
 }
 
+#[test]
+fn f2_multiplication_matches_boolean_and() {
+    // F2 takes the `MODULUS == 2` specializations in the Montgomery kernels:
+    // the Montgomery product degenerates to a bitwise AND of the bits.
+    let field = PrimeField::<2>::new();
+    for lhs in 0..2_u32 {
+        for rhs in 0..2_u32 {
+            assert_eq!(field.mul(lhs, rhs), lhs & rhs);
+            let mut values = [lhs, rhs, 1, 0].map(|value| field.element_u32(value));
+            field
+                .mul_elements_assign(&mut values, &[rhs, lhs, 1, 0].map(|v| field.element_u32(v)))
+                .unwrap();
+            assert_eq!(values.map(FieldElement::value), [lhs & rhs, lhs & rhs, 1, 0]);
+        }
+    }
+    let one = PrimeField::<2>::new().element_u32(1);
+    let zero = PrimeField::<2>::new().element_u32(0);
+    assert_eq!((one * one).value(), 1);
+    assert_eq!((one * zero).value(), 0);
+}
+
 fn check_unary_and_scalar<const MODULUS: u32>() {
     let field = PrimeField::<MODULUS>::new();
     for length in LENGTHS {
@@ -113,6 +134,10 @@ fn dot_product_matches_a_reduced_oracle() {
     check_dot::<17>();
     check_dot::<65_537>();
     check_dot::<PSEUDO_MERSENNE_32_MODULUS>();
+    // Lengths above 16 send this modulus through the exact wide `u128`
+    // accumulator (`len * (p - 1)^2` overflows `u64`), exercising the carry
+    // lane that the smaller moduli cannot reach.
+    check_dot::<1_073_479_681>();
 }
 
 fn dot_oracle(lhs: &[u32], rhs: &[u32], modulus: u32) -> u32 {

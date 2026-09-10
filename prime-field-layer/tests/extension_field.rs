@@ -44,7 +44,14 @@ fn oracle_mul(
     oracle_reduce(k, modulus, modulus_polynomial, &product)
 }
 
-fn irreducible_binomial(k: usize, modulus: u32) -> Vec<u32> {
+/// Builds the binomial `X^k - 3`.
+///
+/// Reducibility is irrelevant for the callers: they pass the result to
+/// [`PolynomialReductionPlan`]-backed constructors that are valid over any
+/// monic quotient ring, and no assertion here depends on the quotient being
+/// a field. (Over `1_073_479_681` this polynomial is in fact reducible at the
+/// benched degrees; see the extension-field benchmark's notes.)
+fn binomial_modulus(k: usize, modulus: u32) -> Vec<u32> {
     let mut polynomial = vec![0; k + 1];
     polynomial[0] = modulus - 3;
     polynomial[k] = 1;
@@ -164,7 +171,7 @@ fn runtime_degree_mismatches_are_rejected_without_mutation() {
 fn ntt_reduction_multiplication_and_squaring_match_slow_oracle() {
     const MODULUS: u32 = 1_073_479_681;
     let k: usize = 128;
-    let modulus = irreducible_binomial(k, MODULUS);
+    let modulus = binomial_modulus(k, MODULUS);
     let extension = ExtensionField::<MODULUS>::new_unchecked_irreducible(k, &modulus).unwrap();
     assert_eq!(
         extension.algorithm(),
@@ -203,8 +210,8 @@ fn ntt_reduction_multiplication_and_squaring_match_slow_oracle() {
 
 #[test]
 fn threshold_behavior_is_degree_only() {
-    let schoolbook_modulus = irreducible_binomial(23, 1_073_479_681);
-    let ntt_modulus = irreducible_binomial(24, 1_073_479_681);
+    let schoolbook_modulus = binomial_modulus(23, 1_073_479_681);
+    let ntt_modulus = binomial_modulus(24, 1_073_479_681);
     assert_eq!(
         PolynomialReductionPlan::<1_073_479_681>::new(23, &schoolbook_modulus)
             .unwrap()
@@ -225,7 +232,7 @@ fn threshold_behavior_is_degree_only() {
 fn caller_scratch_reuses_all_allocations() {
     const MODULUS: u32 = 1_073_479_681;
     let k: usize = 128;
-    let modulus = irreducible_binomial(k, MODULUS);
+    let modulus = binomial_modulus(k, MODULUS);
     let extension = ExtensionField::<MODULUS>::new_unchecked_irreducible(k, &modulus).unwrap();
     let lhs = (0..k).map(|index| index as u32 + 1).collect::<Box<[u32]>>();
     let rhs = (0..k)
