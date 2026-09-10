@@ -149,7 +149,6 @@ impl<const MODULUS: u32> ExtensionField<MODULUS> {
             return Err(ExtensionFieldError::BaseField(FieldError::LengthMismatch));
         }
 
-        self.prepare_operand(lhs, &mut scratch.reduction.values);
         self.prepare_operand(rhs, &mut scratch.rhs);
         match self.algorithm() {
             PolynomialAlgorithm::Schoolbook => {
@@ -164,6 +163,7 @@ impl<const MODULUS: u32> ExtensionField<MODULUS> {
                 }
             }
             PolynomialAlgorithm::Ntt { .. } => {
+                self.prepare_operand(lhs, &mut scratch.reduction.values);
                 self.reduction
                     .convolve(&mut scratch.reduction.values, &mut scratch.rhs)?;
             }
@@ -193,11 +193,11 @@ impl<const MODULUS: u32> ExtensionField<MODULUS> {
         }
 
         self.prepare_operand(value, &mut scratch.rhs);
-        let zero = self.reduction.zero();
-        let product = &mut scratch.reduction.values;
-        product.fill(zero);
         match self.algorithm() {
             PolynomialAlgorithm::Schoolbook => {
+                let zero = self.reduction.zero();
+                let product = &mut scratch.reduction.values;
+                product.fill(zero);
                 for lhs_index in 0..self.k {
                     let lhs = scratch.rhs[lhs_index];
                     product[lhs_index * 2] += lhs.square();
@@ -208,6 +208,7 @@ impl<const MODULUS: u32> ExtensionField<MODULUS> {
                 }
             }
             PolynomialAlgorithm::Ntt { .. } => {
+                let product = &mut scratch.reduction.values;
                 product.copy_from_slice(&scratch.rhs);
                 self.reduction.square_convolution(product)?;
             }
