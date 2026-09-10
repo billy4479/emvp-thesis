@@ -24,6 +24,9 @@ pub struct RaaWeightedProduct<const MODULUS: u32> {
     second_permutation: Permutation,
     third_permutation: Permutation,
     fourth_permutation: Permutation,
+    /// Precomputed `first_permutation[i] / c` gather sources, so the first
+    /// stage needs no runtime division (see [`Self::apply`]).
+    first_sources: Vec<usize>,
 }
 
 /// Reusable two-buffer workspace for [`RaaWeightedProduct`].
@@ -77,6 +80,15 @@ impl<const MODULUS: u32> RaaWeightedProduct<MODULUS> {
         super::error::check_len("third permutation", n, third_permutation.len())?;
         super::error::check_len("fourth permutation", n, fourth_permutation.len())?;
 
+        // `D` repeats each of the `k` input entries `c` times, so stage one
+        // gathers `input[pi[i] / c]`. The division runs once here instead of
+        // once per element per apply.
+        let first_sources: Vec<usize> = first_permutation
+            .indices()
+            .iter()
+            .map(|&index| index / c)
+            .collect();
+
         Ok(Self {
             k,
             c,
@@ -88,6 +100,7 @@ impl<const MODULUS: u32> RaaWeightedProduct<MODULUS> {
             second_permutation,
             third_permutation,
             fourth_permutation,
+            first_sources,
         })
     }
 
@@ -232,9 +245,9 @@ impl<const MODULUS: u32> RaaWeightedProduct<MODULUS> {
         for (result, &index) in scratch
             .first
             .iter_mut()
-            .zip(self.first_permutation.indices())
+            .zip(&self.first_sources)
         {
-            *result = input[index / self.c];
+            *result = input[index];
         }
         weighted_inclusive_scan_assign(&mut scratch.first, &self.first_weights)?;
 
