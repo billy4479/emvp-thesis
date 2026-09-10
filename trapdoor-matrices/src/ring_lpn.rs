@@ -21,11 +21,16 @@ use crate::{DenseMatrix, TdmError};
 /// Maximum whole-matrix resampling attempts while avoiding empty columns.
 ///
 /// The probability that one Bernoulli matrix has no empty column is
-/// `(1 - (1 - weight/(2K))^{2K})^K`. At any sane weight this is
-/// indistinguishable from one and the budget never binds. It is sized so
-/// that even the least favorable supported pair (`K = 8`, `weight = 1`)
-/// still succeeds with probability beyond `2^-40`; larger failures can only
-/// happen below the supported weight range.
+/// `(1 - (1 - weight/(2K))^{2K})^K`, which collapses to about `e^{-K}` for
+/// `weight << K`: the budget is sized for the policy weight regime
+/// (`weight` of the order of the policy floor, 192 in `crate::parameters`),
+/// where the
+/// probability of exhausting it is astronomically small. At tiny weights and
+/// large degrees (say `K = 2048, weight = 1`, which `validate_weight`
+/// accepts) each attempt succeeds with probability about `2^{-1300}` and
+/// sampling deterministically fails after `2K^2` draws per attempt, so the
+/// budget error is the only sane outcome for a request that cannot be
+/// sampled.
 const MAX_EMPTY_COLUMN_RETRIES: usize = 1024;
 
 /// A matrix in compressed sparse column format.
@@ -489,11 +494,18 @@ fn sample_bernoulli_matrix<const MODULUS: u32, R: CryptoRng + ?Sized>(
     rng: &mut R,
 ) -> Result<SparseMatrix<MODULUS>, TdmError> {
     let offsets_capacity = k.checked_add(1).ok_or(TdmError::DimensionOverflow)?;
+    // Each column is nonzero with probability `weight / rows`, so the
+    // expected nonzero count is `k * weight`. Reserving it up front bounds
+    // the entry storage without reallocation, which also keeps the
+    // allocator's timing independent of how the support happened to land.
+    let expected_entries = k
+        .checked_mul(weight)
+        .ok_or(TdmError::DimensionOverflow)?;
     let field = PrimeField::<MODULUS>::new();
     for _attempt in 0..MAX_EMPTY_COLUMN_RETRIES {
         let mut offsets = Vec::with_capacity(offsets_capacity);
-        let mut row_indices = Vec::new();
-        let mut values = Vec::new();
+        let mut row_indices = Vec::with_capacity(expected_entries);
+        let mut values = Vec::with_capacity(expected_entries);
         offsets.push(0);
         for _column in 0..k {
             for row in 0..rows {
