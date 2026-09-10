@@ -49,8 +49,12 @@ fn ring_inputs(k: usize) -> (Box<[u32]>, Box<[u32]>, SparseMatrix<MODULUS>) {
     // matrix must have an exact column weight so the measured work does not
     // depend on Bernoulli sampling luck.
     let field = PrimeField::<MODULUS>::new();
+    // One RNG drawn down once, so the multiplier really is a uniform
+    // polynomial (per-draw reseeding produced a constant one). A separate
+    // domain from the sparse matrix keeps the two fixtures independent.
+    let mut multiplier_rng = seeded_rng(0x30, k);
     let multiplier = (0..k)
-        .map(|_| field.sample_uniform(&mut seeded_rng(0x31, k)).value())
+        .map(|_| field.sample_uniform(&mut multiplier_rng).value())
         .collect::<Box<[u32]>>();
     let target_weight = k.min(TARGET_COLUMN_WEIGHT);
     let sparse = trapdoor_matrices::testing::fixed_weight_sparse::<MODULUS, _>(
@@ -75,6 +79,9 @@ fn ring_instance(k: usize) -> IrreducibleRingLpn<MODULUS> {
 fn ring_construction_for(group: &mut BenchmarkGroup<'_, WallTime>, k: usize) {
     let (modulus, multiplier, sparse) = ring_inputs(k);
     let target_weight = k.min(TARGET_COLUMN_WEIGHT);
+    // Counts the constructed words: the modulus polynomial, the multiplier,
+    // and the `k * weight` secret entries. The retained NTT reduction tables
+    // (the dominant construction cost) are not counted here.
     group.throughput(elements(k + 1 + k + k * target_weight));
     group.bench_function(BenchmarkId::from_parameter(k), |b| {
         b.iter_batched(
@@ -127,6 +134,8 @@ fn toeplitz_instance(k: usize) -> ToeplitzFastProduct<MODULUS> {
 }
 
 fn toeplitz_construction_for(group: &mut BenchmarkGroup<'_, WallTime>, k: usize) {
+    // Counts the secret diagonals of the three Toeplitz factors: the
+    // `(3k - 1)` right, `(4k - 1)` middle, and `(3k - 1)` left diagonals.
     group.throughput(elements(10 * k - 3));
     group.bench_function(BenchmarkId::from_parameter(k), |b| {
         b.iter_batched(
@@ -174,6 +183,9 @@ fn raa_instance(k: usize) -> RaaWeightedProduct<MODULUS> {
 }
 
 fn raa_construction_for(group: &mut BenchmarkGroup<'_, WallTime>, k: usize) {
+    // Counts only the sampled field weights (`3 * k * c`); the four
+    // permutations of `k * c` gather indices each are built in the same
+    // call but not counted.
     group.throughput(elements(3 * k * RAA_C));
     group.bench_function(BenchmarkId::new("sample_nonzero_c4", k), |b| {
         b.iter_batched(
