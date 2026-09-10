@@ -64,14 +64,16 @@ impl<const MODULUS: u32> FieldElement<MODULUS> {
     ///
     /// `raw` must be the canonical Montgomery residue `a * 2^32 mod MODULUS`
     /// of some canonical `a`, that is, a word in `0..MODULUS` as produced by
-    /// [`Self::to_raw`]. This is the inverse of [`Self::to_raw`]. The
-    /// precondition cannot be checked without a reduction, which would defeat
-    /// the zero-copy interchange this constructor exists for, so it is a
-    /// caller obligation: every other operation, including the Montgomery
-    /// kernels, bounds its arithmetic on the operands being canonical.
+    /// [`Self::to_raw`]. This is the inverse of [`Self::to_raw`]. Checking
+    /// the precondition would only need one compare against the modulus, but
+    /// even that is skipped in release builds to keep the zero-copy
+    /// interchange free, so it is a caller obligation: every other
+    /// operation, including the Montgomery kernels, bounds its arithmetic on
+    /// the operands being canonical.
     #[inline(always)]
     #[must_use]
     pub const fn from_raw(raw: u32) -> Self {
+        debug_assert!(raw < MODULUS, "from_raw requires a canonical Montgomery residue");
         Self::from_montgomery(raw)
     }
 
