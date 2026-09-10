@@ -8,6 +8,8 @@ use prime_field_layer::{FieldElement, NttPlan, PrimeField};
 const P1: u32 = 1_073_479_681;
 const P2: u32 = 2_013_265_921;
 const P3: u32 = 2_281_701_377;
+const P4: u32 = 65_537;
+const PSEUDO_MERSENNE: u32 = 4_294_967_291;
 
 #[inline(never)]
 fn forward_auto(plan: &NttPlan<P1>, values: &mut [FieldElement<P1>]) {
@@ -59,6 +61,22 @@ fn forward_wide(plan: &NttPlan<P3>, values: &mut [FieldElement<P3>]) {
     black_box(plan.forward(black_box(values))).unwrap();
 }
 
+#[inline(never)]
+fn dot_u64_fitting(lhs: &[u32], rhs: &[u32]) -> u32 {
+    black_box(
+        PrimeField::<P4>::new().dot_canonical(black_box(lhs), black_box(rhs)),
+    )
+    .unwrap()
+}
+
+#[inline(never)]
+fn dot_pseudo_mersenne(lhs: &[u32], rhs: &[u32]) -> u32 {
+    black_box(
+        PrimeField::<PSEUDO_MERSENNE>::new().dot_canonical(black_box(lhs), black_box(rhs)),
+    )
+    .unwrap()
+}
+
 fn main() {
     let auto = black_box(NttPlan::<P1>::new(1024).unwrap());
     let scalar = black_box(NttPlan::<P1>::new_scalar(1024).unwrap());
@@ -80,6 +98,10 @@ fn main() {
     let wide = black_box(NttPlan::<P3>::new(1024).unwrap());
     let mut wide_values = wide.elements(&black_box((0..1024).collect::<Vec<u32>>()));
     forward_wide(&wide, &mut wide_values);
+    let dot_lhs: Vec<u32> = (0..4096).map(|index| index % 1_000).collect();
+    let dot_rhs: Vec<u32> = (0..4096).map(|index| (index * 7 + 3) % 1_000).collect();
+    black_box(dot_u64_fitting(&dot_lhs, &dot_rhs));
+    black_box(dot_pseudo_mersenne(&dot_lhs, &dot_rhs));
     black_box(wide_values);
     black_box(values);
 }

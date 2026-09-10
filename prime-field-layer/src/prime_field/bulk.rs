@@ -2,6 +2,64 @@ use crate::constant_time::reduce_once_u64;
 
 use super::{FieldError, PrimeField};
 
+const PSEUDO_MERSENNE_32_MODULUS: u32 = 4_294_967_291;
+const PSEUDO_MERSENNE_CHUNK_ELEMENTS: usize = 1_024;
+const PSEUDO_MERSENNE_32_MODULUS_U64: u64 = PSEUDO_MERSENNE_32_MODULUS as u64;
+
+/// Computes the exact dot product of two slices into a `u64`.
+///
+/// The caller proves that the complete dot product fits in `u64`, so no
+/// accumulator can overflow. The kernel stays out of line: inlining it into
+/// `dot_canonical` lets LLVM see the caller's length guard and it then
+/// replaces the clean widening-multiply loop with a much slower
+/// carry-tracking vectorization.
+#[inline(never)]
+fn dot_u64(lhs: &[u32], rhs: &[u32]) -> u64 {
+    let mut sum = 0u64;
+    for (&lhs, &rhs) in lhs.iter().zip(rhs) {
+        sum += u64::from(lhs) * u64::from(rhs);
+    }
+    sum
+}
+
+/// Computes a dot product modulo `2^32 - 5` using `2^32 = 5 (mod p)`.
+///
+/// The slices must have equal lengths. The low and high halves of each
+/// product accumulate separately, which keeps `product >> 32` a pure shift
+/// inside the vectorized loop; both halves stay below `2^42` per chunk, so
+/// the end-of-chunk fold `low + 5 * high` stays below `2^45` and the chunk
+/// reduction keeps every later addition far from overflowing.
+fn dot_pseudo_mersenne_32(lhs: &[u32], rhs: &[u32]) -> u32 {
+    let mut sum = 0u64;
+    // An opaque shift amount stops LLVM from rewriting `product >> 32` into
+    // a shuffle-heavy 32x32 `mulhi`; the loop still vectorizes, lowering the
+    // shift as `vpsrlvq`.
+    let high_shift = std::hint::black_box(32);
+    for (lhs_chunk, rhs_chunk) in lhs
+        .chunks(PSEUDO_MERSENNE_CHUNK_ELEMENTS)
+        .zip(rhs.chunks(PSEUDO_MERSENNE_CHUNK_ELEMENTS))
+    {
+        let mut low_sum = 0u64;
+        let mut high_sum = 0u64;
+        for (&lhs, &rhs) in lhs_chunk.iter().zip(rhs_chunk) {
+            let product = u64::from(lhs) * u64::from(rhs);
+            low_sum += product & u64::from(u32::MAX);
+            high_sum += product >> high_shift;
+        }
+        sum = reduce_pseudo_mersenne_chunk(sum + reduce_pseudo_mersenne_chunk(
+            low_sum + 5 * high_sum,
+        ));
+    }
+    reduce_pseudo_mersenne_chunk(sum) as u32
+}
+
+/// Reduces the values produced by one 1024-element accumulator chunk.
+#[inline(always)]
+fn reduce_pseudo_mersenne_chunk(value: u64) -> u64 {
+    let folded = (value & u64::from(u32::MAX)) + 5 * (value >> 32);
+    reduce_once_u64(folded, PSEUDO_MERSENNE_32_MODULUS_U64)
+}
+
 impl<const MODULUS: u32> PrimeField<MODULUS> {
     #[inline(always)]
     fn reduce_u128(self, value: u128) -> u32 {
@@ -90,10 +148,10 @@ impl<const MODULUS: u32> PrimeField<MODULUS> {
     /// Computes the dot product of two canonical-residue slices.
     ///
     /// Every input must be less than `MODULUS`. The result is canonical.
-    /// On x86-64 with AVX2, exact `u64` accumulation uses eight-element SIMD;
-    /// `MODULUS = 2^32 - 5` instead folds each product with
-    /// `2^32 = 5 (mod MODULUS)` in bounded SIMD chunks. Other cases use the
-    /// portable exact wide accumulator.
+    /// `MODULUS = 2^32 - 5` folds each product with `2^32 = 5 (mod MODULUS)`
+    /// in bounded chunks; the other cases accumulate into an exact wide
+    /// accumulator that fits when the length bound proves it. LLVM
+    /// auto-vectorizes both loops without handwritten intrinsics.
     ///
     /// # Errors
     ///
@@ -103,33 +161,13 @@ impl<const MODULUS: u32> PrimeField<MODULUS> {
             return Err(FieldError::LengthMismatch);
         }
 
-        #[cfg(target_arch = "x86_64")]
-        if MODULUS == super::dot_avx2::PSEUDO_MERSENNE_32_MODULUS
-            && let Some(result) = super::dot_avx2::dot_pseudo_mersenne_32(lhs, rhs)
-        {
-            return Ok(result);
+        if MODULUS == PSEUDO_MERSENNE_32_MODULUS {
+            return Ok(dot_pseudo_mersenne_32(lhs, rhs));
         }
 
         let max_product = u64::from(MODULUS - 1) * u64::from(MODULUS - 1);
         if lhs.len() as u128 * u128::from(max_product) <= u128::from(u64::MAX) {
-            #[cfg(target_arch = "x86_64")]
-            if let Some(sum) = super::dot_avx2::dot_u64(lhs, rhs) {
-                return Ok(self.reduce_u64(sum));
-            }
-
-            let mut sums = [0u64; 4];
-            for (lhs, rhs) in lhs.chunks_exact(4).zip(rhs.chunks_exact(4)) {
-                sums[0] += u64::from(lhs[0]) * u64::from(rhs[0]);
-                sums[1] += u64::from(lhs[1]) * u64::from(rhs[1]);
-                sums[2] += u64::from(lhs[2]) * u64::from(rhs[2]);
-                sums[3] += u64::from(lhs[3]) * u64::from(rhs[3]);
-            }
-
-            let remainder_start = lhs.len() / 4 * 4;
-            for (&lhs, &rhs) in lhs[remainder_start..].iter().zip(&rhs[remainder_start..]) {
-                sums[0] += u64::from(lhs) * u64::from(rhs);
-            }
-            return Ok(self.reduce_u64(sums.into_iter().sum()));
+            return Ok(self.reduce_u64(dot_u64(lhs, rhs)));
         }
 
         let mut low = [0u64; 4];
