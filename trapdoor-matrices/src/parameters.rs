@@ -257,31 +257,39 @@ pub fn assess<const MODULUS: u32>(k: usize, weight: usize) -> SecurityAssessment
             });
         }
 
-        let ntt_length = (rows - 1).next_power_of_two();
-        let two_adicity = MODULUS.saturating_sub(1).trailing_zeros();
-        if u64::from(u32::try_from(ntt_length).unwrap_or(u32::MAX)) > 1u64 << two_adicity {
-            warnings.push(ParameterWarning::NttLengthUnsupported {
-                ntt_length,
-                two_adicity,
-            });
-        }
-
         // Refinement-discount and policy-floor checks only add signal on
         // otherwise-clean assessments; a structurally broken pair is already
         // reported at its strongest warning.
-        if !warnings.iter().any(is_broken_warning) {
-            let discounted_cost = ISD_REFINEMENT_DISCOUNT.mul_add(decoding_iterations, elimination);
-            if discounted_cost < f64::from(TARGET_SECURITY_BITS) {
-                warnings.push(ParameterWarning::IsdRefinementMarginBelowTarget {
-                    log2_cost: discounted_cost,
-                    target_bits: TARGET_SECURITY_BITS,
-                });
-            } else if weight < POLICY_WEIGHT_FLOOR {
-                warnings.push(ParameterWarning::WeightBelowPolicyDefault {
-                    weight,
-                    floor: POLICY_WEIGHT_FLOOR,
+        let ntt_length = (rows - 1).checked_next_power_of_two();
+        let already_broken = warnings.iter().any(is_broken_warning);
+        if let Some(ntt_length) = ntt_length {
+            let two_adicity = MODULUS.saturating_sub(1).trailing_zeros();
+            if u64::from(u32::try_from(ntt_length).unwrap_or(u32::MAX)) > 1u64 << two_adicity {
+                warnings.push(ParameterWarning::NttLengthUnsupported {
+                    ntt_length,
+                    two_adicity,
                 });
             }
+
+            if !already_broken {
+                let discounted_cost =
+                    ISD_REFINEMENT_DISCOUNT.mul_add(decoding_iterations, elimination);
+                if discounted_cost < f64::from(TARGET_SECURITY_BITS) {
+                    warnings.push(ParameterWarning::IsdRefinementMarginBelowTarget {
+                        log2_cost: discounted_cost,
+                        target_bits: TARGET_SECURITY_BITS,
+                    });
+                } else if weight < POLICY_WEIGHT_FLOOR {
+                    warnings.push(ParameterWarning::WeightBelowPolicyDefault {
+                        weight,
+                        floor: POLICY_WEIGHT_FLOOR,
+                    });
+                }
+            }
+        } else {
+            // A degree whose transform length leaves `usize` cannot be
+            // evaluated on this platform at all.
+            warnings.push(ParameterWarning::DegreeBeyondPlatform { degree: k });
         }
     }
 
