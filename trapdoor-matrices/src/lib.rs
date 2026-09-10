@@ -11,9 +11,9 @@
 //! every request against the best-known-attack estimates of [`assess`]
 //! and returns the outcome as warnings while still constructing the instance.
 //! The Toeplitz and RAA constructions rely on new, speculative
-//! structured-cubic pseudorandomness assumptions. The rejected quasi-cyclic
-//! product from an older EMVP implementation is neither the Ring-LPN
-//! construction nor the rectangular-Toeplitz construction here.
+//! structured-cubic pseudorandomness assumptions. The quasi-cyclic product
+//! of the original EMVP proposal was rejected in favor of the constructions
+//! implemented here and does not appear in this crate.
 //!
 //! Evaluation allocates no memory when the caller reuses the construction's
 //! scratch object. Sampling uses rejection and has variable RNG consumption.

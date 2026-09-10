@@ -24,8 +24,10 @@ use crate::{IrreducibleRingLpn, automatic_ring_modulus};
 ///
 /// # Errors
 ///
-/// Returns an error for a zero degree, an oversized weight, dimension
-/// overflow, or malformed sampling bounds.
+/// Returns an error for a zero degree, dimension overflow, or malformed
+/// sampling bounds. A weight above `k` is not an error: it is silently
+/// clamped to `k`, matching the per-column capacity of the deterministic
+/// row layout.
 pub fn fixed_weight_sparse<const MODULUS: u32, R: CryptoRng + ?Sized>(
     k: usize,
     weight: usize,
@@ -73,7 +75,7 @@ pub fn ring_block<const MODULUS: u32, R: CryptoRng + ?Sized>(
     IrreducibleRingLpn::new_unchecked_irreducible(k, &modulus, &multiplier, sparse)
 }
 
-/// Re-exports the field element helper for downstream test fixtures.
+/// Uniform field-element fixture helper shared by downstream test suites.
 #[doc(hidden)]
 pub fn field_values<const MODULUS: u32, R: CryptoRng + ?Sized>(
     length: usize,

@@ -62,6 +62,14 @@ impl<const MODULUS: u32> ToeplitzMap<MODULUS> {
         let zero = PrimeField::<MODULUS>::new().element_u32(0);
         let mut spectrum = vec![zero; transform_length];
 
+        // Pack the diagonals so the cyclic product with the zero-padded
+        // input produces the Toeplitz rows: slot `t` for `t < rows` receives
+        // `diagonals[rows - 1 - t]` (the main diagonal and its positive
+        // neighbors), and the wrapped slots `transform_length - 1 - offset`
+        // receive `diagonals[rows + offset]` (the negative diagonals). The
+        // zero padding of the input guarantees the wrapped slots never
+        // collide with the first `rows` outputs because
+        // `transform_length >= rows + columns - 1`.
         for offset in 0..rows {
             spectrum[offset] = diagonals[rows - 1 - offset];
         }
@@ -197,6 +205,17 @@ impl<const MODULUS: u32> ToeplitzMap<MODULUS> {
         Ok(())
     }
 
+    /// Transformed spectrum of the transposed Toeplitz map.
+    ///
+    /// The transpose of a Toeplitz matrix is Toeplitz with reversed
+    /// diagonals, which corresponds to reversing the sign of every
+    /// frequency: if `p` is the packed diagonal spectrum, the transpose
+    /// packing satisfies `q[u] = p[(-u) mod N]`, and the DFT of `q` is
+    /// therefore `Q(f) = P(-f)`. This method rebuilds `q` from the cached
+    /// spectrum `P`: it maps each target slot to its bit-reversed frequency
+    /// (matching `NttPlan::forward`'s convention of storing `X[bit_reverse
+    /// (i)]` in slot `i`), negates that frequency modulo the transform
+    /// length, and reads the source slot holding `P(-f)`.
     fn transpose_spectrum(&self) -> Vec<FieldElement<MODULUS>> {
         let length = self.transform_length();
         let zero = PrimeField::<MODULUS>::new().element_u32(0);

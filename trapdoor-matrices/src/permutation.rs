@@ -97,6 +97,14 @@ impl Permutation {
     }
 }
 
+/// Samples an unbiased value below `upper_bound`.
+///
+/// Mirrors `prime_field_layer`'s rejection sampler: a random 32-bit word is
+/// accepted when it falls below the largest multiple of `upper_bound` in
+/// `2^32`, which makes every produced value equally likely. Rejection makes
+/// the number of consumed RNG words variable and observable; this function
+/// is for fresh sampling from a cryptographic RNG whose raw output must not
+/// leak, not for values whose timing must be independent of the draw.
 pub fn sample_below<R: CryptoRng + ?Sized>(
     rng: &mut R,
     upper_bound: usize,
