@@ -47,7 +47,7 @@ scott2017:
     doi: 10.1007/978-3-319-71045-7_13
   parent:
     type: Proceedings
-    title: "Cryptography and Coding (17th IMA International Conference, IMACC 2017), LNCS 10655"
+    title: "Cryptography and Coding (16th IMA International Conference, IMACC 2017), LNCS 10655"
 
 longa2016:
   type: Article
@@ -112,8 +112,7 @@ shoup2009:
   note: "Attributed origin of 'Shoup's trick' (precomputing floor(b * 2^k / p) so a modular product costs one widening multiply, one multiply-high and one subtraction, with no division), as distributed in Shoup's NTL library. `prime-field-layer` uses it for twiddle factors (`NttPlan` twiddle storage), the scalar-multiply bulk kernel (`PrimeField::scalar_mul_assign_canonical`), and, in the wide-input lazy form, the transform butterflies. Harvey 2014 restates the correctness bounds for NTT butterflies and Bradbury et al. 2021 give the precise 32-bit-lane bound."
 
 crandall1992:
-  type: Misc
-  genre: Patent
+  type: Patent
   title: "Method and apparatus for public key exchange in a cryptographic system"
   author: "Crandall, Richard E."
   date: 1992
@@ -123,9 +122,9 @@ crandall1992:
 frigo1999:
   type: Article
   title: "A Fast Fourier Transform Compiler"
-  author: ["Frigo, Matteo", "Johnson, Steven G."]
+  author: "Frigo, Matteo"
   date: 1999
-  page-range: 168-177
+  page-range: 169-180
   serial-number:
     doi: 10.1145/301618.301661
   note: "Origin of the reusable 'plan' object: precompute tables, roots, and algorithm choice once, then run transforms allocation-free in place. `prime-field-layer` follows this pattern with `NttPlan`, `NegacyclicPlan`, `PolynomialReductionPlan`, and pretransformed operands with retained workspaces."
@@ -141,12 +140,27 @@ montgomery1985:
   page-range: 519-521
   serial-number:
     doi: 10.2307/2007970
-  note: "Origin of Montgomery multiplication (REDC) and of 'Montgomery's trick' (simultaneous batch inversion: one inversion plus about 3(n-1) multiplications via prefix products). Used in `prime-field-layer` for field-element pointwise multiplication, inverse normalization, `PrimeField::batch_inv_assign`, and `PrimeField::batch_inv_elements`; also underlies the wide-modulus fallback representation."
+  note: "Origin of Montgomery multiplication (REDC). Used in `prime-field-layer` for field-element pointwise multiplication, inverse normalization, and the wide-modulus fallback representation."
   parent:
     type: Periodical
     title: Mathematics of Computation
     volume: 44
     issue: 170
+
+montgomery1987:
+  type: Article
+  title: Speeding the Pollard and Elliptic Curve Methods of Factorization
+  author: "Montgomery, Peter L."
+  date: 1987
+  page-range: 243-264
+  serial-number:
+    doi: 10.1090/S0025-5718-1987-0866113-7
+  note: "Source customarily cited for 'Montgomery's trick' (simultaneous batch inversion: one inversion plus about 3(n-1) multiplications via prefix products). Used in `PrimeField::batch_inv_assign` and `PrimeField::batch_inv_elements`."
+  parent:
+    type: Periodical
+    title: Mathematics of Computation
+    volume: 48
+    issue: 177
 
 rabin1980:
   type: Article
@@ -176,7 +190,7 @@ sutherland2019:
 gathen2013:
   type: Book
   title: Modern Computer Algebra
-  author: ["von zur Gathen, Joachim", "Gerhard, Jurgen"]
+  author: ["von zur Gathen, Joachim", "Gerhard, Jürgen"]
   date: 2013
   edition: '3'
   publisher: Cambridge University Press
@@ -220,14 +234,9 @@ boyle2022:
     - "Kohl, Lisa"
     - "Scholl, Peter"
   date: 2022
-  serial-number:
-    doi: 10.1007/978-3-030-56880-1_14
-    serial: "IACR ePrint 2022/1035"
+  serial-number: "IACR ePrint 2022/1035"
   url: https://eprint.iacr.org/2022/1035
   note: Full version of the CRYPTO 2020 publication. Used for the irreducible-extension Ring-LPN assumption and its structural security caveats.
-  parent:
-    type: Conference
-    title: CRYPTO 2020
 
 heyse2012:
   type: Article
@@ -248,7 +257,7 @@ heyse2012:
     volume: "LNCS 7549"
 
 brehm2024:
-  type: Misc
+  type: Article
   title: "Blaze: Fast SNARKs from Interleaved RAA Codes"
   author:
     - "Brehm, Martijn"
@@ -257,24 +266,31 @@ brehm2024:
     - "Resch, Nicolas"
     - "Rothblum, Ron D."
     - "Zeilberger, Hadas"
-  date: 2024
-  serial-number: "IACR ePrint 2024/1609"
-  url: https://eprint.iacr.org/2024/1609
+  date: 2025
+  page-range: 123-152
+  serial-number:
+    doi: 10.1007/978-3-031-91134-7_5
+    serial: "IACR ePrint 2024/1609"
   note: Used only as algorithmic background for repeat-accumulate-accumulate codes; its coding results do not prove pseudorandomness of the weighted TDM.
   parent:
-    type: Conference
-    title: EUROCRYPT 2025
+    type: Proceedings
+    title: "Advances in Cryptology - EUROCRYPT 2025"
+    volume: "LNCS 15604"
+    publisher: Springer
 
 blelloch1993:
   type: Chapter
   title: Prefix Sums and Their Applications
   author: "Blelloch, Guy E."
   date: 1993
+  page-range: 35-60
   url: https://www.cs.cmu.edu/~guyb/papers/Ble93.pdf
   note: Used for the weighted-prefix-scan formulation of the RAA evaluator.
   parent:
     type: Book
-    title: Synthesis of Parallel Algorithms
+    title: "A Synthesis of Parallel Algorithms"
+    editor: "Reif, John H."
+    publisher: Morgan Kaufmann
 
 intel-avx:
   type: Reference
@@ -284,29 +300,24 @@ intel-avx:
   url: https://cdrdv2.intel.com/v1/dl/getContent/828965
 
 lolcats2024:
-  type: Misc
+  type: Article
   title: "LoLCATs: On Low-Rank Linearizing of Large Language Models"
   author:
-    - "Zhang, Angelica"
-    - "Wang, Bailin"
-    - "Chen, Jannie"
-    - "Khashabi, Daniel"
-    - "Mavridis, Chris"
-    - "Ahmed, Pritom"
-    - "Bolukbasi, Tolga"
-    - "Bapna, Ankur"
-    - "Meng, Yu"
-    - "Firat, Orhan"
-    - "Su, Pei-Hao"
-    - "Ainslie, Joshua"
-  date: 2024
+    - "Zhang, Michael"
+    - "Arora, Simran"
+    - "Chalamala, Rahul"
+    - "Wu, Alan"
+    - "Spector, Benjamin"
+    - "Singhal, Aaryan"
+    - "Ramesh, Krithik"
+    - "Ré, Christopher"
+  date: 2025
   serial-number:
     arxiv: "2410.10254"
-  url: https://arxiv.org/abs/2410.10254
   note: Precedent for distilling softmax attention into linear attention, the main candidate for the EMVP-friendly student architecture.
   parent:
-    type: Conference
-    title: ICLR 2025
+    type: Proceedings
+    title: International Conference on Learning Representations (ICLR 2025)
 
 katharopoulos2020:
   type: Article
@@ -338,7 +349,29 @@ eldan2023:
 smollm2:
   type: Misc
   title: "SmolLM2: When Smol Goes Big - Data-Centric Training of a Small Language Model"
-  author: ["Ben Allal, Loubna", "Lozhkov, Anton", "Bakouch, Elie"]
+  author:
+    - "Ben Allal, Loubna"
+    - "Lozhkov, Anton"
+    - "Bakouch, Elie"
+    - "Martín Blázquez, Gabriel"
+    - "Penedo, Guilherme"
+    - "Tunstall, Lewis"
+    - "Marafioti, Andrés"
+    - "Kydlíček, Hynek"
+    - "Piqueres Lajarín, Agustín"
+    - "Srivastav, Vaibhav"
+    - "Lochner, Joshua"
+    - "Fahlgren, Caleb"
+    - "Nguyen, Xuan-Son"
+    - "Fourrier, Clémentine"
+    - "Burtenshaw, Ben"
+    - "Larcher, Hugo"
+    - "Zhao, Haojun"
+    - "Zakka, Cyril"
+    - "Morlon, Mathieu"
+    - "Raffel, Colin"
+    - "von Werra, Leandro"
+    - "Wolf, Thomas"
   date: 2025
   serial-number:
     arxiv: "2502.02737"
@@ -348,7 +381,7 @@ smollm2:
 lidl1983:
   type: Book
   title: Finite Fields
-  author: "Lidl, Rudolf and Niederreiter, Harald"
+  author: ["Lidl, Rudolf", "Niederreiter, Harald"]
   date: 1983
   publisher: Addison-Wesley
   note: Used for the binomial irreducibility criterion (Theorem 3.75) behind the automatic modulus selection in `trapdoor_matrices::parameters::automatic_ring_modulus`.
@@ -357,8 +390,10 @@ prange1962:
   type: Article
   title: The use of information sets in decoding cyclic codes
   author: "Prange, Eugene"
-  date: 1962
+  date: 1962-09
   page-range: 5-9
+  serial-number:
+    doi: 10.1109/TIT.1962.1057777
   note: Baseline information-set-decoding attack; the source of the ~2^t iteration estimate used to size the Ring-LPN TDM column weight.
   parent:
     type: Periodical
@@ -373,11 +408,11 @@ may2011:
   date: 2011
   page-range: 107-124
   serial-number:
-    doi: 10.1007/978-3-642-20465-4_7
+    doi: 10.1007/978-3-642-25385-0_6
   note: Information-set-decoding refinement behind the pessimistic exponent discount in the Ring-LPN TDM parameter analysis.
   parent:
     type: Proceedings
-    title: "EUROCRYPT 2011, LNCS 6632"
+    title: "ASIACRYPT 2011, LNCS 7073"
 
 becker2012:
   type: Article
@@ -386,7 +421,7 @@ becker2012:
   date: 2012
   page-range: 520-536
   serial-number:
-    doi: 10.1007/978-3-642-55220-5_30
+    doi: 10.1007/978-3-642-29011-4_31
   note: Representation-technique ISD refinement behind the pessimistic exponent discount in the Ring-LPN TDM parameter analysis.
   parent:
     type: Proceedings
@@ -399,7 +434,7 @@ blum2003:
   date: 2003
   page-range: 506-519
   serial-number:
-    doi: 10.1145/777148.777186
+    doi: 10.1145/792538.792543
   note: Source of the sample-hungry BKW attack family; rules out BKW against the dual-LPN TDM because the attacker receives only n samples.
   parent:
     type: Periodical
@@ -414,7 +449,7 @@ kailath1995:
   date: 1995
   page-range: 297-386
   serial-number:
-    doi: 10.1137/S003614459432063X
+    doi: 10.1137/1037082
   note: "Displacement rank and the shift-operator framework; used in the Toeplitz TDM analysis to show unpermuted products stay structurally distinguishable (displacement rank at most 6) while interleaving permutations raise it to full rank."
   parent:
     type: Periodical
@@ -452,24 +487,24 @@ beullens2022:
   title: "Breaking Rainbow Takes a Weekend on a Laptop"
   author: "Beullens, Ward"
   date: 2022
-  page-range: 95-126
+  page-range: 464-479
   serial-number:
-    doi: 10.1007/978-3-031-07085-3_4
+    doi: 10.1007/978-3-031-15979-4_16
     serial: "IACR ePrint 2022/214"
   url: https://eprint.iacr.org/2022/214
   note: Cautionary tale for MQ-flavored assumptions; motivates the research-only status and the conservative-fallback policy for the conjecture-based TDM candidates.
   parent:
     type: Proceedings
-    title: "EUROCRYPT 2022 (Part II), LNCS 13276"
+    title: "CRYPTO 2022 (Part II), LNCS 13508"
 
 druk2014:
   type: Article
   title: Linear-time encodable codes meeting the Gilbert-Varshamov bound and their cryptographic applications
-  author: ["Druk, Ernst", "Ishai, Yuval"]
+  author: ["Druk, Erez", "Ishai, Yuval"]
   date: 2014
   page-range: 169-182
   serial-number:
-    doi: 10.1145/2554797.2554813
+    doi: 10.1145/2554797.2554815
   note: Source of the linear uniform-output family (LUOF) behind the linear-size TDM instantiations in ePrint 2025/858, Section 5.2.
   parent:
     type: Proceedings
@@ -515,7 +550,7 @@ benedetto1998:
   date: 1998
   page-range: 231-244
   serial-number:
-    doi: 10.1109/49.661110
+    doi: 10.1109/49.661111
   note: Turbo-like code interleaver analysis; background for the permutation placement in the RAA TDM.
   parent:
     type: Periodical
@@ -541,7 +576,7 @@ guruswami2008:
   date: 2008
   page-range: 1968-1972
   serial-number:
-    doi: 10.1109/ISIT.2008.4595296
+    doi: 10.1109/ISIT.2008.4595333
   note: Explicit RAA interleavers; background for the permutation families used by the RAA TDM.
   parent:
     type: Proceedings
@@ -554,7 +589,7 @@ boyle2018:
   date: 2018
   page-range: 896-912
   serial-number:
-    doi: 10.1145/3243734.3243818
+    doi: 10.1145/3243734.3243868
   note: PCG predecessor line ([BCGI18] in ePrint 2025/858) establishing dual-LPN over linear-time encodable codes.
   parent:
     type: Proceedings
@@ -567,7 +602,7 @@ boyle2019:
   date: 2019
   page-range: 489-518
   serial-number:
-    doi: 10.1007/978-3-030-26951-7_26
+    doi: 10.1007/978-3-030-26954-8_16
   note: PCG line ([BCG+19b] in ePrint 2025/858) establishing dual-LPN for linear-time encodable codes; the grounded route the RAA TDM report contrasts with the degree-3 conjecture.
   parent:
     type: Proceedings
@@ -613,13 +648,11 @@ lidl1997:
   title: Finite Fields
   author: ["Lidl, Rudolf", "Niederreiter, Harald"]
   date: 1997
+  edition: '2'
+  publisher: Cambridge University Press
   serial-number:
     isbn: 978-0-521-39231-0
-  note: "Encyclopedia of Mathematics and its Applications 20, 2nd edition, Cambridge University Press. Theorem 3.75 (binomial irreducibility criterion) backs the `X^k - 11` extension-field benchmark modulus in `prime-field-layer/benches/extension_field.rs` (11 is a primitive root, unlike 3)."
-  parent:
-    type: Series
-    title: Encyclopedia of Mathematics and its Applications
-    volume: 20
+  note: "Encyclopedia of Mathematics and its Applications 20. Theorem 3.75 (binomial irreducibility criterion) backs the `X^k - 11` extension-field benchmark modulus in `prime-field-layer/benches/extension_field.rs` (11 is a primitive root, unlike 3)."
 
 rpprof:
   type: Repository
@@ -639,14 +672,11 @@ aero2024:
   type: Misc
   title: "AERO: Entropy-Guided Framework for Private LLM Inference"
   author: ["Jha, Nandan Kumar", "Reagen, Brandon"]
-  date: 2024
+  date: 2025
   serial-number:
     arxiv: "2410.13060"
-  url: https://arxiv.org/abs/2410.13060
+  url: https://arxiv.org/abs/2410.13060v3
   note: "Head-wise entropy regularization to decide where transformer nonlinearities can be removed for private inference (3.4x communication, 1.4x latency savings); retitled from 'AERO: Softmax-Only LLMs for Efficient Private Inference' in the cited v3."
-  parent:
-    type: Conference
-    title: ICLR 2026
 
 li2025:
   type: Article
@@ -661,10 +691,14 @@ li2025:
     - "Leng, Jingwen"
     - "Guo, Minyi"
   date: 2025
+  page-range: 34410-34428
+  url: https://proceedings.mlr.press/v267/li25q.html
   note: "Public-decoding with secure verification for 2PC GPT inference (2.1-6.0x speedup over standard secure decoding via private sampling and distillation-based acceptance-rate tuning)."
   parent:
     type: Proceedings
-    title: International Conference on Machine Learning (ICML 2025)
+    title: Proceedings of the 42nd International Conference on Machine Learning
+    volume: 267
+    publisher: PMLR
 
 pang2024:
   type: Article
@@ -676,7 +710,7 @@ pang2024:
     - "Zheng, Wenting"
     - "Schneider, Thomas"
   date: 2024
-  page-range: 2131-2149
+  page-range: 4753-4771
   serial-number:
     doi: 10.1109/SP54263.2024.00130
   note: "MPC transformer-inference framework (10.91x communication reduction) combining attention-sparsity and MLP-embedding omission with an extension-based GELU protocol."
@@ -690,20 +724,18 @@ hou2023:
   author:
     - "Hou, Xiaoyang"
     - "Liu, Jian"
-    - "Lu, Wen-jie"
     - "Li, Jingyu"
+    - "Li, Yuhan"
+    - "Lu, Wen-jie"
     - "Hong, Cheng"
     - "Ren, Kui"
   date: 2023
   serial-number: "IACR ePrint 2023/1147"
   url: https://eprint.iacr.org/2023/1147
-  note: "First specialized secure two-party GPT-inference framework (Gaussian-coding-based secure GELU and softmax); preprint of the ACM CCS 2024 publication."
-  parent:
-    type: Conference
-    title: ACM CCS 2024
+  note: "First specialized secure two-party GPT-inference framework (Gaussian-coding-based secure GELU and softmax)."
 
 gao2026:
-  type: Misc
+  type: Article
   title: "Euston: Efficient and User-Friendly Secure Transformer Inference with Non-Interactivity"
   author:
     - "Gao, Xinwen"
@@ -713,9 +745,15 @@ gao2026:
     - "Luo, Yuchuan"
     - "Wang, Yongjun"
   date: 2026
-  serial-number: "IACR ePrint 2026/046"
-  url: https://eprint.iacr.org/2026/046
+  page-range: 1443-1462
+  serial-number:
+    doi: 10.1109/SP63933.2026.00048
+    serial: "IACR ePrint 2026/046"
   note: "Non-interactive (HE-only) transformer inference over RNS-CKKS: SVD-based batched homomorphic matrix multiplication and column-packed nonlinear evaluation, up to 8.8x faster than NEXUS end-to-end."
+  parent:
+    type: Proceedings
+    title: "2026 IEEE Symposium on Security and Privacy (SP)"
+    publisher: IEEE
 
 balogh2026:
   type: Misc
@@ -728,7 +766,7 @@ balogh2026:
   note: "Shows a large share of transformer MLP nonlinearity can be replaced by precomputed linear matrices via a contextual gate (25-56% linear routing at <1% perplexity cost in GPT-2); per-instance routing is not predictable from token identity."
 
 li2024:
-  type: Misc
+  type: Article
   title: "Nimbus: Secure and Efficient Two-Party Inference for Transformers"
   author:
     - "Li, Zhengyi"
@@ -743,13 +781,15 @@ li2024:
     - "Guo, Minyi"
     - "Leng, Jingwen"
   date: 2024
+  page-range: 21572-21600
   serial-number:
+    doi: 10.52202/079017-0680
     arxiv: "2411.15707"
-  url: https://arxiv.org/abs/2411.15707
   note: "2PC transformer inference (2.7-4.7x over SOTA) via an outer-product-based secure matrix-multiplication paradigm and input-distribution-aware low-degree polynomial approximation of GELU and Softmax."
   parent:
-    type: Conference
-    title: NeurIPS 2024
+    type: Proceedings
+    title: "Advances in Neural Information Processing Systems 37 (NeurIPS 2024)"
+    publisher: Neural Information Processing Systems Foundation, Inc.
 
 zimerman2026:
   type: Article
@@ -763,13 +803,17 @@ zimerman2026:
     - "Drucker, Nir"
     - "Lerner, Jenny"
     - "Masalha, Ramy"
-    - "Meiri, Reut"
+    - "Moshe, Reut"
     - "Soceanu, Omri"
   date: 2026
+  page-range: 5203-5211
+  url: https://proceedings.mlr.press/v300/zimerman26a.html
   note: "HE-friendly polynomial-form self-attention trainable end-to-end; first polynomial LLMs over a billion parameters with reasoning and in-context learning capabilities."
   parent:
     type: Proceedings
-    title: "29th International Conference on Artificial Intelligence and Statistics (AISTATS 2026), PMLR 300"
+    title: "Proceedings of the 29th International Conference on Artificial Intelligence and Statistics"
+    volume: 300
+    publisher: PMLR
 
 moon2025:
   type: Article
@@ -780,6 +824,7 @@ moon2025:
     - "Jiang, Xiaoqian"
     - "Kim, Miran"
   date: 2025
+  page-range: 3765-3779
   serial-number:
     doi: 10.1145/3719027.3765150
   note: "Non-interactive HE transformer inference: diagonal-major encoding with compact ciphertext packing for PC-MM/CC-MM, plus adaptive iterative approximation of softmax, LayerNorm, GELU, and Tanh."
@@ -801,15 +846,17 @@ razzhigaev2024:
   date: 2024
   page-range: 5376-5384
   serial-number:
+    doi: 10.18653/v1/2024.acl-long.293
     arxiv: "2405.12250"
-  url: https://arxiv.org/abs/2405.12250
+  url: https://aclanthology.org/2024.acl-long.293/
   note: "Procrustes similarity 0.99 between adjacent decoder-layer embeddings; removing or linearly approximating the most linear blocks barely affects loss, with a cosine-similarity regularizer to suppress linearity during pretraining."
   parent:
     type: Proceedings
     title: "62nd Annual Meeting of the Association for Computational Linguistics (Volume 1: Long Papers)"
+    publisher: Association for Computational Linguistics
 
 vaswani2017:
-  type: Conference
+  type: Article
   title: "Attention Is All You Need"
   author:
     - "Vaswani, Ashish"
@@ -818,9 +865,10 @@ vaswani2017:
     - "Uszkoreit, Jakob"
     - "Jones, Llion"
     - "Gomez, Aidan N."
-    - "Kaiser, Lukasz"
+    - "Kaiser, Łukasz"
     - "Polosukhin, Illia"
   date: 2017
+  page-range: 5998-6008
   serial-number:
     arxiv: "1706.03762"
   url: https://arxiv.org/abs/1706.03762
