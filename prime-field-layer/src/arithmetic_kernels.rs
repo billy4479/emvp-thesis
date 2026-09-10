@@ -91,11 +91,26 @@ pub fn dot_product<const MODULUS: u32>(
 ) -> Result<FieldElement<MODULUS>, ArithmeticKernelError> {
     validate_lengths(lhs.len(), rhs.len())?;
 
-    let mut sum = PrimeField::<MODULUS>::new().element_u32(0);
-    for (&lhs, &rhs) in lhs.iter().zip(rhs) {
-        sum += lhs * rhs;
+    // Four independent accumulators break the serial multiply-then-add
+    // dependency chain; `dot_canonical` uses the same lane layout.
+    let field = PrimeField::<MODULUS>::new();
+    let zero = field.element_u32(0);
+    let mut sums = [zero; 4];
+    for (lhs, rhs) in lhs.chunks_exact(4).zip(rhs.chunks_exact(4)) {
+        sums[0] += lhs[0] * rhs[0];
+        sums[1] += lhs[1] * rhs[1];
+        sums[2] += lhs[2] * rhs[2];
+        sums[3] += lhs[3] * rhs[3];
     }
-    Ok(sum)
+    let remainder = lhs
+        .chunks_exact(4)
+        .remainder()
+        .iter()
+        .zip(rhs.chunks_exact(4).remainder());
+    for (&lhs, &rhs) in remainder {
+        sums[0] += lhs * rhs;
+    }
+    Ok(sums.into_iter().fold(zero, |total, sum| total + sum))
 }
 
 /// Adds `scalar * input[i]` to each existing `output[i]`.
