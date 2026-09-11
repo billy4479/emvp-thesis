@@ -30,7 +30,7 @@ use trapdoor_matrices::{
     ToeplitzFastProduct, ToeplitzScratch,
 };
 
-use crate::protocol::MIN_PARALLEL_MULTIPLICATIONS;
+use crate::dispatch::is_parallel_work;
 
 /// Tile edge for the cache-blocked transpose in the default
 /// [`TdmMask::materialize_top_rows`]: 32 rows x 32 columns keeps both access
@@ -205,10 +205,7 @@ pub trait TdmMask<const MODULUS: u32>: Send + Sync {
         // estimate of `columns * full_rows * columns` multiplications.
         let threads = rayon::current_num_threads();
         let work = columns.saturating_mul(full_rows).saturating_mul(columns);
-        if threads > 1
-            && columns >= threads.saturating_mul(2)
-            && work >= MIN_PARALLEL_MULTIPLICATIONS
-        {
+        if is_parallel_work(work, columns, threads) {
             staged
                 .par_chunks_mut(rows)
                 .enumerate()
@@ -527,10 +524,7 @@ impl<M: TdmMask<MODULUS>, const MODULUS: u32> TdmMask<MODULUS> for RowStackMask<
             .len()
             .saturating_mul(block_rows)
             .saturating_mul(block_rows);
-        if threads > 1
-            && full_blocks >= threads.saturating_mul(2)
-            && work >= MIN_PARALLEL_MULTIPLICATIONS
-        {
+        if is_parallel_work(work, full_blocks, threads) {
             let (full_output, _tail_output) = output.split_at_mut(full_blocks * block_rows);
             self.blocks[..full_blocks]
                 .par_iter()
@@ -592,10 +586,8 @@ impl<M: TdmMask<MODULUS>, const MODULUS: u32> TdmMask<MODULUS> for RowStackMask<
             .saturating_mul(block_rows)
             .saturating_mul(block_rows)
             .saturating_mul(block_rows);
-        let fulls: Vec<DenseMatrix<MODULUS>> = if threads > 1
-            && last >= threads.saturating_mul(2)
-            && work >= MIN_PARALLEL_MULTIPLICATIONS
-        {
+        let fulls: Vec<DenseMatrix<MODULUS>> =
+            if is_parallel_work(work, last, threads) {
             self.blocks[..last]
                 .par_iter()
                 .map(|block| block.materialize_top_rows(block_rows))

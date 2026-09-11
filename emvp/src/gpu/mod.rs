@@ -7,7 +7,10 @@
 //! a compute device through [`wgpu`] while the client stays on the CPU. The
 //! trust boundary is unchanged: every word the GPU reads or writes is public
 //! protocol data, no secret key material ever reaches the device, and
-//! constant-time discipline is unnecessary on this path.
+//! constant-time discipline is unnecessary on this path. The workload
+//! threshold that decides between this path and the CPU path lives in
+//! [`crate::dispatch`], whose [`AnswerDispatcher`](crate::dispatch::AnswerDispatcher)
+//! runner owns the hand-off.
 //!
 //! # Montgomery-native interchange
 //!

@@ -220,11 +220,6 @@ const fn check_len(
     }
 }
 
-/// Minimum estimated field multiplications before a protocol kernel switches
-/// to rayon; smaller workloads stay serial. The answer-phase crossover this
-/// value calibrates was measured once when sizing the benchmark thread pool.
-pub(crate) const MIN_PARALLEL_MULTIPLICATIONS: usize = 32 * 1024;
-
 fn fill_answer_row<const MODULUS: u32>(
     matrix_row: &[FieldElement<MODULUS>],
     query: &[FieldElement<MODULUS>],
@@ -875,7 +870,7 @@ fn fill_encrypted_rows<const MODULUS: u32>(
     let zero = PrimeField::<MODULUS>::new().element_u32(0);
     let threads = rayon::current_num_threads();
     let work = rows.saturating_mul(n);
-    if threads > 1 && rows >= threads.saturating_mul(2) && work >= MIN_PARALLEL_MULTIPLICATIONS {
+    if crate::dispatch::is_parallel_work(work, rows, threads) {
         encoded
             .par_chunks_mut(n)
             .zip(matrix.par_chunks(ell))
@@ -1216,7 +1211,7 @@ fn fill_answer<const MODULUS: u32>(
 ) {
     let threads = rayon::current_num_threads();
     let work = rows.saturating_mul(n);
-    if threads > 1 && rows >= threads.saturating_mul(2) && work >= MIN_PARALLEL_MULTIPLICATIONS {
+    if crate::dispatch::is_parallel_work(work, rows, threads) {
         output
             .par_chunks_mut(s)
             .zip(matrix.values().par_chunks(n))
@@ -1291,7 +1286,9 @@ pub fn answer_batch<const MODULUS: u32>(
 ///
 /// The arena splits into `queries.len() * rows` disjoint answer rows, so
 /// the flattened grid parallelizes without nested pools and every row
-/// reuses the single-query row kernel.
+/// reuses the single-query row kernel. The parallel tier is selected by the
+/// shared dispatch policy ([`crate::dispatch`]); smaller batches stay on
+/// the serial row loop.
 fn fill_answer_batch<const MODULUS: u32>(
     matrix: &EncryptedMatrix<MODULUS>,
     queries: &[EncryptedQuery<MODULUS>],
@@ -1304,7 +1301,7 @@ fn fill_answer_batch<const MODULUS: u32>(
     let threads = rayon::current_num_threads();
     let grid = queries.len().saturating_mul(rows);
     let work = grid.saturating_mul(n);
-    if threads > 1 && grid >= threads.saturating_mul(2) && work >= MIN_PARALLEL_MULTIPLICATIONS {
+    if crate::dispatch::is_parallel_work(work, grid, threads) {
         arena
             .par_chunks_mut(s)
             .enumerate()
@@ -1373,8 +1370,9 @@ fn validate_decode<const MODULUS: u32>(
 /// Writes each decoded product `M' p' - r'` into `output`.
 ///
 /// Rows are independent dot products of length `s`, so large answers
-/// distribute them across rayon workers; the output is identical to the
-/// serial row loop. Smaller answers stay serial.
+/// distribute them across rayon workers under the shared dispatch policy
+/// ([`crate::dispatch`]); the output is identical to the serial row loop.
+/// Smaller answers stay serial.
 fn fill_decoded<const MODULUS: u32>(
     answer: &AnswerMatrix<MODULUS>,
     key: &DecodingKey<MODULUS>,
@@ -1384,7 +1382,7 @@ fn fill_decoded<const MODULUS: u32>(
     let threads = rayon::current_num_threads();
     let rows = output.len();
     let work = rows.saturating_mul(s);
-    if threads > 1 && rows >= threads.saturating_mul(2) && work >= MIN_PARALLEL_MULTIPLICATIONS {
+    if crate::dispatch::is_parallel_work(work, rows, threads) {
         output
             .par_iter_mut()
             .enumerate()

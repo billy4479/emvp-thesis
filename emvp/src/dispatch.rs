@@ -1,0 +1,405 @@
+//! Backend-selection policy for the server answer phase.
+//!
+//! One answer batch can run on three backends: a single core, the rayon
+//! pool, or the GPU. This module is the single decision point between them:
+//! two multiplication-count thresholds split the estimated batch work
+//! `queries * rows * n` into three tiers, and (with the `gpu` feature) the
+//! [`AnswerDispatcher`] runner turns that policy into an executable answer
+//! server that owns the device hand-off.
+//!
+//! # Thresholds
+//!
+//! `MIN_PARALLEL_MULTIPLICATIONS` gates the single-core to rayon tier. It
+//! was calibrated once with the benchmark suite when sizing the rayon thread
+//! pool; smaller workloads stay serial because scheduling overhead dominates.
+//!
+//! `MIN_GPU_MULTIPLICATIONS` (with the `gpu` feature) gates the rayon to GPU
+//! tier. It was calibrated by sweeping both answer paths over the
+//! `answer_dispatch` criterion group (`emvp/benches/dispatch.rs`) on an
+//! 8-thread CPU against an Intel Iris Xe iGPU: the raw crossover sits
+//! between 2^22 and 2^23 multiplications, and 2^24 is the smallest power of
+//! two at which the device wins decisively (20-32% across three independent
+//! shapes). The constant is machine-dependent by nature; recalibrate with
+//!
+//! ```text
+//! cargo bench -p emvp --features gpu --bench dispatch -- --save-baseline dispatch-policy
+//! ```
+//!
+//! when the server hardware changes. On a discrete card the crossover sits
+//! lower, so the calibrated value remains safe there (it only delays the
+//! hand-off).
+//!
+//! The selection additionally respects a runtime guard at the rayon tier:
+//! parallel dispatch needs at least two answer rows per pool thread, so a
+//! batch whose grid is too flat for the configured pool stays single-core
+//! even above the parallel threshold.
+
+#[cfg(feature = "gpu")]
+use rayon::current_num_threads;
+
+#[cfg(feature = "gpu")]
+use crate::gpu::{GpuAnswerer, GpuEncryptedMatrix, GpuError};
+#[cfg(feature = "gpu")]
+use crate::protocol::{AnswerMatrix, EncryptedMatrix, EncryptedQuery, ProtocolError};
+
+/// Minimum estimated field multiplications before the CPU answer path
+/// switches from the serial row loop to rayon.
+///
+/// Smaller workloads stay single-core. Calibrated once with the benchmark
+/// suite when sizing the rayon thread pool.
+pub const MIN_PARALLEL_MULTIPLICATIONS: usize = 32 * 1024;
+
+/// Minimum estimated field multiplications before an answer batch is worth
+/// dispatching to the GPU.
+///
+/// Smaller workloads run on the CPU path. Calibrated for an 8-thread CPU
+/// against an Intel Iris Xe iGPU; see the [module documentation](self) for
+/// the calibration procedure.
+#[cfg(feature = "gpu")]
+pub const MIN_GPU_MULTIPLICATIONS: usize = 16_777_216;
+
+/// The execution backend selected for one answer batch.
+///
+/// The variants are ordered by escalation: a batch selected at the `Gpu`
+/// tier would also have cleared every lower tier.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
+pub enum AnswerBackend {
+    /// The serial row loop on one core.
+    SingleCore,
+    /// The row grid distributed across the rayon pool.
+    Rayon,
+    /// The WGSL compute kernel on the device.
+    #[cfg(feature = "gpu")]
+    Gpu,
+}
+
+/// The CPU tier of the policy: is this `(work, grid, threads)` combination
+/// worth distributing across the rayon pool?
+///
+/// `work` is the estimated field-multiplication count, `grid` the number of
+/// independent answer rows. Shared by [`select_answer_backend`] and the CPU
+/// kernels in [`crate::protocol`] so the policy and the code that executes
+/// it cannot drift apart.
+pub(crate) const fn is_parallel_work(work: usize, grid: usize, threads: usize) -> bool {
+    threads > 1 && grid >= threads.saturating_mul(2) && work >= MIN_PARALLEL_MULTIPLICATIONS
+}
+
+/// Selects the backend for one answer batch under the dispatch policy.
+///
+/// `queries * rows * n` estimates the batch's field-multiplication work;
+/// work of at least the GPU threshold (with the `gpu` feature) selects the
+/// [`AnswerBackend::Gpu`] tier, and below that the CPU tiers apply: rayon
+/// when the work clears [`MIN_PARALLEL_MULTIPLICATIONS`] and the grid offers
+/// at least two rows per pool thread, single-core otherwise. All dimension
+/// products saturate, so every `usize` input is accepted.
+#[must_use]
+pub const fn select_answer_backend(
+    queries: usize,
+    rows: usize,
+    n: usize,
+    rayon_threads: usize,
+) -> AnswerBackend {
+    let grid = queries.saturating_mul(rows);
+    let work = grid.saturating_mul(n);
+    #[cfg(feature = "gpu")]
+    if work >= MIN_GPU_MULTIPLICATIONS {
+        return AnswerBackend::Gpu;
+    }
+    if is_parallel_work(work, grid, rayon_threads) {
+        AnswerBackend::Rayon
+    } else {
+        AnswerBackend::SingleCore
+    }
+}
+
+/// A failed answer-phase dispatch (with the `gpu` feature).
+#[cfg(feature = "gpu")]
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum AnswerDispatchError {
+    /// The CPU path rejected the request: malformed parameters, a shape or
+    /// identifier mismatch, or dimension overflow.
+    Protocol(ProtocolError),
+    /// The device path failed. Device failures never fall back to the CPU
+    /// silently at call time; only construction-time availability shortfalls
+    /// demote a dispatcher to the CPU path.
+    Gpu(GpuError),
+}
+
+#[cfg(feature = "gpu")]
+impl std::fmt::Display for AnswerDispatchError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Protocol(error) => error.fmt(formatter),
+            Self::Gpu(error) => error.fmt(formatter),
+        }
+    }
+}
+
+#[cfg(feature = "gpu")]
+impl std::error::Error for AnswerDispatchError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Protocol(error) => Some(error),
+            Self::Gpu(error) => Some(error),
+        }
+    }
+}
+
+#[cfg(feature = "gpu")]
+impl From<ProtocolError> for AnswerDispatchError {
+    fn from(error: ProtocolError) -> Self {
+        Self::Protocol(error)
+    }
+}
+
+#[cfg(feature = "gpu")]
+impl From<GpuError> for AnswerDispatchError {
+    fn from(error: GpuError) -> Self {
+        Self::Gpu(error)
+    }
+}
+
+/// The server's answer-phase runner: it owns the backend decision for every
+/// batch against one encrypted matrix.
+///
+/// Construct it once per matrix and answer every batch through
+/// [`Self::answer_batch`]. When built with a [`GpuAnswerer`], the matrix is
+/// uploaded to the device once and every batch that clears
+/// [`MIN_GPU_MULTIPLICATIONS`] runs on the WGSL kernel; smaller batches run
+/// the CPU [`answer_batch`](crate::answer_batch) path, whose serial and
+/// rayon tiers follow the same policy. When built without an answerer, or
+/// when the device cannot host the matrix (its buffers are too small), the
+/// dispatcher silently runs every batch on the CPU path; the demotion is
+/// observable through [`Self::backend`].
+///
+/// The dispatcher borrows the encrypted matrix, so both backends read the
+/// same host copy and no ciphertext is duplicated for the CPU tier.
+#[cfg(feature = "gpu")]
+pub struct AnswerDispatcher<'a, const MODULUS: u32> {
+    params: crate::params::EmvpParams,
+    columns: usize,
+    matrix: &'a EncryptedMatrix<MODULUS>,
+    device: Option<(&'a GpuAnswerer, GpuEncryptedMatrix<MODULUS>)>,
+}
+
+/// Checks the parameter/matrix shape once so the dispatcher fails fast at
+/// construction instead of inside the first answer call. Mirrors the shape
+/// validation of [`GpuAnswerer::upload_matrix`].
+#[cfg(feature = "gpu")]
+fn validate_shapes<const MODULUS: u32>(
+    params: &crate::params::EmvpParams,
+    matrix: &EncryptedMatrix<MODULUS>,
+) -> Result<usize, ProtocolError> {
+    params.validate_dimensions()?;
+    let n = params.n()?;
+    if matrix.columns() != n {
+        return Err(ProtocolError::LengthMismatch {
+            name: "encrypted matrix columns",
+            expected: n,
+            actual: matrix.columns(),
+        });
+    }
+    let rows = matrix.rows();
+    if rows == 0 {
+        return Err(ProtocolError::LengthMismatch {
+            name: "matrix rows",
+            expected: 1,
+            actual: 0,
+        });
+    }
+    let words = rows.checked_mul(n).ok_or(ProtocolError::DimensionOverflow)?;
+    if matrix.values().len() != words {
+        return Err(ProtocolError::LengthMismatch {
+            name: "encrypted matrix values",
+            expected: words,
+            actual: matrix.values().len(),
+        });
+    }
+    Ok(n)
+}
+
+#[cfg(feature = "gpu")]
+impl<'a, const MODULUS: u32> AnswerDispatcher<'a, MODULUS> {
+    /// Builds a dispatcher that runs every batch on the CPU path.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the parameters are malformed or disagree with the
+    /// matrix shape, matching the validation of the GPU-capable
+    /// [`Self::new`].
+    pub fn cpu(
+        params: crate::params::EmvpParams,
+        matrix: &'a EncryptedMatrix<MODULUS>,
+    ) -> Result<Self, AnswerDispatchError> {
+        let columns = validate_shapes(&params, matrix)?;
+        Ok(Self {
+            params,
+            columns,
+            matrix,
+            device: None,
+        })
+    }
+
+    /// Builds a dispatcher and arms the GPU path when `answerer` is
+    /// provided.
+    ///
+    /// The armed upload is the one-time matrix transfer; every GPU-tier batch
+    /// reuses the device-resident words. A device that cannot host the
+    /// matrix ([`GpuError::UploadTooLarge`]) demotes the dispatcher to the
+    /// CPU path silently, because that is a hardware capacity shortfall a
+    /// smaller deployment can absorb; every other upload failure propagates,
+    /// because a shape or identifier mismatch would fail on the CPU path
+    /// anyway and is better surfaced here.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the parameters are malformed or disagree with the
+    /// matrix shape, or if the armed upload fails for a reason other than
+    /// device capacity.
+    pub fn new(
+        params: crate::params::EmvpParams,
+        matrix: &'a EncryptedMatrix<MODULUS>,
+        answerer: Option<&'a GpuAnswerer>,
+    ) -> Result<Self, AnswerDispatchError> {
+        let columns = validate_shapes(&params, matrix)?;
+        let mut device = None;
+        if let Some(answerer) = answerer {
+            match answerer.upload_matrix_sync(&params, matrix) {
+                Ok(gpu_matrix) => device = Some((answerer, gpu_matrix)),
+                Err(GpuError::UploadTooLarge { .. }) => {}
+                Err(error) => return Err(AnswerDispatchError::Gpu(error)),
+            }
+        }
+        Ok(Self {
+            params,
+            columns,
+            matrix,
+            device,
+        })
+    }
+
+    /// The backend this dispatcher would run for a batch of `queries`
+    /// queries under the current rayon pool.
+    ///
+    /// This is the effective decision, not the raw policy: a GPU-tier batch
+    /// on a dispatcher without a usable device reports
+    /// [`AnswerBackend::Rayon`], because the CPU path's rayon tier is the
+    /// fallback that would actually execute.
+    #[must_use]
+    pub fn backend(&self, queries: usize) -> AnswerBackend {
+        match select_answer_backend(
+            queries,
+            self.matrix.rows(),
+            self.columns,
+            current_num_threads(),
+        ) {
+            AnswerBackend::Gpu if self.device.is_none() => AnswerBackend::Rayon,
+            backend => backend,
+        }
+    }
+
+    /// Whether the dispatcher holds a device-resident copy of the matrix.
+    #[must_use]
+    pub const fn is_device_backed(&self) -> bool {
+        self.device.is_some()
+    }
+
+    /// Answers a batch of encrypted queries, dispatching under the policy.
+    ///
+    /// The GPU tier and the CPU tiers produce bit-identical answers, so the
+    /// backend choice is never observable in the output.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the batch is empty, any query has the wrong
+    /// length or a foreign instance identifier, or the selected backend
+    /// fails. Validation is all-or-nothing on both paths: an error means no
+    /// answer was produced.
+    pub fn answer_batch(
+        &self,
+        queries: &[EncryptedQuery<MODULUS>],
+    ) -> Result<Vec<AnswerMatrix<MODULUS>>, AnswerDispatchError> {
+        match self.backend(queries.len()) {
+            AnswerBackend::Gpu => {
+                // Unreachable with `backend()` as written today, but the
+                // demotion is re-checked here so the fallback survives any
+                // future divergence between the two methods.
+                let Some((answerer, gpu_matrix)) = self.device.as_ref() else {
+                    return Ok(crate::answer_batch(&self.params, self.matrix, queries)?);
+                };
+                Ok(answerer.answer_batch_sync(gpu_matrix, queries)?)
+            }
+            _ => Ok(crate::answer_batch(&self.params, self.matrix, queries)?),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn single_core_below_the_parallel_threshold() {
+        // A grid of 64 rows satisfies the two-rows-per-thread guard for any
+        // pool up to 32 threads; the multiplication count decides the tier.
+        let (queries, rows, threads) = (1, 64, 8);
+        let n = MIN_PARALLEL_MULTIPLICATIONS / (queries * rows);
+        assert_eq!(queries * rows * n, MIN_PARALLEL_MULTIPLICATIONS);
+        assert_eq!(
+            select_answer_backend(queries, rows, n, threads),
+            AnswerBackend::Rayon
+        );
+        assert_eq!(
+            select_answer_backend(queries, rows, n - 1, threads),
+            AnswerBackend::SingleCore
+        );
+    }
+
+    #[test]
+    fn flat_grids_stay_single_core_above_the_parallel_threshold() {
+        // Work 4x over the threshold, but the grid guard decides: eight rows
+        // per thread parallelize, one row per thread stays serial, and a
+        // single-threaded pool never parallelizes.
+        let work = 4 * MIN_PARALLEL_MULTIPLICATIONS;
+        assert_eq!(
+            select_answer_backend(1, 64, work / 64, 8),
+            AnswerBackend::Rayon
+        );
+        assert_eq!(
+            select_answer_backend(1, 8, work / 8, 8),
+            AnswerBackend::SingleCore
+        );
+        assert_eq!(
+            select_answer_backend(1, 4096, work / 4096, 1),
+            AnswerBackend::SingleCore
+        );
+    }
+
+    #[test]
+    fn saturating_dimensions_never_panic() {
+        let huge = usize::MAX;
+        // Without the gpu feature the CPU tiers cap the escalation.
+        #[cfg(feature = "gpu")]
+        let expected = AnswerBackend::Gpu;
+        #[cfg(not(feature = "gpu"))]
+        let expected = AnswerBackend::Rayon;
+        assert_eq!(select_answer_backend(huge, huge, huge, 8), expected);
+    }
+
+    #[cfg(feature = "gpu")]
+    #[test]
+    fn gpu_tier_boundary() {
+        let (queries, rows, threads) = (4, 65_536, 8);
+        let n = MIN_GPU_MULTIPLICATIONS / (queries * rows);
+        assert_eq!(queries * rows * n, MIN_GPU_MULTIPLICATIONS);
+        assert_eq!(
+            select_answer_backend(queries, rows, n, threads),
+            AnswerBackend::Gpu
+        );
+        assert_eq!(
+            select_answer_backend(queries, rows, n - 1, threads),
+            AnswerBackend::Rayon
+        );
+    }
+}

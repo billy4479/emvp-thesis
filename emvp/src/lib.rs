@@ -17,6 +17,7 @@
 //! [`trapdoor_matrices`]: trapdoor_matrices
 
 pub mod code;
+pub mod dispatch;
 #[cfg(feature = "gpu")]
 pub mod gpu;
 pub mod mask;
@@ -25,6 +26,11 @@ pub mod prf;
 pub mod protocol;
 
 pub use code::{CodeError, CyclicCodeScratch, CyclicDualCode};
+pub use dispatch::{
+    AnswerBackend, MIN_PARALLEL_MULTIPLICATIONS, select_answer_backend,
+};
+#[cfg(feature = "gpu")]
+pub use dispatch::{AnswerDispatcher, AnswerDispatchError, MIN_GPU_MULTIPLICATIONS};
 #[cfg(feature = "gpu")]
 pub use gpu::{GpuAnswerer, GpuEncryptedMatrix, GpuError, PhaseTimings};
 pub use mask::{MaskError, RowStackMask, TdmMask};
