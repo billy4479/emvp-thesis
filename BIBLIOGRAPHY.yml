@@ -634,7 +634,7 @@ wgsl:
 wgpu:
   type: Repository
   title: "wgpu: Native WebGPU implementation in Rust"
-  author: "The gfx-rs project contributors"
+  author: "gfx-rs project contributors"
   organization: gfx-rs
   date: 2026
   url:
@@ -849,7 +849,7 @@ razzhigaev2024:
     doi: 10.18653/v1/2024.acl-long.293
     arxiv: "2405.12250"
   url: https://aclanthology.org/2024.acl-long.293/
-  note: "Procrustes similarity 0.99 between adjacent decoder-layer embeddings; removing or linearly approximating the most linear blocks barely affects loss, with a cosine-similarity regularizer to suppress linearity during pretraining."
+  note: "Procrustes similarity 0.99 between adjacent decoder-layer embeddings; removing or linearly approximating the most linear blocks barely affects loss, with a cosine-similarity regularizer to suppress linearity during pretraining. Section 3.1 of arXiv:2405.12250v1 gives the generalized (minimum over all linear maps, not only orthogonal ones) linearity score implemented in the Phase One metrics: score = 1 - min_A ||X~ A - Y~||_F^2 on centered embedding sets normalized by their Frobenius norms."
   parent:
     type: Proceedings
     title: "62nd Annual Meeting of the Association for Computational Linguistics (Volume 1: Long Papers)"
