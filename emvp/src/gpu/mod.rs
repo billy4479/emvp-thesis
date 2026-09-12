@@ -23,23 +23,22 @@
 //! [`prime_field_layer::FieldElement::from_raw`]. The results are
 //! bit-identical to the CPU [`answer_batch`](crate::answer_batch), which
 //! remains the reference implementation; the parity tests in
-//! `emvp/tests/gpu.rs` pin this property empirically. Because REDC of
-//! canonical residues yields canonical residues, and field addition of
-//! canonical residues is canonical, equality on raw words matches equality
-//! on elements and no normalization pass is needed.
+//! `emvp/tests/gpu.rs` pin this property empirically. Because the kernel's
+//! final fold returns a canonical word, equality on raw words matches
+//! equality on elements and no normalization pass is needed.
 //!
 //! # Pipelines and constants
 //!
 //! One compute pipeline exists per field modulus, cached in
-//! [`GpuAnswerer`]. The shader receives the modulus `p` and the REDC
-//! constant `-p^{-1} mod 2^32` (from
-//! [`PrimeField::montgomery_neg_inv`]) as pipeline-overridable constants
-//! compiled into the kernel; `R2 = 2^64 mod p` is deliberately not passed
-//! because these buffers already hold Montgomery residues and R2 only
-//! matters when entering Montgomery form, which the CPU did when the
-//! elements were built. Per-call dimensions (`n`, `b`, `s`, rows, batch,
-//! dispatch width) travel in a small uniform buffer so changing protocol
-//! parameters never recompiles the pipeline.
+//! [`GpuAnswerer`]. The shader receives the modulus `p`, the REDC constant
+//! `-p^{-1} mod 2^32` (from [`PrimeField::montgomery_neg_inv`]), and the
+//! Montgomery conversion constant `2^64 mod p` (from
+//! [`PrimeField::montgomery_r2`]) as pipeline-overridable constants compiled
+//! into the kernel. `R2` does not convert into Montgomery form — the buffers
+//! already hold Montgomery residues — it cancels the lazy accumulator's
+//! double `2^-32` fold in the kernel's final reduction. Per-call dimensions
+//! (`n`, `b`, `s`, rows, batch, dispatch width) travel in a small uniform
+//! buffer so changing protocol parameters never recompiles the pipeline.
 //!
 //! # Data flow and resource ownership
 //!
@@ -506,9 +505,11 @@ impl GpuAnswerer {
     ///
     /// Every query is answered exactly as the CPU
     /// [`answer_batch`](crate::answer_batch) answers it alone: for each
-    /// output `(query, row, block)` the kernel accumulates `b` Montgomery
-    /// products with field additions, writing one canonical word per element
-    /// of the query-major answer arena. Validation is all-or-nothing and
+    /// output `(query, row, block)` the kernel accumulates the `b` raw word
+    /// products into a 96-bit integer accumulator and reduces it once with
+    /// a two-step Montgomery fold plus an `R2` correction, writing one
+    /// canonical word per element of the query-major answer arena.
+    /// Validation is all-or-nothing and
     /// mirrors the CPU path; results are bit-identical to it. Buffers are
     /// leased from the answerer's scratch pool and returned afterwards, so
     /// steady-state calls allocate nothing.
@@ -743,6 +744,7 @@ impl GpuAnswerer {
         let constants = [
             ("MODULUS", f64::from(MODULUS)),
             ("NEG_INV", f64::from(field.montgomery_neg_inv())),
+            ("R2", f64::from(field.montgomery_r2())),
         ];
         device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
             label: Some("emvp-answer-pipeline"),

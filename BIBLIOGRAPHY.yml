@@ -140,7 +140,7 @@ montgomery1985:
   page-range: 519-521
   serial-number:
     doi: 10.2307/2007970
-  note: "Origin of Montgomery multiplication (REDC). Used in `prime-field-layer` for field-element pointwise multiplication, inverse normalization, and the wide-modulus fallback representation."
+  note: "Origin of Montgomery multiplication (REDC). Used in `prime-field-layer` for field-element pointwise multiplication, inverse normalization, and the wide-modulus fallback representation. The `emvp::gpu` answer kernel applies the same REDC lazily: raw products accumulate unnormalized in a 96-bit integer accumulator and one two-word fold per output (plus an `R2 = 2^64 mod p` multiply that cancels the fold's `2^-64` factor) replaces per-element reduction, halving the kernel's multiply count."
   parent:
     type: Periodical
     title: Mathematics of Computation

@@ -22,6 +22,28 @@
 // the reconstructed thread index, which includes workgroup padding, also
 // stays inside u32.
 //
+// # Lazy reduction
+//
+// The inner loop does not reduce per product. Each thread accumulates the
+// raw 64-bit products of the Montgomery words into a 96-bit accumulator
+// (three u32 words) and applies one two-step Montgomery fold at the end.
+// The accumulator is exact for every shape the host accepts: each product
+// of canonical residues is below `p^2 < 2^62`, and `b <= n <= 2^32` keeps
+// the sum below `2^32 * 2^62 = 2^94 < 2^96`. This halves the multiply
+// count of the multiply-dominated inner loop (one wide multiply per
+// element instead of REDC's two) at a fixed cost of four wide multiplies
+// per output element. Each fold divides by `2^32`, so the folded value is
+// congruent to `A * 2^-64 mod p`; one REDC multiply by `R2 = 2^64 mod p`
+// cancels the extra factor and returns the canonical word
+// `A * 2^-32 = sum_t m_t q_t * 2^-32`, exactly the sum of canonical
+// Montgomery products the CPU accumulates, so results stay bit-identical
+// to the CPU reference.
+//
+// The four-wide main loop issues one thread's four consecutive loads
+// together so the driver can merge them into single wide loads, and drops
+// the loop trip count fourfold; a scalar tail covers `b` values that are
+// not multiples of four.
+//
 // All protocol data here is public (encrypted matrix, encrypted queries,
 // answers), so no constant-time discipline is required on the GPU side.
 //
@@ -32,13 +54,15 @@
 // extensions, no workgroup arrays, no f64.
 
 // MODULUS is the prime p. NEG_INV is -p^{-1} mod 2^32, the REDC constant
-// PrimeField::montgomery_neg_inv() returns. R2 = 2^64 mod p is deliberately
-// NOT passed: these buffers already hold Montgomery residues, and R2 is only
-// needed to enter Montgomery form, which the CPU did when building the
-// elements. The defaults are never used because the host always supplies
-// both constants.
+// PrimeField::montgomery_neg_inv() returns. R2 = 2^64 mod p is
+// PrimeField::montgomery_r2(): the buffers already hold Montgomery
+// residues, so R2 is not needed to enter Montgomery form — it exists to
+// cancel the lazy accumulator's double `2^-32` fold (see "Lazy reduction"
+// above). The defaults are never used because the host always supplies all
+// three constants.
 override MODULUS: u32 = 0u;
 override NEG_INV: u32 = 0u;
+override R2: u32 = 0u;
 
 // Must match the host WORKGROUP_SIZE. A module const (not an override) keeps
 // the workgroup size a compile-time constant as required.
@@ -100,8 +124,7 @@ fn mul_32x32(a: u32, b: u32) -> vec2<u32> {
 // returning the canonical Montgomery product a * b * 2^-32 mod p.
 //
 // This is the same computation as PrimeField::montgomery_mul_scalar with the
-// u64 arithmetic carried in two u32 words, so results are bit-identical to
-// the CPU kernel:
+// u64 arithmetic carried in two u32 words:
 //   T = a * b < 2^62            (both operands are canonical, p < 2^31)
 //   m = (T mod 2^32) * NEG_INV  mod 2^32  (wrapping u32 multiply)
 //   U = m * p < 2^63            (m < 2^32, p < 2^31)
@@ -120,12 +143,64 @@ fn fmul(a: u32, b: u32) -> u32 {
     return select(reduced, reduced - MODULUS, reduced >= MODULUS);
 }
 
-// Field addition of canonical residues. a + b < 2p < 2^32 cannot overflow.
-// This is a branchless `select` on public data; constant-time discipline is
-// unnecessary here and also unnecessary on the CPU reference.
-fn fadd(a: u32, b: u32) -> u32 {
-    let s = a + b;
-    return select(s, s - MODULUS, s >= MODULUS);
+// Adds one raw 64-bit product `lo + hi * 2^32` into the 96-bit accumulator
+// `acc`. `hi` is below `2^30` because both product operands are canonical
+// residues below `p < 2^31`, so `hi + carry_low` cannot wrap; the carries
+// into the middle and top words are captured explicitly. The top word stays
+// below `2^32` for every accepted shape (the whole accumulator is below
+// `2^94`, see the module comment), so the accumulation is exact.
+fn accumulate(acc: vec3<u32>, lo: u32, hi: u32) -> vec3<u32> {
+    let low = acc.x + lo;
+    let carry_low = select(0u, 1u, low < acc.x);
+    let mid_add = hi + carry_low;
+    let mid = acc.y + mid_add;
+    let carry_mid = select(0u, 1u, mid < acc.y);
+    return vec3<u32>(low, mid, acc.z + carry_mid);
+}
+
+// Reduces the 96-bit accumulator `A = acc.x + acc.y * 2^32 + acc.z * 2^64`
+// to the canonical Montgomery sum `A * 2^-32 mod p`: two REDC steps (one
+// per 32-bit word) fold `A` to a single word congruent to `A * 2^-64`, and
+// a final REDC multiply by `R2 = 2^64 mod p` cancels the extra `2^-64`
+// factor (see the module comment).
+//
+// Bounds, with `b <= n <= 2^32` and `p < 2^31`:
+//   A < b * 2^62 <= 2^94, so three words hold it exactly.
+//   Step one: `m = acc.x * NEG_INV mod 2^32` makes `A + m * p` divisible
+//   by `2^32`, and `A + m * p < 2^94 + 2^63 < 2^95`, so
+//   `S1 = (A + m * p) / 2^32` fits two words with `S1`'s high word below
+//   `2^31`.
+//   Step two: `m2 = (S1 mod 2^32) * NEG_INV mod 2^32` makes
+//   `S1 + m2 * p` divisible by `2^32`, and `S1 + m2 * p < 2^63 + 2^63`, so
+//   `S2 = (S1 + m2 * p) / 2^32 < 2^32` fits one word, and every addition
+//   along the way stays inside u32.
+//   `S2` is congruent to `A * 2^-64 mod p` but can exceed `p` (up to
+//   roughly `2p + b/4`), so the canonicalization loop subtracts `p` until
+//   the value is canonical; on protocol moduli it runs at most twice, and
+//   the data is public so the data-dependent trip count needs no
+//   constant-time discipline.
+fn fold(acc: vec3<u32>) -> u32 {
+    let m = acc.x * NEG_INV;
+    let mp = mul_32x32(m, MODULUS);
+    // A + mp is divisible by 2^32, so the low word of the sum is zero and
+    // only the carries propagate upward.
+    let low = acc.x + mp.x;
+    let carry_low = select(0u, 1u, low < acc.x);
+    let mid = acc.y + mp.y;
+    let carry_mid = select(0u, 1u, mid < acc.y);
+    let s1_low = mid + carry_low;
+    let carry_s1 = select(0u, 1u, s1_low < mid);
+    let s1_high = acc.z + carry_mid + carry_s1;
+
+    let m2 = s1_low * NEG_INV;
+    let mp2 = mul_32x32(m2, MODULUS);
+    let low2 = s1_low + mp2.x;
+    let carry_low2 = select(0u, 1u, low2 < s1_low);
+    var reduced = s1_high + mp2.y + carry_low2;
+    while (reduced >= MODULUS) {
+        reduced = reduced - MODULUS;
+    }
+    return fmul(reduced, R2);
 }
 
 @compute
@@ -147,25 +222,55 @@ fn main(
     }
     // Query-major grid matching the CPU answer arena: answers for query 0
     // first, then query 1, and so on. Consecutive threads cover consecutive
-    // blocks of one (query, row) pair, so each iteration step reads one word
-    // per thread at a stride of `b` words (one block); a warp therefore
-    // touches up to `b` distinct cache lines per step, which is fully
-    // coalesced for small `b`. The `offset` loop revisits the same lines, and
-    // neighbouring workgroups reuse the same matrix row across queries, so
-    // the traffic stays L1/L2-resident.
+    // blocks of one (query, row) pair, so each iteration step reads four
+    // consecutive words per thread at a stride of `b` words (one block); the
+    // four-wide loop keeps the per-thread reads contiguous so they merge
+    // into wide load instructions. The loop revisits the same cache lines,
+    // and neighbouring workgroups reuse the same matrix row across queries,
+    // so the traffic stays L1/L2-resident.
     let block = index % dims.s;
     let query_row = index / dims.s;
     let row = query_row % dims.rows;
     let query = query_row / dims.rows;
 
-    let start = block * dims.b;
-    // The Montgomery residue of zero is zero, matching the CPU accumulator's
-    // canonical zero seed.
-    var accumulator: u32 = 0u;
-    for (var offset: u32 = 0u; offset < dims.b; offset = offset + 1u) {
-        let matrix_word = matrix_words[row * dims.n + start + offset];
-        let query_word = query_words[query * dims.n + start + offset];
-        accumulator = fadd(accumulator, fmul(matrix_word, query_word));
+    let matrix_base = row * dims.n + block * dims.b;
+    let query_base = query * dims.n + block * dims.b;
+    // The accumulator starts at exact integer zero: it holds raw products,
+    // not residues, so no Montgomery seed is involved.
+    var accumulator = vec3<u32>(0u, 0u, 0u);
+    // Four-wide main loop over the multiples of four, then a scalar tail
+    // for the remaining `b mod 4` elements. For `b` a multiple of four the
+    // thread's four reads per operand are consecutive words starting at a
+    // 16-byte-aligned offset (`b | n` keeps every block base aligned), so
+    // the driver can merge them into single wide loads.
+    let vector_end = dims.b - (dims.b % 4u);
+    var offset: u32 = 0u;
+    while (offset < vector_end) {
+        let m0 = matrix_words[matrix_base + offset];
+        let q0 = query_words[query_base + offset];
+        let m1 = matrix_words[matrix_base + offset + 1u];
+        let q1 = query_words[query_base + offset + 1u];
+        let m2 = matrix_words[matrix_base + offset + 2u];
+        let q2 = query_words[query_base + offset + 2u];
+        let m3 = matrix_words[matrix_base + offset + 3u];
+        let q3 = query_words[query_base + offset + 3u];
+        let p0 = mul_32x32(m0, q0);
+        let p1 = mul_32x32(m1, q1);
+        let p2 = mul_32x32(m2, q2);
+        let p3 = mul_32x32(m3, q3);
+        accumulator = accumulate(accumulator, p0.x, p0.y);
+        accumulator = accumulate(accumulator, p1.x, p1.y);
+        accumulator = accumulate(accumulator, p2.x, p2.y);
+        accumulator = accumulate(accumulator, p3.x, p3.y);
+        offset = offset + 4u;
     }
-    answer_words[index] = accumulator;
+    while (offset < dims.b) {
+        let product = mul_32x32(
+            matrix_words[matrix_base + offset],
+            query_words[query_base + offset],
+        );
+        accumulator = accumulate(accumulator, product.x, product.y);
+        offset = offset + 1u;
+    }
+    answer_words[index] = fold(accumulator);
 }
