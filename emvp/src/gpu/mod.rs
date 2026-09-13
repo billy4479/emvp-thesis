@@ -168,6 +168,14 @@ pub enum GpuError {
         /// The largest element count the device accepts for one buffer.
         max_elements: usize,
     },
+    /// The driver refused a buffer allocation because the device ran out of
+    /// memory. Unlike [`Self::UploadTooLarge`], which is decided by the
+    /// adapter's reported limits before any allocation, this surfaces the
+    /// scoped out-of-memory error of an allocation the limits allowed.
+    OutOfMemory {
+        /// Which buffer allocation failed.
+        context: &'static str,
+    },
     /// A slice did not have the required length.
     LengthMismatch {
         /// The rejected slice.
@@ -215,6 +223,12 @@ impl fmt::Display for GpuError {
                 formatter,
                 "buffer of {elements} elements exceeds the device maximum of {max_elements}"
             ),
+            Self::OutOfMemory { context } => {
+                write!(
+                    formatter,
+                    "device ran out of memory allocating the {context}"
+                )
+            }
             Self::LengthMismatch {
                 name,
                 expected,
@@ -446,7 +460,7 @@ impl GpuAnswerer {
     /// the parameter dimensions disagree with the matrix, the matrix is
     /// empty, its value length differs from `rows * columns`, the element
     /// count exceeds the device's per-buffer capacity or the kernel's u32
-    /// index bound.
+    /// index bound, or the driver refuses the buffer allocation.
     #[expect(
         clippy::unused_async,
         reason = "the async surface stays uniform across the answerer API so callers integrate it with executors uniformly"
@@ -478,12 +492,16 @@ impl GpuAnswerer {
         })?;
         self.check_buffer_words(u64::from(words_u32))?;
 
-        let buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("emvp-encrypted-matrix"),
-            size: byte_len_of_words(words_u32),
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
+        let buffer = create_buffer_checked(
+            &self.device,
+            "encrypted matrix buffer",
+            &wgpu::BufferDescriptor {
+                label: Some("emvp-encrypted-matrix"),
+                size: byte_len_of_words(words_u32),
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            },
+        )?;
         let mut view = staged_write_view(&self.queue, &buffer, words_u32)?;
         fill_matrix_view(&mut view, matrix.values());
         drop(view);
@@ -518,8 +536,9 @@ impl GpuAnswerer {
     ///
     /// Returns an error before any device work if the parameters are
     /// malformed, the batch is empty, any query has the wrong length or a
-    /// foreign instance identifier, an index or size would overflow, or the
-    /// query/output buffers exceed the device's capacity.
+    /// foreign instance identifier, an index or size would overflow, the
+    /// query/output buffers exceed the device's capacity, or the driver
+    /// refuses a buffer allocation.
     pub async fn answer_batch<const MODULUS: u32>(
         &self,
         matrix: &GpuEncryptedMatrix<MODULUS>,
@@ -567,13 +586,20 @@ impl GpuAnswerer {
             workgroups_x,
         )?;
         let mut timings = PhaseTimings::default();
-        let mut scratch = lock_recovered(&self.scratch_pool).pop().unwrap_or_else(|| {
-            AnswerScratch::new(&self.device, shape.query_words_u32, shape.answer_words_u32)
-        });
+        let pooled = {
+            let mut pool = lock_recovered(&self.scratch_pool);
+            pool.pop()
+        };
+        let mut scratch = match pooled {
+            Some(scratch) => scratch,
+            None => {
+                AnswerScratch::new(&self.device, shape.query_words_u32, shape.answer_words_u32)?
+            }
+        };
         let (query_buffer, uniform_buffer, output_buffer, staging_buffer) = {
             let start = Instant::now();
             let buffers =
-                scratch.prepare(&self.device, shape.query_words_u32, shape.answer_words_u32);
+                scratch.prepare(&self.device, shape.query_words_u32, shape.answer_words_u32)?;
             timings.prepare_buffers = start.elapsed();
             buffers
         };
@@ -996,70 +1022,113 @@ impl AnswerScratch {
     /// Creates a set whose buffers start sized for `query_words` and
     /// `answer_words`; both capacities are valid device-side sizes because
     /// the shape validation ran first.
-    fn new(device: &wgpu::Device, query_words: u32, answer_words: u32) -> Self {
-        Self {
-            query_buffer: device.create_buffer(&answer_buffer_descriptor(
+    ///
+    /// # Errors
+    ///
+    /// Returns [`GpuError::OutOfMemory`] if the driver refuses any of the
+    /// four buffer allocations.
+    fn new(device: &wgpu::Device, query_words: u32, answer_words: u32) -> Result<Self, GpuError> {
+        let query_buffer = create_buffer_checked(
+            device,
+            "answer query buffer",
+            &answer_buffer_descriptor(
                 "emvp-answer-queries",
                 query_words,
                 wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
-            )),
-            uniform_buffer: device.create_buffer(&wgpu::BufferDescriptor {
+            ),
+        )?;
+        let uniform_buffer = create_buffer_checked(
+            device,
+            "answer uniform buffer",
+            &wgpu::BufferDescriptor {
                 label: Some("emvp-answer-dims"),
                 size: DIMS_UNIFORM_BYTES,
                 usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
                 mapped_at_creation: false,
-            }),
-            output_buffer: device.create_buffer(&answer_buffer_descriptor(
+            },
+        )?;
+        let output_buffer = create_buffer_checked(
+            device,
+            "answer output buffer",
+            &answer_buffer_descriptor(
                 "emvp-answer-output",
                 answer_words,
                 wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
-            )),
-            staging_buffer: device.create_buffer(&answer_buffer_descriptor(
+            ),
+        )?;
+        let staging_buffer = create_buffer_checked(
+            device,
+            "answer staging buffer",
+            &answer_buffer_descriptor(
                 "emvp-answer-staging",
                 answer_words,
                 wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
-            )),
+            ),
+        )?;
+        Ok(Self {
+            query_buffer,
+            uniform_buffer,
+            output_buffer,
+            staging_buffer,
             query_capacity_words: query_words,
             answer_capacity_words: answer_words,
-        }
+        })
     }
 
     /// Grows the reused buffers to cover `query_words` and `answer_words`
     /// when the request exceeds the set's recorded peaks, and returns the
     /// ready buffers. Steady-state calls take the no-growth fast path.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`GpuError::OutOfMemory`] if the driver refuses a growth
+    /// allocation. The set is left inconsistent in that case and must be
+    /// dropped rather than returned to its pool.
     fn prepare(
         &mut self,
         device: &wgpu::Device,
         query_words: u32,
         answer_words: u32,
-    ) -> (&wgpu::Buffer, &wgpu::Buffer, &wgpu::Buffer, &wgpu::Buffer) {
+    ) -> Result<(&wgpu::Buffer, &wgpu::Buffer, &wgpu::Buffer, &wgpu::Buffer), GpuError> {
         if query_words > self.query_capacity_words {
-            self.query_buffer = device.create_buffer(&answer_buffer_descriptor(
-                "emvp-answer-queries",
-                query_words,
-                wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
-            ));
+            self.query_buffer = create_buffer_checked(
+                device,
+                "answer query buffer",
+                &answer_buffer_descriptor(
+                    "emvp-answer-queries",
+                    query_words,
+                    wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                ),
+            )?;
             self.query_capacity_words = query_words;
         }
         if answer_words > self.answer_capacity_words {
-            self.output_buffer = device.create_buffer(&answer_buffer_descriptor(
-                "emvp-answer-output",
-                answer_words,
-                wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
-            ));
-            self.staging_buffer = device.create_buffer(&answer_buffer_descriptor(
-                "emvp-answer-staging",
-                answer_words,
-                wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
-            ));
+            self.output_buffer = create_buffer_checked(
+                device,
+                "answer output buffer",
+                &answer_buffer_descriptor(
+                    "emvp-answer-output",
+                    answer_words,
+                    wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+                ),
+            )?;
+            self.staging_buffer = create_buffer_checked(
+                device,
+                "answer staging buffer",
+                &answer_buffer_descriptor(
+                    "emvp-answer-staging",
+                    answer_words,
+                    wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+                ),
+            )?;
             self.answer_capacity_words = answer_words;
         }
-        (
+        Ok((
             &self.query_buffer,
             &self.uniform_buffer,
             &self.output_buffer,
             &self.staging_buffer,
-        )
+        ))
     }
 }
 
@@ -1085,6 +1154,29 @@ fn answer_buffer_descriptor(
         usage,
         mapped_at_creation: false,
     }
+}
+
+/// Creates a buffer, surfacing a scoped device out-of-memory error as a
+/// recoverable [`GpuError::OutOfMemory`].
+///
+/// `create_buffer` reports allocation failures through wgpu's error-scope
+/// machinery rather than its return type. This helper brackets the call in
+/// an [`wgpu::ErrorFilter::OutOfMemory`] scope and blocks on popping it. On
+/// the native backends the underlying scope future is already resolved when
+/// popped (buffer validation and its OOM reporting are synchronous), so the
+/// blocking wait never parks meaningfully; error scopes are thread-local,
+/// which every caller satisfies by creating and popping on one thread.
+fn create_buffer_checked(
+    device: &wgpu::Device,
+    context: &'static str,
+    descriptor: &wgpu::BufferDescriptor<'_>,
+) -> Result<wgpu::Buffer, GpuError> {
+    let scope = device.push_error_scope(wgpu::ErrorFilter::OutOfMemory);
+    let buffer = device.create_buffer(descriptor);
+    pollster::block_on(scope.pop()).map_or_else(
+        || Ok(buffer),
+        |_out_of_memory| Err(GpuError::OutOfMemory { context }),
+    )
 }
 
 /// Opens a write-only staging view over the first `words` words of `buffer`
@@ -1314,20 +1406,16 @@ fn byte_len_of_words(words: u32) -> wgpu::BufferAddress {
 
 #[cfg(test)]
 mod tests {
-    use super::{MAX_ANSWER_WORDS, MAX_WORKGROUPS_PER_DIMENSION, WORKGROUP_SIZE_USIZE, dispatch_grid};
+    use super::{
+        MAX_ANSWER_WORDS, MAX_WORKGROUPS_PER_DIMENSION, WORKGROUP_SIZE_USIZE, dispatch_grid,
+    };
 
     /// The largest issued thread index over the whole dispatch must stay
     /// inside `u32`, or the shader's wrapping index arithmetic would let
     /// padded threads overwrite real output slots.
     #[test]
     fn dispatch_indices_never_wrap_u32() {
-        for answer_words in [
-            1_usize,
-            256,
-            257,
-            MAX_ANSWER_WORDS - 1,
-            MAX_ANSWER_WORDS,
-        ] {
+        for answer_words in [1_usize, 256, 257, MAX_ANSWER_WORDS - 1, MAX_ANSWER_WORDS] {
             let (workgroups_x, workgroups_y) = dispatch_grid(answer_words).unwrap();
             let issued_threads =
                 u64::from(workgroups_x) * u64::from(workgroups_y) * WORKGROUP_SIZE_USIZE as u64;
