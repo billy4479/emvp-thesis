@@ -1,5 +1,5 @@
 [workspace]
-members = ["emvp", "prime-field-layer", "trapdoor-matrices"]
+members = ["emvp", "prime-field-layer", "trapdoor-matrices", "emvp-network"]
 exclude = ["prime-field-layer/benches/common"]
 resolver = "3"
 
