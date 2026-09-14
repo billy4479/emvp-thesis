@@ -1,0 +1,16 @@
+[package]
+name = "client"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+clap = { workspace = true }
+emvp = { path = "../emvp" }
+emvp-network = { path = "../emvp-network" }
+prime-field-layer = { path = "../prime-field-layer" }
+rand_chacha = { workspace = true }
+rand_core = { workspace = true }
+trapdoor-matrices = { path = "../trapdoor-matrices" }
+
+[lints]
+workspace = true

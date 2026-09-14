@@ -10,6 +10,7 @@
 //! travel as `u64`; each message's redundant counts are cross-checked
 //! before any element payload is read.
 
+use std::fmt;
 use std::io::{Read, Write};
 
 use emvp::{AnswerMatrix, EmvpParams, EncryptedMatrix, EncryptedQuery};
@@ -68,6 +69,14 @@ impl ErrorResponse {
         ErrorCode::from_u32(self.code)
     }
 }
+
+impl fmt::Display for ErrorResponse {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "error {}: {}", self.code, self.message)
+    }
+}
+
+impl std::error::Error for ErrorResponse {}
 
 /// Bytes in one matrix record's fixed prefix: four parameter fields, the
 /// instance identifier, the two dimensions, and the element count.
