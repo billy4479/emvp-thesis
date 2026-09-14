@@ -36,13 +36,15 @@
 //!
 //! # Calibrated result
 //!
-//! On the calibration machine (8 CPU threads, Intel Iris Xe iGPU, Mesa
-//! ANV Vulkan) the raw crossover sits between 2^22 and 2^23 estimated
-//! field multiplications, with the device ahead decisively (20-32%) from
-//! 2^24 up; that value is hard-coded as
-//! `emvp::dispatch::MIN_GPU_MULTIPLICATIONS`. Re-run this suite against
-//! the saved `dispatch-policy` baseline whenever the answer hardware or
-//! pool size changes.
+//! On the current calibration machine (12 CPU threads, AMD Ryzen 5 2600X,
+//! NVIDIA GTX 1060 6GB, Vulkan; 2026-09-14 full-suite run) the raw crossover
+//! sits between 2^18 and 2^19 estimated field multiplications (the device
+//! edges ahead at 2^19 by only 4%), with the device ahead decisively (22%,
+//! growing to 97% at the largest shapes) from 2^20 up; that value is
+//! hard-coded as `emvp::dispatch::MIN_GPU_MULTIPLICATIONS` (previously 2^24
+//! from an Intel Iris Xe iGPU calibration). Re-run this suite against the
+//! saved `dispatch-policy` baseline whenever the answer hardware or pool
+//! size changes.
 
 use std::time::Duration;
 

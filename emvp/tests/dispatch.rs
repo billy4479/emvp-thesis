@@ -149,8 +149,8 @@ mod dispatcher {
 
     #[test]
     fn cpu_only_dispatcher_demotes_the_gpu_tier() {
-        // 2^24 multiplications exactly: GPU tier by policy, rayon tier
-        // without a device.
+        // 2^24 multiplications, well above the GPU threshold: GPU tier by
+        // policy, rayon tier without a device.
         let fixture = protocol_fixture::<MODULUS>(32, 8, 2, 65_536, 4, 0x21);
         let dispatcher = AnswerDispatcher::cpu(fixture.params, &fixture.encrypted).unwrap();
         assert!(!dispatcher.is_device_backed());
@@ -189,9 +189,9 @@ mod dispatcher {
         let Ok(Some(answerer)) = gpu_answerer() else {
             return;
         };
-        // batch * rows * n = 4 * 2^16 * 2^6 = 2^24 = MIN_GPU_MULTIPLICATIONS:
+        // batch * rows * n = 4 * 2^12 * 2^6 = 2^20 = MIN_GPU_MULTIPLICATIONS:
         // the exact threshold must select the device.
-        let fixture = protocol_fixture::<MODULUS>(32, 8, 2, 65_536, 4, 0x23);
+        let fixture = protocol_fixture::<MODULUS>(32, 8, 2, 4_096, 4, 0x23);
         let dispatcher =
             AnswerDispatcher::new(fixture.params, &fixture.encrypted, Some(&answerer)).unwrap();
         assert!(dispatcher.is_device_backed());

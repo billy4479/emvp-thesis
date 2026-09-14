@@ -15,19 +15,21 @@
 //!
 //! `MIN_GPU_MULTIPLICATIONS` (with the `gpu` feature) gates the rayon to GPU
 //! tier. It was calibrated by sweeping both answer paths over the
-//! `answer_dispatch` criterion group (`emvp/benches/dispatch.rs`) on an
-//! 8-thread CPU against an Intel Iris Xe iGPU: the raw crossover sits
-//! between 2^22 and 2^23 multiplications, and 2^24 is the smallest power of
-//! two at which the device wins decisively (20-32% across three independent
+//! `answer_dispatch` criterion group (`emvp/benches/dispatch.rs`). The
+//! 2026-09-14 calibration ran on a 12-thread AMD Ryzen 5 2600X against an
+//! NVIDIA GTX 1060 6GB: the raw crossover sits between 2^18 and 2^19
+//! multiplications (the device already edges ahead at 2^19, but only by 4%,
+//! well within run-to-run variance), and 2^20 is the smallest power of two
+//! at which it wins decisively (22% there, up to 97% at the largest swept
 //! shapes). The constant is machine-dependent by nature; recalibrate with
 //!
 //! ```text
 //! cargo bench -p emvp --features gpu --bench dispatch -- --save-baseline dispatch-policy
 //! ```
 //!
-//! when the server hardware changes. On a discrete card the crossover sits
-//! lower, so the calibrated value remains safe there (it only delays the
-//! hand-off).
+//! when the server hardware changes. On a weaker integrated GPU the
+//! crossover sits higher, so a value calibrated on a discrete card can hand
+//! off too early there (an Intel Iris Xe iGPU measured 2^22-2^23).
 //!
 //! The selection additionally respects a runtime guard at the rayon tier:
 //! parallel dispatch needs at least two answer rows per pool thread, so a
@@ -52,11 +54,11 @@ pub const MIN_PARALLEL_MULTIPLICATIONS: usize = 32 * 1024;
 /// Minimum estimated field multiplications before an answer batch is worth
 /// dispatching to the GPU.
 ///
-/// Smaller workloads run on the CPU path. Calibrated for an 8-thread CPU
-/// against an Intel Iris Xe iGPU; see the [module documentation](self) for
-/// the calibration procedure.
+/// Smaller workloads run on the CPU path. Calibrated for a 12-thread AMD
+/// Ryzen 5 2600X against an NVIDIA GTX 1060 6GB (2026-09-14 full-suite run);
+/// see the [module documentation](self) for the calibration procedure.
 #[cfg(feature = "gpu")]
-pub const MIN_GPU_MULTIPLICATIONS: usize = 16_777_216;
+pub const MIN_GPU_MULTIPLICATIONS: usize = 1_048_576;
 
 /// The execution backend selected for one answer batch.
 ///
