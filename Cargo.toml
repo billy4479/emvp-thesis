@@ -1,5 +1,5 @@
 [workspace]
-members = ["emvp", "prime-field-layer", "trapdoor-matrices", "emvp-network"]
+members = ["emvp", "prime-field-layer", "trapdoor-matrices", "emvp-network", "server"]
 exclude = ["prime-field-layer/benches/common"]
 resolver = "3"
 
@@ -10,6 +10,7 @@ debug = true
 debug = true
 
 [workspace.dependencies]
+clap = { version = "4", features = ["derive"] }
 rand_core = { version = "0.10", default-features = false }
 
 allocation-counter = "0.8"

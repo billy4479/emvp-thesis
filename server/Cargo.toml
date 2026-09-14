@@ -1,0 +1,18 @@
+[package]
+name = "server"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+clap = { workspace = true }
+emvp = { path = "../emvp", features = ["gpu"] }
+emvp-network = { path = "../emvp-network" }
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+prime-field-layer = { path = "../prime-field-layer" }
+rand_chacha = { workspace = true }
+rand_core = { workspace = true }
+trapdoor-matrices = { path = "../trapdoor-matrices" }
