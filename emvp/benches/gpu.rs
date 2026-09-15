@@ -1,70 +1,68 @@
 #![expect(
     clippy::unwrap_used,
-    reason = "benchmarks use fixed valid parameters and keep setup beside measurements"
+    reason = "benchmarks use fixed valid parameters and keep setup beside measurement"
 )]
 #![expect(
     clippy::unnecessary_literal_unwrap,
     reason = "the adapter probe wraps an unexpected error in `Err` so the single `unwrap` path fails the bench loudly; static analysis flags the literal even though the error is dynamic"
 )]
 
-//! GPU-versus-CPU benchmarks for the server answer phase.
+//! GPU-versus-CPU benchmarks for the server answer phase at LLM scale.
 //!
-//! The cases run on the rayon global pool a deployment would use, over the
-//! same field and parameter set as `benches/protocol.rs` so the CPU numbers
-//! stay comparable with the saved protocol baselines. Fixture construction
-//! (derive + encrypt + queries) and the one-time matrix upload happen before
-//! timing; every measured iteration is one full `answer_batch`. Without a
-//! compute adapter the binary prints a notice and benchmarks nothing.
+//! The parameter suites, fixtures, case IDs, and the pinned eight-thread CPU
+//! pool mirror `benches/protocol.rs` exactly, so the CPU numbers stay
+//! comparable with the saved protocol answer baselines and the GPU numbers
+//! slot next to them in the same tables: one single-query `answer_batch` per
+//! measured iteration over the same `ell in {4096, 8192}` suites and
+//! `rows in {4096, 8192, 16384}` matrix heights. Fixture construction
+//! (derive + encrypt) and the one-time matrix upload happen before timing;
+//! the largest shape uploads a 512 MiB encrypted matrix, which fits the
+//! 6 GiB reference card together with its staging buffer. Without a compute
+//! adapter the binary prints a notice and benchmarks nothing.
 //!
 //! # Case IDs and filters
 //!
-//! Each `(batch, rows)` size runs three cases under the `gpu_answer` group:
-//! `gpu_answer/gpu/batchB-rowsR` (device answer path),
-//! `gpu_answer/cpu/batchB-rowsR` (CPU reference on the same shapes), and
-//! `gpu_answer/phase/batchB-rowsR` (the same device path with the
-//! host-side [`PhaseTimings`] breakdown printed after the criterion table).
-//!
-//! The criterion `--` filter is a regular expression over full case IDs, so
-//! one filter selects the whole paired suite in a single run:
+//! Each `(ell, rows)` size runs three cases under the `gpu_answer` group:
+//! `gpu_answer/gpu/ellE-rowsR` (device answer path),
+//! `gpu_answer/phase/ellE-rowsR` (the same device path instrumented; prints
+//! a host-side [`PhaseTimings`] median|mean breakdown to stdout after the
+//! criterion table), and `gpu_answer/cpu/ellE-rowsR` (the eight-thread pool
+//! reference matching `benches/protocol.rs`).
 //!
 //! ```text
 //! cargo bench -p emvp --features gpu -- 'gpu_answer/(gpu|cpu|phase)'
 //! ```
-//!
-//! Plain `-- gpu` matches only the `gpu_answer/gpu/*` cases because the
-//! existing `cpu` and `phase` IDs intentionally do not contain the string
-//! "gpu" — the `gpu` and `cpu` IDs are kept verbatim so criterion baselines
-//! saved by earlier validation runs still resolve.
 
-use std::time::Duration;
+use std::{slice, sync::OnceLock, time::Duration};
 
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use emvp::{
-    DerivedState, EmvpParams, EncryptedMatrix, EncryptedQuery, GpuAnswerer, GpuError, PhaseTimings,
-    ProtocolError, SecretKey, answer_batch, encrypt, query,
+    DerivedState, EmvpParams, EncryptedMatrix, EncryptedQuery, GpuAnswerer, GpuError,
+    PhaseTimings, ProtocolError, SecretKey, answer_batch, encrypt, query, search,
 };
 use prime_field_layer::{FieldElement, PrimeField};
 use rand_chacha::ChaCha20Rng;
 use rand_core::SeedableRng;
+use rayon::{ThreadPool, ThreadPoolBuilder};
 use trapdoor_matrices::ToeplitzFastProduct;
 
 // Same NTT-friendly prime as benches/protocol.rs.
 const MODULUS: u32 = 1_073_479_681;
 
-// Same parameter set as the standard protocol suite: k = 512, n = 1024,
-// b = 16, s = 64.
-const PARAMS: EmvpParams = EmvpParams {
-    k: 512,
-    ell: 512,
-    b: 16,
-    lambda: 128,
-};
+// LLM-scale record lengths and matrix heights, matching the default
+// protocol suite: each suite derives concrete (k, b) from the record length
+// with the same parameter search a production deployment would run.
+const LLM_RECORD_LENGTHS: [usize; 2] = [4096, 8192];
+const LLM_ROW_COUNTS: [usize; 3] = [4096, 8192, 16384];
+const LLM_LAMBDA: u32 = 128;
 
-// Batched answer cases as (batch, rows) pairs. The 262144-row encrypted
-// matrix is a 1 GiB device upload; outputs and staging stay at or below
-// 128 MiB each, so the whole footprint fits the 6 GiB reference card with
-// room to spare.
-const CASES: [(usize, usize); 3] = [(1, 65_536), (8, 65_536), (1, 262_144)];
+// The fixed eight-thread pool keeps the CPU reference comparable with the
+// saved protocol answer baselines; installed before every measured
+// iteration.
+fn benchmark_pool() -> &'static ThreadPool {
+    static POOL: OnceLock<ThreadPool> = OnceLock::new();
+    POOL.get_or_init(|| ThreadPoolBuilder::new().num_threads(8).build().unwrap())
+}
 
 fn seeded_rng(domain: u8, size: usize) -> ChaCha20Rng {
     let mut seed = [domain; 32];
@@ -103,23 +101,18 @@ fn derive_with(
         .unwrap()
 }
 
-// One client run producing the encrypted matrix plus `count` queries;
-// mirrors `benches/protocol.rs::protocol_fixtures_batch` with fresh records.
-fn protocol_fixtures_batch(
+// One client run producing the encrypted matrix plus one query; mirrors
+// `benches/protocol.rs::protocol_fixtures`.
+fn protocol_fixtures(
     params: EmvpParams,
     rows: usize,
-    count: usize,
-) -> (EncryptedMatrix<MODULUS>, Vec<EncryptedQuery<MODULUS>>) {
+) -> (EncryptedMatrix<MODULUS>, EncryptedQuery<MODULUS>) {
     let mut state = derive_with(params, rows, 0x06);
     let matrix = field_values(rows * params.ell, 0x07);
+    let record = field_values(params.ell, 0x08);
     let encrypted = encrypt(&mut state, &matrix).unwrap();
-    let mut queries = Vec::with_capacity(count);
-    for _ in 0..count {
-        let record = field_values(params.ell, 0x08);
-        let (encrypted_query, _decoding_key) = query(&mut state, &record).unwrap();
-        queries.push(encrypted_query);
-    }
-    (encrypted, queries)
+    let (encrypted_query, _decoding_key) = query(&mut state, &record).unwrap();
+    (encrypted, encrypted_query)
 }
 
 /// Accessor for one [`PhaseTimings`] phase field.
@@ -127,7 +120,7 @@ type PhaseAccessor = fn(&PhaseTimings) -> Duration;
 
 /// Prints the host-side phase breakdown a `phase` case collected across all
 /// of its measured iterations.
-fn print_phase_breakdown(batch: usize, rows: usize, samples: &[PhaseTimings]) {
+fn print_phase_breakdown(tag: &str, samples: &[PhaseTimings]) {
     if samples.is_empty() {
         return;
     }
@@ -142,7 +135,7 @@ fn print_phase_breakdown(batch: usize, rows: usize, samples: &[PhaseTimings]) {
         ("total", PhaseTimings::total),
     ];
     println!(
-        "phase breakdown gpu_answer/phase/batch{batch}-rows{rows} over {} calls (median | mean):",
+        "phase breakdown gpu_answer/phase/{tag} over {} calls (median | mean):",
         samples.len()
     );
     for (name, accessor) in phases {
@@ -168,48 +161,54 @@ fn gpu_benches(c: &mut Criterion) {
         }
     };
     let mut group = c.benchmark_group("gpu_answer");
-    // Iterations at the top size cost seconds; fewer samples keep the run
-    // bounded, matching the huge protocol-suite configuration.
+    // Iterations at the top size cost tens of milliseconds; fewer samples
+    // keep the run bounded, matching the huge protocol-suite configuration.
     group.sample_size(10);
-    for &(batch, rows) in &CASES {
-        let (encrypted, queries) = protocol_fixtures_batch(PARAMS, rows, batch);
-        // One-time upload; the measured GPU iterations reuse the
-        // device-resident matrix.
-        let gpu_matrix = answerer.upload_matrix_sync(&PARAMS, &encrypted).unwrap();
-        let elements = u64::try_from(batch * rows * PARAMS.n().unwrap()).unwrap();
-        group.throughput(Throughput::Elements(elements));
-        group.bench_function(
-            BenchmarkId::new("gpu", format!("batch{batch}-rows{rows}")),
-            |b| {
-                b.iter(|| answerer.answer_batch_sync(&gpu_matrix, &queries).unwrap());
-            },
+    for &ell in &LLM_RECORD_LENGTHS {
+        let params = search(ell, LLM_LAMBDA).unwrap();
+        println!(
+            "llm gpu suite at ell = {ell}: k = {}, b = {}, n = {}, lambda = {}",
+            params.k,
+            params.b,
+            params.n().unwrap(),
+            params.lambda
         );
-        // The same device path instrumented with the host-side phase
-        // breakdown; the criterion number is the same wall time as the
-        // `gpu` case and the block printed afterwards attributes it to the
-        // phases of `PhaseTimings`.
-        let mut phase_samples: Vec<PhaseTimings> = Vec::new();
-        group.bench_function(
-            BenchmarkId::new("phase", format!("batch{batch}-rows{rows}")),
-            |b| {
+        for &rows in &LLM_ROW_COUNTS {
+            let tag = format!("ell{ell}-rows{rows}");
+            let (encrypted, query) = protocol_fixtures(params, rows);
+            // One-time upload; the measured GPU iterations reuse the
+            // device-resident matrix.
+            let gpu_matrix = answerer.upload_matrix_sync(&params, &encrypted).unwrap();
+            let elements = u64::try_from(rows * params.n().unwrap()).unwrap();
+            group.throughput(Throughput::Elements(elements));
+            group.bench_function(BenchmarkId::new("gpu", tag.clone()), |b| {
+                b.iter(|| answerer.answer_batch_sync(&gpu_matrix, slice::from_ref(&query)).unwrap());
+            });
+            // The same device path instrumented with the host-side phase
+            // breakdown; the criterion number is the same wall time as the
+            // `gpu` case and the block printed afterwards attributes it to
+            // the phases of `PhaseTimings`.
+            let mut phase_samples: Vec<PhaseTimings> = Vec::new();
+            group.bench_function(BenchmarkId::new("phase", tag.clone()), |b| {
                 b.iter(|| {
                     let (_answers, timings) = answerer
-                        .answer_batch_sync_with_timings(&gpu_matrix, &queries)
+                        .answer_batch_sync_with_timings(&gpu_matrix, slice::from_ref(&query))
                         .unwrap();
                     phase_samples.push(timings);
                 });
-            },
-        );
-        print_phase_breakdown(batch, rows, &phase_samples);
-        drop(gpu_matrix);
-        // CPU reference on the rayon global pool, matching the huge
-        // answer_batch cases in benches/protocol.rs.
-        group.bench_function(
-            BenchmarkId::new("cpu", format!("batch{batch}-rows{rows}")),
-            |b| {
-                b.iter(|| answer_batch(&PARAMS, &encrypted, &queries).unwrap());
-            },
-        );
+            });
+            print_phase_breakdown(&tag, &phase_samples);
+            drop(gpu_matrix);
+            // CPU reference on the pinned eight-thread pool, matching the
+            // answer cases in benches/protocol.rs.
+            group.bench_function(BenchmarkId::new("cpu", tag), |b| {
+                b.iter(|| {
+                    benchmark_pool().install(|| {
+                        answer_batch(&params, &encrypted, slice::from_ref(&query)).unwrap()
+                    })
+                });
+            });
+        }
     }
     group.finish();
 }
