@@ -74,7 +74,10 @@ fn f2_multiplication_matches_boolean_and() {
             field
                 .mul_elements_assign(&mut values, &[rhs, lhs, 1, 0].map(|v| field.element_u32(v)))
                 .unwrap();
-            assert_eq!(values.map(FieldElement::value), [lhs & rhs, lhs & rhs, 1, 0]);
+            assert_eq!(
+                values.map(FieldElement::value),
+                [lhs & rhs, lhs & rhs, 1, 0]
+            );
         }
     }
     let one = PrimeField::<2>::new().element_u32(1);

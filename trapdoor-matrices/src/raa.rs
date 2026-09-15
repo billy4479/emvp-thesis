@@ -242,11 +242,7 @@ impl<const MODULUS: u32> RaaWeightedProduct<MODULUS> {
         super::error::check_len("first scratch buffer", self.n, scratch.first.len())?;
         super::error::check_len("second scratch buffer", self.n, scratch.second.len())?;
 
-        for (result, &index) in scratch
-            .first
-            .iter_mut()
-            .zip(&self.first_sources)
-        {
+        for (result, &index) in scratch.first.iter_mut().zip(&self.first_sources) {
             *result = input[index];
         }
         weighted_inclusive_scan_assign(&mut scratch.first, &self.first_weights)?;

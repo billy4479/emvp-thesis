@@ -46,9 +46,9 @@ fn dot_pseudo_mersenne_32(lhs: &[u32], rhs: &[u32]) -> u32 {
             low_sum += product & u64::from(u32::MAX);
             high_sum += product >> high_shift;
         }
-        sum = reduce_pseudo_mersenne_chunk(sum + reduce_pseudo_mersenne_chunk(
-            low_sum + 5 * high_sum,
-        ));
+        sum = reduce_pseudo_mersenne_chunk(
+            sum + reduce_pseudo_mersenne_chunk(low_sum + 5 * high_sum),
+        );
     }
     reduce_pseudo_mersenne_chunk(sum) as u32
 }

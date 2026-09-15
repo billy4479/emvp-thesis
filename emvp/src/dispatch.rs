@@ -210,7 +210,9 @@ fn validate_shapes<const MODULUS: u32>(
             actual: 0,
         });
     }
-    let words = rows.checked_mul(n).ok_or(ProtocolError::DimensionOverflow)?;
+    let words = rows
+        .checked_mul(n)
+        .ok_or(ProtocolError::DimensionOverflow)?;
     if matrix.values().len() != words {
         return Err(ProtocolError::LengthMismatch {
             name: "encrypted matrix values",

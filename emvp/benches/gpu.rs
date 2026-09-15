@@ -37,8 +37,8 @@ use std::{slice, sync::OnceLock, time::Duration};
 
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use emvp::{
-    DerivedState, EmvpParams, EncryptedMatrix, EncryptedQuery, GpuAnswerer, GpuError,
-    PhaseTimings, ProtocolError, SecretKey, answer_batch, encrypt, query, search,
+    DerivedState, EmvpParams, EncryptedMatrix, EncryptedQuery, GpuAnswerer, GpuError, PhaseTimings,
+    ProtocolError, SecretKey, answer_batch, encrypt, query, search,
 };
 use prime_field_layer::{FieldElement, PrimeField};
 use rand_chacha::ChaCha20Rng;
@@ -182,7 +182,11 @@ fn gpu_benches(c: &mut Criterion) {
             let elements = u64::try_from(rows * params.n().unwrap()).unwrap();
             group.throughput(Throughput::Elements(elements));
             group.bench_function(BenchmarkId::new("gpu", tag.clone()), |b| {
-                b.iter(|| answerer.answer_batch_sync(&gpu_matrix, slice::from_ref(&query)).unwrap());
+                b.iter(|| {
+                    answerer
+                        .answer_batch_sync(&gpu_matrix, slice::from_ref(&query))
+                        .unwrap()
+                });
             });
             // The same device path instrumented with the host-side phase
             // breakdown; the criterion number is the same wall time as the

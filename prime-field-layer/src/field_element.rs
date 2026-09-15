@@ -73,7 +73,10 @@ impl<const MODULUS: u32> FieldElement<MODULUS> {
     #[inline(always)]
     #[must_use]
     pub const fn from_raw(raw: u32) -> Self {
-        debug_assert!(raw < MODULUS, "from_raw requires a canonical Montgomery residue");
+        debug_assert!(
+            raw < MODULUS,
+            "from_raw requires a canonical Montgomery residue"
+        );
         Self::from_montgomery(raw)
     }
 

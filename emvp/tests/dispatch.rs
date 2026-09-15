@@ -100,10 +100,7 @@ fn protocol_fixture<const M: u32>(
 }
 
 #[cfg(feature = "gpu")]
-fn assert_answers_match_cpu<const M: u32>(
-    fixture: &Fixture<M>,
-    answers: &[emvp::AnswerMatrix<M>],
-) {
+fn assert_answers_match_cpu<const M: u32>(fixture: &Fixture<M>, answers: &[emvp::AnswerMatrix<M>]) {
     let cpu = answer_batch(&fixture.params, &fixture.encrypted, &fixture.queries).unwrap();
     assert_eq!(answers.len(), cpu.len());
     for (answer, cpu_answer) in answers.iter().zip(&cpu) {
@@ -154,7 +151,10 @@ mod dispatcher {
         let fixture = protocol_fixture::<MODULUS>(32, 8, 2, 65_536, 4, 0x21);
         let dispatcher = AnswerDispatcher::cpu(fixture.params, &fixture.encrypted).unwrap();
         assert!(!dispatcher.is_device_backed());
-        assert_eq!(dispatcher.backend(fixture.queries.len()), AnswerBackend::Rayon);
+        assert_eq!(
+            dispatcher.backend(fixture.queries.len()),
+            AnswerBackend::Rayon
+        );
         let answers = dispatcher.answer_batch(&fixture.queries).unwrap();
         assert_answers_match_cpu(&fixture, &answers);
     }
@@ -220,16 +220,11 @@ mod dispatcher {
         let Ok(Some(answerer)) = gpu_answerer() else {
             return;
         };
-        let shapes = [
-            (8, 8, 2, 5, 3),
-            (16, 16, 4, 17, 2),
-            (12, 7, 6, 9, 5),
-        ];
+        let shapes = [(8, 8, 2, 5, 3), (16, 16, 4, 17, 2), (12, 7, 6, 9, 5)];
         for (index, &(k, ell, b, rows, batch)) in shapes.iter().enumerate() {
             let fixture = protocol_fixture::<MODULUS>(k, ell, b, rows, batch, 0x25 + index as u8);
             let dispatcher =
-                AnswerDispatcher::new(fixture.params, &fixture.encrypted, Some(&answerer))
-                    .unwrap();
+                AnswerDispatcher::new(fixture.params, &fixture.encrypted, Some(&answerer)).unwrap();
             assert_eq!(
                 dispatcher.backend(fixture.queries.len()),
                 AnswerBackend::SingleCore

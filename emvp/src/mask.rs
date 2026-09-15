@@ -586,8 +586,7 @@ impl<M: TdmMask<MODULUS>, const MODULUS: u32> TdmMask<MODULUS> for RowStackMask<
             .saturating_mul(block_rows)
             .saturating_mul(block_rows)
             .saturating_mul(block_rows);
-        let fulls: Vec<DenseMatrix<MODULUS>> =
-            if is_parallel_work(work, last, threads) {
+        let fulls: Vec<DenseMatrix<MODULUS>> = if is_parallel_work(work, last, threads) {
             self.blocks[..last]
                 .par_iter()
                 .map(|block| block.materialize_top_rows(block_rows))

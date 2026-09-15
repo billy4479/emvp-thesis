@@ -63,18 +63,13 @@ fn forward_wide(plan: &NttPlan<P3>, values: &mut [FieldElement<P3>]) {
 
 #[inline(never)]
 fn dot_u64_fitting(lhs: &[u32], rhs: &[u32]) -> u32 {
-    black_box(
-        PrimeField::<P4>::new().dot_canonical(black_box(lhs), black_box(rhs)),
-    )
-    .unwrap()
+    black_box(PrimeField::<P4>::new().dot_canonical(black_box(lhs), black_box(rhs))).unwrap()
 }
 
 #[inline(never)]
 fn dot_pseudo_mersenne(lhs: &[u32], rhs: &[u32]) -> u32 {
-    black_box(
-        PrimeField::<PSEUDO_MERSENNE>::new().dot_canonical(black_box(lhs), black_box(rhs)),
-    )
-    .unwrap()
+    black_box(PrimeField::<PSEUDO_MERSENNE>::new().dot_canonical(black_box(lhs), black_box(rhs)))
+        .unwrap()
 }
 
 fn main() {

@@ -498,9 +498,7 @@ fn sample_bernoulli_matrix<const MODULUS: u32, R: CryptoRng + ?Sized>(
     // expected nonzero count is `k * weight`. Reserving it up front bounds
     // the entry storage without reallocation, which also keeps the
     // allocator's timing independent of how the support happened to land.
-    let expected_entries = k
-        .checked_mul(weight)
-        .ok_or(TdmError::DimensionOverflow)?;
+    let expected_entries = k.checked_mul(weight).ok_or(TdmError::DimensionOverflow)?;
     let field = PrimeField::<MODULUS>::new();
     for _attempt in 0..MAX_EMPTY_COLUMN_RETRIES {
         let mut offsets = Vec::with_capacity(offsets_capacity);

@@ -236,7 +236,10 @@ fn fill_answer_row<const MODULUS: u32>(
         let matrix_block = &matrix_row[start..start + block_len];
         let query_block = &query[start..start + block_len];
         let mut sums = [zero; 4];
-        for (matrix, query) in matrix_block.chunks_exact(4).zip(query_block.chunks_exact(4)) {
+        for (matrix, query) in matrix_block
+            .chunks_exact(4)
+            .zip(query_block.chunks_exact(4))
+        {
             sums[0] += matrix[0] * query[0];
             sums[1] += matrix[1] * query[1];
             sums[2] += matrix[2] * query[2];
