@@ -149,7 +149,7 @@ independently that the whole protocol is secure against a malicious server.
 My implementation should be correct and follows the constructions in the papers which provide the
 algorithms but it hasn't been independently audited and might therefore be flawed.
 
-== Linearization of the Transformer Model
+== Reducing the client roundtrips
 
 The transformer model has become the de facto standard for language models.
 Its basic unit, the _transformer block_ #cite(<vaswani2017>), maps a sequence of $d$-dimensional
@@ -157,37 +157,69 @@ token vectors to a new sequence of the same length through two sublayers: a self
 layer, and a feed-forward network, both wrapped in residual connections and normalization.
 
 Both sublayers contain many linear parts, which are however interleaved by a non-negligible number
-of non-linearities, which, as we discussed previously, require a roundtrip back to the client to be
-computed. A single transformer block has 1 softmax, 1 activation (usually ReLU/GeLU/SiLU...), 2
-normalization, moreover, even if self-attention is mostly linear, the score $Q K^T$ as well as the
+of non-linearities. As we discussed previously, these non-linearities, require a roundtrip back to
+the client to be computed.
+A single (original) transformer block has 1 softmax, 1 activation (usually ReLU/GeLU/SiLU...),
+2 normalization: this is already 4 roundtrips per block.
+Moreover, even if self-attention is mostly linear, the score $Q K^T$ as well as the
 final attention value $A V$ computations are linear operations on two input-dependent matrices and
 therefore are not suitable for direct use with EMVP.
 
-This issues can however be mitigated by the findings of these two studies which fit together almost
-too well.
+There are many studies which attempt to _linearize_ more of the transformer block: some attempt to
+remove the softmax in attention, some try to linearize the MLP.
+However, for this application this is often not enough: in this work I study whether it is possible
+to bring the number of roundtrips per block to 1, or even 0.
 
-/ Your transformer is secretly linear: #cite(<razzhigaev2024>) is a study which highlights that
-  often some of the transformer blocks can be well approximated by a suitable linear operation
-  without losing much on performance.
-/ AERO: #cite(<aero2024>) asks how many of the non-linearities of a transformer block can be removed
-  without losing the quality of the output. The answer is surprisingly many, as long as you keep the
-  entropy well balanced in the attention heads. After a suited training run, the whole attention
-  block collapses to
-  $
-    Q = X W_Q, K = X W_K, V = X W_V \
-    A = "Softmax"((Q K^t)/(t sqrt(d_k))), Z = A V \
-    Y = X + "Concat"(Z_1, ..., Z_H) W_O
-  $
-  where we can let the client compute only $A$ and $Z$, which can become relatively small for an
-  appropriate choice of weights matrices.
+TODO: add citations here.
 
-TODO: Expand here
+=== Linearizing the transformer
+
+The first question I wanted to try to answer is "How well can a full transformer block be
+approximated by a linear transformation?".
+There is some experimental research already in this direction #cite(<razzhigaev2024>) which seems to
+suggest that, while not all transformer blocks can be replaced, some often can.
+
+If we find a suitable block to be replaced in this way, we can fully fold it into the next matrix,
+making it practically free in our protocol.
+This is not always possible however: some blocks are highly non-linear, others, even if
+linear-looking, cannot be easily replaced without increasing a consistently the perplexity score.
+Moreover, while in the low-context-size regime many blocks seem well suited for this kind of
+approximation, when the number of tokens being processed increases the non-linearities become more
+important and the approximation less precise.
+
+=== A less aggressive approach
+
+When linearizing the whole block is not possible, I still try to remove as many non-linearities as
+possible. Since we need already a client roundtrip to compute some attention values, the most well
+suited non-linearity to be kept is the `Softmax` in the attention block: in this way we use the same
+client roundtrip for both part of the attention calculation as well as computation of the
+non-linearity.
+
+These idea has been already analyzed by Jha and Reagen in their "AERO" protocol #cite(<aero2024>).
+The authors of this work studied how a model can be trained when `LayerNorm` and the activation
+function of the MLP are completely removing, leaving the block in a `Softmax`-only regime.
+
+The study showed that this can lead to an entropy unbalance in the attention heads: in some the
+entropy tends to get very high, in some others very low, leading to degradation of the model
+performance.
+In their study the authors suggest the use of an "Entropy Regularizer" during training which can
+mitigate this problem.
+
+While #cite(<aero2024>) train a model from scratch, I study if the same techniques can be applied to
+a pre-existing model, in order to distill a more linear one.
+When a block can be brought to the `Softmax`-only regime, its attention reduces to
+$
+  Q = X W_Q, K = X W_K, V = X W_V \
+  A = "Softmax"((Q K^t)/(t sqrt(d_k))), Z = A V \
+  Y = X + "Concat"(Z_1, ..., Z_H) W_O
+$
+where we can let the client compute only $A$ and $Z$.
 
 == Related Works
 
-TODO
+TODO.
 
-= Assumptions
+= Assumptions <sec:assumptions>
 
 In this work I assume that all the cryptography assumptions in the EMVP protocol are sound and the
 choice of parameters is appropriate. When I was in doubt on which parameters to pick I always made
@@ -209,9 +241,10 @@ out of scope for the current work.
 
 = Development
 
-== EMVP
+The whole code for this project is available at https://github.com/billy4479/emvp-thesis and
+https://github.com/billy4479/emvp-model-training\.
 
-TODO: add link to repo
+== EMVP
 
 I implemented the EMVP protocol in the Rust programming language #cite(<rust>), which provides the
 memory safety and the low-level primitives needed for fast execution.
@@ -228,6 +261,9 @@ implementation details which I find worth noting.
 This is really the core the project: all the algebra primitives are located here, therefore it's
 important that the code is well optimized, as the performance of everything downstream depends on
 them.
+
+Even if the EMVP protocol itself is field-agnostic, fast computation of convolutions needed for the
+trapdoored matrices requires a prime field.
 
 / Vectorization:
   The whole crate is optimized having in mind that the client has access to an `AVX2`-capable CPU,
@@ -285,7 +321,7 @@ them.
   multiplication below a crossover point measured with the benchmark suite.
 
   Even if this NTT implementation was independently written I compared it to other state of the art
-  libraries which implement the same algorithm #cite(<concrete-ntt>, <fasterntt>).
+  libraries which implement the same algorithms #cite(<concrete-ntt>, <fasterntt>).
 
 
 === Trapdoored Matrices
@@ -302,57 +338,181 @@ benefit from parallel computation.
 
 === EMVP Protocol
 
-TODO: rewrite this
-
-This crate glues the previous two layers into the full protocol, so its speed comes less from
-isolated kernels and more from structure: which work runs in which phase, how many times memory is
-touched, and how much is allocated. These are the tricks which survived the benchmarks.
-
-/ Answer kernel:
-  The server's answer $M'$ consists of $m s$ dot products of length $b$ between blocks of $hat(M)$
-  and blocks of $hat(q)$, making it the protocol's hottest loop. Accumulating into a single
-  register serializes every step on the addition latency, so the kernel keeps four independent
-  accumulators and folds them at the end. Each block is also sliced once up front, which removes
-  the per-element bounds checks that the compiler cannot elide across the two operand slices.
-
-/ Measured parallel crossover:
-  Rows in the answer, encryption, and decoding loops are independent, so rayon #cite(<rayon>)
-  distributes them across workers. Every parallel path is gated by a multiplication-count
-  threshold calibrated once with the benchmark suite, plus the requirement of at least two rows
-  per worker thread, so small inputs stay serial instead of paying scheduling overhead. Each
-  worker allocates its scratch buffers once and reuses them for every row it receives, and every
-  parallel path is tested to produce output identical to the serial loop, which lets the switch
-  be made dynamically per workload.
-
-/ Allocation-free online phase:
-  Query and answer threads own reusable scratch structures, so steady-state queries allocate
-  nothing. My favorite micro-trick: in the query algorithm $tilde(q)$ is dead once $r'$ and the
-  permuted query have been computed, so its head doubles as staging for the $alpha_i$, and the
-  decoding key $p' = (alpha_1^(-1), ..., alpha_s^(-1))$ comes out of a single batch inversion
-  #cite(<montgomery1985>) without a fresh allocation. Batched answers for many queries are written
-  into one query-major arena: a single allocation whose flattened (query, row) grid parallelizes
-  without nested thread pools.
-
-/ GPU hand-off:
-  By our assumptions, the server has a GPU. During the answer phase, we can exploit its compute
-  capabilities to compute the result faster.
-  I chose to use WGPU #cite(<wgpu>, <wgsl>) instead of more popular alternatives like CUDA, as WGPU
+/ Answer phase:
+  This is the hottest code path: it will be executed many times and will is quite expensive to run,
+  however it is also easily optimizable.
+  The answer phase is basically just a chunked matrix-vector multiplication over a finite field,
+  a task which can be easily parallelized.
+  We could use rayon again, but by our assumptions (@sec:assumptions), the server has a GPU, which
+  we can use to speed up computations drastically.
+  I chose to use WGPU #cite(<wgpu>, <wgsl>), instead of more popular alternatives like CUDA, as it
   is open-source, cross-vendor, integrates well with Rust, and the performance loss is negligible
   for the scope of this project.
-  Device buffers hold raw Montgomery residues, so uploads and readbacks move the words as-is: the
-  answers are bit-identical to the CPU path with no conversion or normalization pass.
+  Device buffers hold raw Montgomery residues, so no conversion happens on upload or download.
   Compute shares are also compiled on the flight for a specialized prime modulus, while the
   dimensions of each batch travel in a small uniform buffer, so changing protocol parameters never
   triggers a recompilation.
-  // TODO: change below
-  Device buffers are leased from a grow-only pool, so a server answering steady batch shapes
-  allocates device memory once per concurrent caller; uploads are fused into a single pass over staging
-  memory, and the encrypted matrix crosses the bus once per instance rather than once per batch.
-  Finally, WGSL has no 64-bit integers, so each field product is assembled from four 16-bit
-  partial products, and the query-major output layout gives warps coalesced reads while
-  neighboring workgroups reuse the same matrix row in cache.
+
+/ Measured crossover:
+  Using the GPU is sometimes not necessary, as sending data through PCIe is often expensive. For
+  smaller matrices and queries the cost outweighs the benefits. Instead of sending everything to the
+  GPU, I measured crossover point where rayon becomes faster than the GPU, and where single core
+  becomes faster than rayon.
+
+=== Client-Server architecture
+
+The `client` and `server` crates provide an actually runnable binary to run inference on the
+selected model.
+These binaries are model-agnostic: they just need the right manifest to tell the client what layers
+can be delegated to the servers and which ones cannot, but they should work for models different
+than GPT-2.
+
+The client connects to the server via TCP and uploads all the encrypted matrices. The server
+generates, for each client connection, an unique identifier for each uploaded matrix.
+The client then sends to the server queries in the for `Vec<(matrix_id, Vec<encrypted_vector>)>` so
+that the server can compute all those products in parallel, reducing the number of roundtrips
+needed.
 
 == Distillation
+
+I focussed my work on GPT-2 124M #cite(<radford2019>). This is a very small model which was chosen
+for its simple architecture (only 12 transformer blocks), which allows for fast iteration times for
+experiments, even on consumer hardware.
+There isn't anything really preventing from applying the same procedure to a bigger model, however
+the rest of my work is based on this model, and more sophisticated or bigger models have not been
+tested.
+
+Moreover I chose to work with very small context length of 128 tokens. This was done for speed up
+the research but there is nothing preventing this study to be performed on longer contexts.
+
+I gave myself a limit on how much the performance of the final model can degrade with respect to the
+untouched GPT-2 by deciding that the model perplexity score on a fixed validation portion of the
+WikiText dataset #cite(<merity2017>) should not increase more than $5%$.
+
+Each phase follows more or less the same process: fit a linear layer to replace some part of the
+original GPT-2 architecture, surgically insert it into the actual model, evaluate the result.
+At each phase I allowed the perplexity to go up to a limit of $20%$, then I add a new LoRA layer
+#cite(<hu2022>) right after the just introduced linear one while the rest of the weights remain
+fixed. If this is enough to make perplexity go down under $5%$ I move to the next layer to be
+replaced. If LoRA is not enough I unfreeze all the weights and train again.
+
+All experiments try to stay as deterministic as possible and various intermediates are immutable:
+this allows for results to be reproduced and allow, at any point, to jump back to a previous phase.
+
+
+=== Linearization
+
+As first experiment I computed the Procrustes score for each block, as well as per each attention
+and MLP sub-blocks.
+While I aim to replace the whole transformer with an affine transformation, this is useful data for
+the next phases: it will give good hints on how well will AERO's procedure apply.
+
+I followed a greedy approach: replace the layer with the least perplexity increase, fit and measure
+all other layers again and repeat.
+
+=== Softmax-only regime
+
+TODO.
+
+=== Quantization
+
+My implementation of the prime field layer works over `u32`, but the best performance is only
+available when the modulus $p < 2^30$.
+Since we need to avoid wrap-around, and for GPT-2 the hidden dimension is $d = 768$, to be
+completely sure that we will never wrap-around, we can use a signed `int10` precision.
+
+However, once the vectors are decrypted on the client, I convert them to to `float32` precision to
+apply `Softmax` attention and other non-linearities. This gives us room to requantize them to the
+most appropriate scale.
+
+
+TODO: complete here if a quantizer-aware fine tune run will needed.
+
+= Results
+
+All benchmarks are run on a desktop PC with a AMD Ryzen 2600X (6 cores, 12 threads, AVX2), 32GB of
+RAM, and a GTX 1060 6GB when the machine was at idle using the Criterion library.
+
+== Rust Library
+
+While GPT-2 is quite a small model, the EMVP crate supports larger dimensions. The code is fully
+reusable and I hope it might be a fit for future projects and research.
+
+=== TDMs
+
+While Ring-LPN offers the most stable cryptographic foundation it is also the slowest one compared
+to the other two. In general RAA style TDMs are much faster than all the others during `Apply`.
+
+#figure(
+  image("assets/apply.svg", width: 70%),
+  caption: [Timings for `Apply`. This is the hot path which the client will run on each EMVP,
+    therefore it is the most important operation to do quickly.],
+)
+#figure(
+  image("assets/construction.svg", width: 70%),
+  caption: [ Timings for `Construction`. This happens just once during encryption. ],
+)
+#figure(
+  image("assets/materialize.svg", width: 70%),
+  caption: [ Timings for `Materialize` in logarithmic scale.
+    This happens just once during construction.
+    (This benchmark uses a different smaller matrices than the two figures above as materializing
+    matrices takes a lot of RAM, making the benchmarks suite too heavy to run on some less powerful
+    machines.)
+  ],
+)
+
+=== EMVP Protocol
+
+What follows are some plots of the results of the benchmark of the EMVP protocol itself.
+I believe these are good results: the full online phase is only slightly slower than a plaintext
+computation, also compared to the reference implementation #citesec(<emvp2025>, "F")
+
+#figure(
+  image("assets/protocol_phases_ell4096_rows4096.svg", width: 70%),
+  caption: [ Timings for different phases of the EMVP protocol, logarithmic scale.
+    Plaintext comparison is with Ring-LPN TDM and assumes no communication latency.\
+    $ell = 4096, k = 4096$.],
+)
+#figure(
+  image("assets/protocol_phases_ell8192_rows8192.svg", width: 70%),
+  caption: [ Timings for different phases of the EMVP protocol, logarithmic scale.
+    Plaintext comparison is with Ring-LPN TDM and assumes no communication latency.\
+    $ell = 8192, k = 8192$.],
+)
+
+== Model
+
+=== Linearization
+
+=== Softmax-only Regime
+
+=== Quantization
+
+= Conclusions
+
+TODO.
+
+== Limitations and Further Work
+
+Download size could be surely optimized using the rate-1 additively homographic encryption scheme
+suggested in #citesec(<emvp2025>, "4.1"). However I deemed this out of scope for my thesis, it
+should be possible to add it to the Rust crate with without major issues.
+
+Using a model like GPT-2 doesn't really give enough credit to the EMVP protocol, as this size of
+model can easily be ran on consumer CPUs. A more in depth study with more compute power, larger and
+more sophisticated models could uncover flaws in this work.
+
+= AI Disclosure
+
+While this document is fully hand-written, generative AI was used throughout this project for
+research, code writing, generating plots, and for carrying on long repetitive running tasks such as
+running benchmarks and training runs.
+
+The use of AI tools was heavily guided by me, I was always in control of the direction of the AI
+agents. I fully own any mistake.
+
+The models which helped in completing this work are `GPT-5.6-Sol` and `GLM-5.3-Flash`.
 
 
 #bibliography(title: "Bibliography")

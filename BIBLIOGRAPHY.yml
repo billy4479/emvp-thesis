@@ -877,6 +877,59 @@ vaswani2017:
     type: Proceedings
     title: "Advances in Neural Information Processing Systems 30 (NIPS 2017)"
 
+radford2019:
+  type: Misc
+  title: "Language Models are Unsupervised Multitask Learners"
+  author:
+    - "Radford, Alec"
+    - "Wu, Jeffrey"
+    - "Child, Rewon"
+    - "Luan, David"
+    - "Amodei, Dario"
+    - "Sutskever, Ilya"
+  date: 2019
+  organization: OpenAI
+  url: https://cdn.openai.com/better-language-models/language_models_are_unsupervised_multitask_learners.pdf
+  note: "Original GPT-2 technical report; source of the 124M-parameter model used as the starting point of the distillation study."
+
+merity2017:
+  type: Article
+  title: "Pointer Sentinel Mixture Models"
+  author:
+    - "Merity, Stephen"
+    - "Xiong, Caiming"
+    - "Bradbury, James"
+    - "Socher, Richard"
+  date: 2017
+  serial-number:
+    arxiv: "1609.07843"
+  url: https://arxiv.org/abs/1609.07843
+  note: "Introduces the WikiText-2 and WikiText-103 corpora; source of the validation split used for the perplexity budget."
+  parent:
+    type: Proceedings
+    title: International Conference on Learning Representations (ICLR 2017)
+
+hu2022:
+  type: Article
+  title: "LoRA: Low-Rank Adaptation of Large Language Models"
+  author:
+    - "Hu, Edward J."
+    - "Shen, Yelong"
+    - "Wallis, Phillip"
+    - "Allen-Zhu, Zeyuan"
+    - "Li, Yuanzhi"
+    - "Wang, Shean"
+    - "Wang, Lu"
+    - "Chen, Weizhu"
+  date: 2022
+  serial-number:
+    arxiv: "2106.09685"
+  url: https://arxiv.org/abs/2106.09685
+  note: "Low-rank adapters for parameter-efficient fine-tuning; used to recover the perplexity budget after each linearization phase."
+  parent:
+    type: Proceedings
+    title: International Conference on Learning Representations (ICLR 2022)
+
 llvm:
   type: Web
   title: The LLVM Compiler Infrastructure Project

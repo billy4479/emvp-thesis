@@ -6,6 +6,7 @@ target/
 
 *.svg
 perf.data*
+bench-results/
 
 
 # Added by cargo
