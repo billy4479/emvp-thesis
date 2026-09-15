@@ -12,8 +12,8 @@
 //! monotonic query index. Callers persist the next index when reconstructing
 //! state after a restart.
 //!
-//! The data flow, matching the conventions of [`crate::code`] and
-//! [`crate::mask`]:
+//! The data flow, matching the conventions of [`crate::code`] and the
+//! `trapdoor_matrices` mask module:
 //!
 //! - encrypt: each matrix row is dual-encoded to `(-conv(g, m_pad) | m_pad)`
 //!   (row times the dual generator `D = [-M_g^T | I_k]`), masked by adding
@@ -49,10 +49,9 @@ use prime_field_layer::{FieldElement, FieldError, PrimeField};
 use rand_chacha::ChaCha20Rng;
 use rand_core::{CryptoRng, Rng};
 use rayon::prelude::*;
-use trapdoor_matrices::{DenseMatrix, Permutation};
+use trapdoor_matrices::{DenseMatrix, Permutation, RowStackMask, TdmError, TdmMask};
 
 use crate::code::{CodeError, CyclicCodeScratch, CyclicDualCode};
-use crate::mask::{MaskError, RowStackMask, TdmMask};
 use crate::params::{EmvpParams, ParamsError};
 use crate::prf::{Prf, PrfError, purpose};
 
@@ -76,7 +75,7 @@ pub enum ProtocolError {
     /// Code construction, encoding, or codeword sampling failed.
     Code(CodeError),
     /// Mask construction, evaluation, or materialization failed.
-    Mask(MaskError),
+    Mask(TdmError),
     /// Field arithmetic failed.
     Field(FieldError),
     /// Protocol parameters were malformed or did not meet the requested
@@ -180,8 +179,8 @@ impl From<CodeError> for ProtocolError {
     }
 }
 
-impl From<MaskError> for ProtocolError {
-    fn from(error: MaskError) -> Self {
+impl From<TdmError> for ProtocolError {
+    fn from(error: TdmError) -> Self {
         Self::Mask(error)
     }
 }
@@ -195,12 +194,6 @@ impl From<FieldError> for ProtocolError {
 impl From<ParamsError> for ProtocolError {
     fn from(error: ParamsError) -> Self {
         Self::Params(error)
-    }
-}
-
-impl From<trapdoor_matrices::TdmError> for ProtocolError {
-    fn from(error: trapdoor_matrices::TdmError) -> Self {
-        Self::Mask(error.into())
     }
 }
 

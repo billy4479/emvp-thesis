@@ -9,12 +9,7 @@ use prime_field_layer::{FieldElement, NttBackend, NttPerformanceWarning, NttPlan
 use rand_core::CryptoRng;
 use rayon::prelude::*;
 
-use crate::{DenseMatrix, Permutation, TdmError, error::check_len};
-
-/// Minimum estimated field multiplications before a materialization switches
-/// to rayon; smaller workloads stay on the serial path. The value mirrors the
-/// crossover calibrated for the emvp answer phase.
-const MIN_PARALLEL_MULTIPLICATIONS: usize = 32 * 1024;
+use crate::{DenseMatrix, Permutation, TdmError, error::check_len, mask::is_parallel_work};
 
 /// A rectangular Toeplitz linear map evaluated through a cached cyclic NTT.
 ///
@@ -547,8 +542,7 @@ impl<const MODULUS: u32> ToeplitzFastProduct<MODULUS> {
         // `rows * K * K` is a conservative multiplication estimate.
         let threads = rayon::current_num_threads();
         let work = rows.saturating_mul(k).saturating_mul(k);
-        if threads > 1 && rows >= threads.saturating_mul(2) && work >= MIN_PARALLEL_MULTIPLICATIONS
-        {
+        if is_parallel_work(work, rows, threads) {
             values
                 .par_chunks_mut(k)
                 .enumerate()

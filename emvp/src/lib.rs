@@ -20,7 +20,6 @@ pub mod code;
 pub mod dispatch;
 #[cfg(feature = "gpu")]
 pub mod gpu;
-pub mod mask;
 pub mod params;
 pub mod prf;
 pub mod protocol;
@@ -31,7 +30,6 @@ pub use dispatch::{AnswerBackend, MIN_PARALLEL_MULTIPLICATIONS, select_answer_ba
 pub use dispatch::{AnswerDispatchError, AnswerDispatcher, MIN_GPU_MULTIPLICATIONS};
 #[cfg(feature = "gpu")]
 pub use gpu::{GpuAnswerer, GpuEncryptedMatrix, GpuError, PhaseTimings};
-pub use mask::{MaskError, RowStackMask, TdmMask};
 pub use params::{
     EmvpParams, POW_MAX_LAMBDA, PROTOCOL_MAX_LAMBDA, ParamsError, pow_ge_pow2, search,
 };
@@ -41,3 +39,4 @@ pub use protocol::{
     QueryReservation, QueryReservations, QueryScratch, SecretKey, answer_batch, answer_into,
     decode_into, encrypt, query, query_batch, query_with_scratch,
 };
+pub use trapdoor_matrices::{RowStackMask, TdmMask};

@@ -3,15 +3,14 @@
     reason = "fixed test fixtures establish that construction and evaluation must succeed"
 )]
 
-use emvp::{MaskError, RowStackMask, TdmMask};
 use prime_field_layer::{FieldElement, PrimeField};
 use proptest::prelude::*;
 use rand_chacha::ChaCha20Rng;
 use rand_core::SeedableRng;
 use rayon::{ThreadPool, ThreadPoolBuilder};
 use trapdoor_matrices::{
-    DenseMatrix, IrreducibleRingLpn, RaaWeightedProduct, SparseMatrix, TdmError,
-    ToeplitzFastProduct,
+    DenseMatrix, IrreducibleRingLpn, RaaWeightedProduct, RowStackMask, SparseMatrix, TdmError,
+    TdmMask, ToeplitzFastProduct,
 };
 
 // NTT-friendly prime for the Toeplitz and RAA constructions: 1_073_479_681 - 1
@@ -19,7 +18,7 @@ use trapdoor_matrices::{
 const MODULUS: u32 = 1_073_479_681;
 
 // Small prime for the Ring-LPN adapter, with the irreducible cubic
-// x^3 + 3x + 1 copied from the trapdoor-matrices integration tests.
+// x^3 + 3x + 1 copied from the crate's integration tests.
 const SMALL_MODULUS: u32 = 17;
 const RING_MODULUS_POLY: [u32; 4] = [1, 3, 0, 1];
 
@@ -98,8 +97,8 @@ fn assert_apply_matches_materialize<const MODULUS: u32, M: TdmMask<MODULUS>>(
     assert_eq!(structured, expected);
 }
 
-/// Copied from the trapdoor-matrices integration tests: `K = 3` over
-/// `F_17` with modulus polynomial x^3 + 3x + 1.
+/// From the crate's integration tests: `K = 3` over `F_17` with modulus
+/// polynomial x^3 + 3x + 1.
 fn explicit_ring_lpn() -> IrreducibleRingLpn<SMALL_MODULUS> {
     let k = 3;
     let sparse = SparseMatrix::new(
@@ -133,16 +132,16 @@ impl TdmMask<MODULUS> for FixedBlock {
         input: &[FieldElement<MODULUS>],
         output: &mut [FieldElement<MODULUS>],
         _scratch: &mut Self::Scratch,
-    ) -> Result<(), MaskError> {
+    ) -> Result<(), TdmError> {
         if input.len() != self.columns {
-            return Err(MaskError::LengthMismatch {
+            return Err(TdmError::LengthMismatch {
                 name: "fixed block input",
                 expected: self.columns,
                 actual: input.len(),
             });
         }
         if output.len() != self.rows {
-            return Err(MaskError::LengthMismatch {
+            return Err(TdmError::LengthMismatch {
                 name: "fixed block output",
                 expected: self.rows,
                 actual: output.len(),
@@ -152,16 +151,12 @@ impl TdmMask<MODULUS> for FixedBlock {
         Ok(())
     }
 
-    fn materialize(&self) -> Result<DenseMatrix<MODULUS>, MaskError> {
+    fn materialize(&self) -> Result<DenseMatrix<MODULUS>, TdmError> {
         let length = self
             .rows
             .checked_mul(self.columns)
-            .ok_or(MaskError::DimensionOverflow)?;
-        Ok(DenseMatrix::new(
-            self.rows,
-            self.columns,
-            zeros::<MODULUS>(length),
-        )?)
+            .ok_or(TdmError::DimensionOverflow)?;
+        DenseMatrix::new(self.rows, self.columns, zeros::<MODULUS>(length))
     }
 }
 
@@ -181,11 +176,11 @@ impl TdmMask<MODULUS> for BadMaterialization {
         input: &[FieldElement<MODULUS>],
         output: &mut [FieldElement<MODULUS>],
         _scratch: &mut Self::Scratch,
-    ) -> Result<(), MaskError> {
+    ) -> Result<(), TdmError> {
         // The declared height is 2, but the evaluation only accepts one row:
         // a contract violation the structured materialization must surface.
         if output.len() != 1 {
-            return Err(MaskError::LengthMismatch {
+            return Err(TdmError::LengthMismatch {
                 name: "bad materialization apply",
                 expected: 1,
                 actual: output.len(),
@@ -195,8 +190,8 @@ impl TdmMask<MODULUS> for BadMaterialization {
         Ok(())
     }
 
-    fn materialize(&self) -> Result<DenseMatrix<MODULUS>, MaskError> {
-        Ok(DenseMatrix::new(1, 1, zeros::<MODULUS>(1))?)
+    fn materialize(&self) -> Result<DenseMatrix<MODULUS>, TdmError> {
+        DenseMatrix::new(1, 1, zeros::<MODULUS>(1))
     }
 }
 
@@ -298,7 +293,7 @@ fn remainder_row_stack_truncates_the_last_block() {
 fn row_stack_rejects_bad_block_descriptors() {
     assert!(matches!(
         RowStackMask::<ToeplitzFastProduct<MODULUS>, MODULUS>::new(Vec::new(), 5),
-        Err(MaskError::LengthMismatch {
+        Err(TdmError::LengthMismatch {
             name: "mask blocks",
             expected: 1,
             actual: 0
@@ -312,7 +307,7 @@ fn row_stack_rejects_bad_block_descriptors() {
             }],
             2
         ),
-        Err(MaskError::LengthMismatch {
+        Err(TdmError::LengthMismatch {
             name: "first mask block rows",
             expected: 3,
             actual: 2
@@ -326,7 +321,7 @@ fn row_stack_rejects_bad_block_descriptors() {
             }],
             1
         ),
-        Err(MaskError::LengthMismatch {
+        Err(TdmError::LengthMismatch {
             name: "mask block rows",
             expected: 1,
             actual: 0
@@ -346,7 +341,7 @@ fn row_stack_rejects_bad_block_descriptors() {
             ],
             5
         ),
-        Err(MaskError::LengthMismatch {
+        Err(TdmError::LengthMismatch {
             name: "mask block rows",
             expected: 5,
             actual: 4
@@ -366,7 +361,7 @@ fn row_stack_rejects_bad_block_descriptors() {
             ],
             5
         ),
-        Err(MaskError::LengthMismatch {
+        Err(TdmError::LengthMismatch {
             name: "mask block columns",
             expected: 5,
             actual: 4
@@ -383,7 +378,7 @@ fn row_stack_rejects_materialization_that_disagrees_with_dimensions() {
     let stack = RowStackMask::new(vec![BadMaterialization], 2).unwrap();
     assert!(matches!(
         stack.materialize(),
-        Err(MaskError::LengthMismatch {
+        Err(TdmError::LengthMismatch {
             name: "bad materialization apply",
             expected: 1,
             actual: 2,
@@ -398,7 +393,7 @@ fn row_stack_rejects_invalid_constructions() {
     let small = sample_toeplitz(3, 0x6602);
     assert!(matches!(
         RowStackMask::new(vec![large, small], 5),
-        Err(MaskError::LengthMismatch {
+        Err(TdmError::LengthMismatch {
             name: "mask block rows",
             expected: 5,
             actual: 3
@@ -409,7 +404,7 @@ fn row_stack_rejects_invalid_constructions() {
     let second = sample_toeplitz(5, 0x6604);
     assert!(matches!(
         RowStackMask::new(vec![first, second], 11),
-        Err(MaskError::LengthMismatch {
+        Err(TdmError::LengthMismatch {
             name: "total mask rows",
             expected: 10,
             actual: 11
@@ -417,7 +412,7 @@ fn row_stack_rejects_invalid_constructions() {
     ));
     assert!(matches!(
         RowStackMask::new(vec![sample_toeplitz(5, 0x6605)], 0),
-        Err(MaskError::LengthMismatch {
+        Err(TdmError::LengthMismatch {
             name: "total mask rows",
             expected: 1,
             actual: 0
@@ -428,7 +423,7 @@ fn row_stack_rejects_invalid_constructions() {
     let second = sample_toeplitz(5, 0x6607);
     assert!(matches!(
         RowStackMask::new(vec![first, second], 2),
-        Err(MaskError::LengthMismatch {
+        Err(TdmError::LengthMismatch {
             name: "mask blocks for total rows",
             expected: 1,
             actual: 2,
@@ -463,7 +458,7 @@ fn length_errors_leave_outputs_unchanged() {
     let wrong_input = zeros::<MODULUS>(4);
     assert!(matches!(
         stack.apply(&wrong_input, &mut output, &mut scratch),
-        Err(MaskError::LengthMismatch {
+        Err(TdmError::LengthMismatch {
             name: "mask input",
             expected: 5,
             actual: 4
@@ -475,7 +470,7 @@ fn length_errors_leave_outputs_unchanged() {
     let input = zeros::<MODULUS>(5);
     assert!(matches!(
         stack.apply(&input, &mut short_output, &mut scratch),
-        Err(MaskError::LengthMismatch {
+        Err(TdmError::LengthMismatch {
             name: "mask output",
             expected: 15,
             actual: 14
@@ -487,7 +482,7 @@ fn length_errors_leave_outputs_unchanged() {
     short_scratch.0.pop();
     assert!(matches!(
         stack.apply(&input, &mut output, &mut short_scratch),
-        Err(MaskError::LengthMismatch {
+        Err(TdmError::LengthMismatch {
             name: "mask scratch blocks",
             expected: 3,
             actual: 2
@@ -495,8 +490,8 @@ fn length_errors_leave_outputs_unchanged() {
     ));
     assert_eq!(output, sentinel);
 
-    // The adapter layer translates its own length failures through
-    // MaskError::Tdm without touching the output.
+    // The construction surfaces its own length failures as TdmError values
+    // without touching the output.
     let product = sample_toeplitz(5, 0x6801);
     let mut product_scratch = product.scratch();
     let adapter_sentinel = sentinel_values::<MODULUS>(5, 7);
@@ -508,11 +503,11 @@ fn length_errors_leave_outputs_unchanged() {
             &mut adapter_output,
             &mut product_scratch
         ),
-        Err(MaskError::Tdm(TdmError::LengthMismatch {
+        Err(TdmError::LengthMismatch {
             name: "fast-product input",
             expected: 5,
             actual: 4
-        }))
+        })
     ));
     assert_eq!(adapter_output, adapter_sentinel);
 
@@ -525,11 +520,11 @@ fn length_errors_leave_outputs_unchanged() {
             &mut short_adapter_output,
             &mut product_scratch
         ),
-        Err(MaskError::Tdm(TdmError::LengthMismatch {
+        Err(TdmError::LengthMismatch {
             name: "fast-product output",
             expected: 5,
             actual: 4
-        }))
+        })
     ));
     assert_eq!(field_values(&short_adapter_output), vec![0; 4]);
 }

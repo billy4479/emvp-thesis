@@ -4,12 +4,12 @@
 //! matrix behind a pseudorandom mask `R` in `F_p^{m x n}`: the client stores
 //! the trapdoor of `R` so it can evaluate `R v` fast during the online
 //! phase, while the offline phase materializes `R` densely. The
-//! constructions in the [`trapdoor_matrices`] crate are all square `K x K`,
-//! so a rectangular `m x n` mask is assembled from independent square
-//! blocks stacked along the rows: block `i` multiplies the full `n`-element
-//! input and supplies rows `[i n, (i + 1) n)` of the product. When `m` is
-//! not a multiple of `n`, the final block materializes only its top `m mod n`
-//! rows when the block implementation supports efficient row prefixes.
+//! constructions in this crate are all square `K x K`, so a rectangular
+//! `m x n` mask is assembled from independent square blocks stacked along
+//! the rows: block `i` multiplies the full `n`-element input and supplies
+//! rows `[i n, (i + 1) n)` of the product. When `m` is not a multiple of
+//! `n`, the final block materializes only its top `m mod n` rows when the
+//! block implementation supports efficient row prefixes.
 //!
 //! [`TdmMask`] abstracts one square trapdoored matrix, and
 //! [`RowStackMask`] turns any stack of equally sized blocks into a single
@@ -18,94 +18,41 @@
 //! This is experimental cryptography: the underlying constructions have no
 //! settled security parameters, secret state is not zeroized on drop, and
 //! the implementations have not received a constant-time audit.
-//!
-//! [`trapdoor_matrices`]: trapdoor_matrices
-
-use std::fmt;
 
 use prime_field_layer::{FieldElement, PrimeField};
 use rayon::prelude::*;
-use trapdoor_matrices::{
-    DenseMatrix, IrreducibleRingLpn, RaaScratch, RaaWeightedProduct, RingLpnScratch, TdmError,
-    ToeplitzFastProduct, ToeplitzScratch,
-};
 
-use crate::dispatch::is_parallel_work;
+use crate::{
+    DenseMatrix, IrreducibleRingLpn, RaaScratch, RaaWeightedProduct, RingLpnScratch, TdmError,
+    ToeplitzFastProduct, ToeplitzScratch, error::check_len,
+};
 
 /// Tile edge for the cache-blocked transpose in the default
 /// [`TdmMask::materialize_top_rows`]: 32 rows x 32 columns keeps both access
 /// streams (a staging column slice and a run of output words) inside L1/L2.
 const TRANSPOSE_TILE: usize = 32;
 
-/// A rejected mask construction or evaluation.
-#[derive(Clone, Debug, Eq, PartialEq)]
-#[non_exhaustive]
-pub enum MaskError {
-    /// A slice did not have the required length.
-    LengthMismatch {
-        /// The rejected slice.
-        name: &'static str,
-        /// The required length.
-        expected: usize,
-        /// The observed length.
-        actual: usize,
-    },
-    /// Dimension arithmetic overflowed `usize`.
-    DimensionOverflow,
-    /// Trapdoored-matrix construction or arithmetic failed.
-    Tdm(TdmError),
-}
+/// Minimum estimated field multiplications before a mask application or
+/// materialization switches to rayon; smaller workloads stay on the serial
+/// path. The value mirrors the crossover calibrated for the emvp answer
+/// phase.
+const MIN_PARALLEL_MULTIPLICATIONS: usize = 32 * 1024;
 
-impl fmt::Display for MaskError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::LengthMismatch {
-                name,
-                expected,
-                actual,
-            } => write!(
-                formatter,
-                "{name} length mismatch: expected {expected}, got {actual}"
-            ),
-            Self::DimensionOverflow => formatter.write_str("dimension arithmetic overflowed"),
-            Self::Tdm(error) => error.fmt(formatter),
-        }
-    }
-}
-
-impl std::error::Error for MaskError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Self::Tdm(error) => Some(error),
-            _ => None,
-        }
-    }
-}
-
-impl From<TdmError> for MaskError {
-    fn from(error: TdmError) -> Self {
-        Self::Tdm(error)
-    }
-}
-
-const fn check_len(name: &'static str, expected: usize, actual: usize) -> Result<(), MaskError> {
-    if expected == actual {
-        Ok(())
-    } else {
-        Err(MaskError::LengthMismatch {
-            name,
-            expected,
-            actual,
-        })
-    }
+/// Whether this `(work, grid, threads)` combination is worth distributing
+/// across the rayon pool: parallel dispatch needs at least two independent
+/// units of work per pool thread and enough estimated field
+/// multiplications. Shared by the [`TdmMask`] defaults, [`RowStackMask`],
+/// and the Toeplitz materialization so the policy and the code that
+/// executes it cannot drift apart.
+pub const fn is_parallel_work(work: usize, grid: usize, threads: usize) -> bool {
+    threads > 1 && grid >= threads.saturating_mul(2) && work >= MIN_PARALLEL_MULTIPLICATIONS
 }
 
 /// One square trapdoored matrix usable as an EMVP mask block.
 ///
-/// The trait is local to this crate, so it can be implemented for the
-/// foreign construction types of the [`trapdoor_matrices`] crate as well as
-/// for user-supplied blocks. Every block is `rows x columns`; the shipped
-/// constructions are square `K x K`.
+/// The trait is implemented for the constructions shipped in this crate as
+/// well as for user-supplied blocks. Every block is `rows x columns`; the
+/// shipped constructions are square `K x K`.
 ///
 /// # Thread-safety contract
 ///
@@ -154,7 +101,7 @@ pub trait TdmMask<const MODULUS: u32>: Send + Sync {
         input: &[FieldElement<MODULUS>],
         output: &mut [FieldElement<MODULUS>],
         scratch: &mut Self::Scratch,
-    ) -> Result<(), MaskError>;
+    ) -> Result<(), TdmError>;
 
     /// Materializes the matrix in row-major dense form for the offline
     /// phase.
@@ -162,7 +109,7 @@ pub trait TdmMask<const MODULUS: u32>: Send + Sync {
     /// # Errors
     ///
     /// Returns an error if dense dimensions overflow or evaluation fails.
-    fn materialize(&self) -> Result<DenseMatrix<MODULUS>, MaskError>;
+    fn materialize(&self) -> Result<DenseMatrix<MODULUS>, TdmError>;
 
     /// Materializes the first `rows` rows in row-major form.
     ///
@@ -181,13 +128,13 @@ pub trait TdmMask<const MODULUS: u32>: Send + Sync {
     ///
     /// Returns an error if `rows` is zero, exceeds the reported row count,
     /// dimensions overflow, or evaluation fails.
-    fn materialize_top_rows(&self, rows: usize) -> Result<DenseMatrix<MODULUS>, MaskError> {
+    fn materialize_top_rows(&self, rows: usize) -> Result<DenseMatrix<MODULUS>, TdmError> {
         let (full_rows, columns) = self.dims();
         if rows == 0 {
-            return Err(MaskError::Tdm(TdmError::ZeroDimension("materialized rows")));
+            return Err(TdmError::ZeroDimension("materialized rows"));
         }
         if rows > full_rows {
-            return Err(MaskError::LengthMismatch {
+            return Err(TdmError::LengthMismatch {
                 name: "materialized rows",
                 expected: full_rows,
                 actual: rows,
@@ -199,7 +146,7 @@ pub trait TdmMask<const MODULUS: u32>: Send + Sync {
         let one = field.element_u32(1);
         let length = rows
             .checked_mul(columns)
-            .ok_or(MaskError::DimensionOverflow)?;
+            .ok_or(TdmError::DimensionOverflow)?;
         let mut staged = vec![zero; length];
         // One structured evaluation applies the full mask: a conservative
         // estimate of `columns * full_rows * columns` multiplications.
@@ -219,7 +166,7 @@ pub trait TdmMask<const MODULUS: u32>: Send + Sync {
                         Ok(())
                     },
                 )
-                .try_for_each(|result: Result<(), MaskError>| result)?;
+                .try_for_each(|result: Result<(), TdmError>| result)?;
         } else {
             let mut input = vec![zero; columns];
             let mut output = vec![zero; full_rows];
@@ -251,7 +198,7 @@ pub trait TdmMask<const MODULUS: u32>: Send + Sync {
                 }
             }
         }
-        Ok(DenseMatrix::new(rows, columns, values)?)
+        DenseMatrix::new(rows, columns, values)
     }
 }
 
@@ -274,12 +221,12 @@ impl<const MODULUS: u32> TdmMask<MODULUS> for IrreducibleRingLpn<MODULUS> {
         input: &[FieldElement<MODULUS>],
         output: &mut [FieldElement<MODULUS>],
         scratch: &mut Self::Scratch,
-    ) -> Result<(), MaskError> {
-        Ok(self.apply(input, output, scratch)?)
+    ) -> Result<(), TdmError> {
+        self.apply(input, output, scratch)
     }
 
-    fn materialize(&self) -> Result<DenseMatrix<MODULUS>, MaskError> {
-        Ok(self.materialize()?)
+    fn materialize(&self) -> Result<DenseMatrix<MODULUS>, TdmError> {
+        self.materialize()
     }
 }
 
@@ -301,16 +248,16 @@ impl<const MODULUS: u32> TdmMask<MODULUS> for ToeplitzFastProduct<MODULUS> {
         input: &[FieldElement<MODULUS>],
         output: &mut [FieldElement<MODULUS>],
         scratch: &mut Self::Scratch,
-    ) -> Result<(), MaskError> {
-        Ok(self.apply(input, output, scratch)?)
+    ) -> Result<(), TdmError> {
+        self.apply(input, output, scratch)
     }
 
-    fn materialize(&self) -> Result<DenseMatrix<MODULUS>, MaskError> {
-        Ok(self.materialize()?)
+    fn materialize(&self) -> Result<DenseMatrix<MODULUS>, TdmError> {
+        self.materialize()
     }
 
-    fn materialize_top_rows(&self, rows: usize) -> Result<DenseMatrix<MODULUS>, MaskError> {
-        Ok(Self::materialize_top_rows(self, rows)?)
+    fn materialize_top_rows(&self, rows: usize) -> Result<DenseMatrix<MODULUS>, TdmError> {
+        Self::materialize_top_rows(self, rows)
     }
 }
 
@@ -330,12 +277,12 @@ impl<const MODULUS: u32> TdmMask<MODULUS> for RaaWeightedProduct<MODULUS> {
         input: &[FieldElement<MODULUS>],
         output: &mut [FieldElement<MODULUS>],
         scratch: &mut Self::Scratch,
-    ) -> Result<(), MaskError> {
-        Ok(self.apply(input, output, scratch)?)
+    ) -> Result<(), TdmError> {
+        self.apply(input, output, scratch)
     }
 
-    fn materialize(&self) -> Result<DenseMatrix<MODULUS>, MaskError> {
-        Ok(self.materialize()?)
+    fn materialize(&self) -> Result<DenseMatrix<MODULUS>, TdmError> {
+        self.materialize()
     }
 }
 
@@ -367,9 +314,9 @@ impl<M: TdmMask<MODULUS>, const MODULUS: u32> RowStackMask<M, MODULUS> {
     /// Returns a length error for an empty block list, a nonsquare block,
     /// mismatched block dimensions, or a `total_rows` outside the valid
     /// range, and an overflow error if the row-count arithmetic overflows.
-    pub fn new(blocks: Vec<M>, total_rows: usize) -> Result<Self, MaskError> {
+    pub fn new(blocks: Vec<M>, total_rows: usize) -> Result<Self, TdmError> {
         let Some(first) = blocks.first() else {
-            return Err(MaskError::LengthMismatch {
+            return Err(TdmError::LengthMismatch {
                 name: "mask blocks",
                 expected: 1,
                 actual: blocks.len(),
@@ -377,14 +324,14 @@ impl<M: TdmMask<MODULUS>, const MODULUS: u32> RowStackMask<M, MODULUS> {
         };
         let (first_rows, first_columns) = first.dims();
         if first_rows != first_columns {
-            return Err(MaskError::LengthMismatch {
+            return Err(TdmError::LengthMismatch {
                 name: "first mask block rows",
                 expected: first_columns,
                 actual: first_rows,
             });
         }
         if first_rows == 0 {
-            return Err(MaskError::LengthMismatch {
+            return Err(TdmError::LengthMismatch {
                 name: "mask block rows",
                 expected: 1,
                 actual: 0,
@@ -394,14 +341,14 @@ impl<M: TdmMask<MODULUS>, const MODULUS: u32> RowStackMask<M, MODULUS> {
         for block in blocks.iter().skip(1) {
             let (rows, columns) = block.dims();
             if rows != block_rows {
-                return Err(MaskError::LengthMismatch {
+                return Err(TdmError::LengthMismatch {
                     name: "mask block rows",
                     expected: block_rows,
                     actual: rows,
                 });
             }
             if columns != block_rows {
-                return Err(MaskError::LengthMismatch {
+                return Err(TdmError::LengthMismatch {
                     name: "mask block columns",
                     expected: block_rows,
                     actual: columns,
@@ -411,16 +358,16 @@ impl<M: TdmMask<MODULUS>, const MODULUS: u32> RowStackMask<M, MODULUS> {
         let full_rows = blocks
             .len()
             .checked_mul(block_rows)
-            .ok_or(MaskError::DimensionOverflow)?;
+            .ok_or(TdmError::DimensionOverflow)?;
         if total_rows == 0 {
-            return Err(MaskError::LengthMismatch {
+            return Err(TdmError::LengthMismatch {
                 name: "total mask rows",
                 expected: 1,
                 actual: 0,
             });
         }
         if total_rows > full_rows {
-            return Err(MaskError::LengthMismatch {
+            return Err(TdmError::LengthMismatch {
                 name: "total mask rows",
                 expected: full_rows,
                 actual: total_rows,
@@ -428,7 +375,7 @@ impl<M: TdmMask<MODULUS>, const MODULUS: u32> RowStackMask<M, MODULUS> {
         }
         let expected_blocks = total_rows.div_ceil(block_rows);
         if blocks.len() != expected_blocks {
-            return Err(MaskError::LengthMismatch {
+            return Err(TdmError::LengthMismatch {
                 name: "mask blocks for total rows",
                 expected: expected_blocks,
                 actual: blocks.len(),
@@ -494,7 +441,7 @@ impl<M: TdmMask<MODULUS>, const MODULUS: u32> TdmMask<MODULUS> for RowStackMask<
         input: &[FieldElement<MODULUS>],
         output: &mut [FieldElement<MODULUS>],
         scratch: &mut Self::Scratch,
-    ) -> Result<(), MaskError> {
+    ) -> Result<(), TdmError> {
         let block_rows = self.block_rows;
         check_len("mask input", block_rows, input.len())?;
         check_len("mask output", self.total_rows, output.len())?;
@@ -565,12 +512,12 @@ impl<M: TdmMask<MODULUS>, const MODULUS: u32> TdmMask<MODULUS> for RowStackMask<
     ///
     /// Returns an error if dense dimensions overflow or a block
     /// materialization fails.
-    fn materialize(&self) -> Result<DenseMatrix<MODULUS>, MaskError> {
+    fn materialize(&self) -> Result<DenseMatrix<MODULUS>, TdmError> {
         let block_rows = self.block_rows;
         let length = self
             .total_rows
             .checked_mul(block_rows)
-            .ok_or(MaskError::DimensionOverflow)?;
+            .ok_or(TdmError::DimensionOverflow)?;
         let last = self.blocks.len() - 1;
         if last == 0 {
             let matrix = self.blocks[0].materialize_top_rows(self.total_rows)?;
@@ -590,12 +537,12 @@ impl<M: TdmMask<MODULUS>, const MODULUS: u32> TdmMask<MODULUS> for RowStackMask<
             self.blocks[..last]
                 .par_iter()
                 .map(|block| block.materialize_top_rows(block_rows))
-                .collect::<Result<Vec<_>, MaskError>>()?
+                .collect::<Result<Vec<_>, TdmError>>()?
         } else {
             self.blocks[..last]
                 .iter()
                 .map(|block| block.materialize_top_rows(block_rows))
-                .collect::<Result<Vec<_>, MaskError>>()?
+                .collect::<Result<Vec<_>, TdmError>>()?
         };
         let mut values = Vec::with_capacity(length);
         for matrix in &fulls {
@@ -606,7 +553,7 @@ impl<M: TdmMask<MODULUS>, const MODULUS: u32> TdmMask<MODULUS> for RowStackMask<
         let tail_rows = self.total_rows - last * block_rows;
         let tail_length = tail_rows
             .checked_mul(block_rows)
-            .ok_or(MaskError::DimensionOverflow)?;
+            .ok_or(TdmError::DimensionOverflow)?;
         let last_matrix = self.blocks[last].materialize_top_rows(tail_rows)?;
         check_len("materialized tail rows", tail_rows, last_matrix.rows())?;
         check_len(
@@ -621,6 +568,6 @@ impl<M: TdmMask<MODULUS>, const MODULUS: u32> TdmMask<MODULUS> for RowStackMask<
         )?;
         values.extend_from_slice(last_matrix.values());
 
-        Ok(DenseMatrix::new(self.total_rows, block_rows, values)?)
+        DenseMatrix::new(self.total_rows, block_rows, values)
     }
 }

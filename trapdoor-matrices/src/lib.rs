@@ -5,6 +5,10 @@
 //! `R = S_L Pi_L S Pi_R S_R`, and the RAA-style weighted product
 //! `R = D^T Pi_4 S_3 Pi_3 S_2 Pi_2 S_1 Pi_1 D`.
 //!
+//! The [`TdmMask`] trait abstracts one square construction as an EMVP mask
+//! block, and [`RowStackMask`] stacks square blocks into the rectangular
+//! masks the EMVP protocol hides its encodings behind.
+//!
 //! These are experimental constructions, not production cryptographic
 //! primitives. The Ring-LPN construction relies on structured dual-LPN and has
 //! no settled parameter set. [`IrreducibleRingLpn::sample`] therefore sizes
@@ -21,6 +25,7 @@
 //! formal constant-time audit.
 
 mod error;
+mod mask;
 mod matrix;
 mod parameters;
 mod permutation;
@@ -30,6 +35,7 @@ pub mod testing;
 mod toeplitz;
 
 pub use error::TdmError;
+pub use mask::{RowStackMask, TdmMask};
 pub use matrix::DenseMatrix;
 pub use parameters::{
     ParameterWarning, SecurityAssessment, SecurityLevel, TARGET_SECURITY_BITS, assess,
