@@ -5,33 +5,24 @@
 
 use std::{hint::black_box, sync::OnceLock};
 
-use bench_common as common;
 use criterion::{
-    BatchSize, BenchmarkGroup, BenchmarkId, Criterion, Throughput, criterion_group, criterion_main,
+    BatchSize, BenchmarkGroup, BenchmarkId, Criterion, criterion_group, criterion_main,
     measurement::WallTime,
 };
 use emvp::{
-    AnswerMatrix, DecodingKey, DerivedState, EmvpParams, EncryptedMatrix, EncryptedQuery,
-    ProtocolError, SecretKey, TdmMask, answer_batch, answer_into, decode_into, encrypt, query,
+    AnswerMatrix, EmvpParams, SecretKey, answer_batch, answer_into, decode_into, encrypt, query,
     query_batch, search,
 };
 use prime_field_layer::{FieldElement, PrimeField};
-use rand_chacha::ChaCha20Rng;
-use rand_core::SeedableRng;
 use rayon::{ThreadPool, ThreadPoolBuilder, prelude::*};
-use trapdoor_matrices::{IrreducibleRingLpn, RaaWeightedProduct, ToeplitzFastProduct};
+use trapdoor_matrices::TdmMask;
 
-// NTT-friendly prime: 1_073_479_681 - 1 is divisible by 2^18.
-const MODULUS: u32 = 1_073_479_681;
+mod common;
 
-// Legacy small parameter set, kept for the bench-quick feedback suite. Its
-// online client cases cross the n-row mask-block boundary at rows = n =
-// 1024. The default suite only runs the LLM-scale parameter sets below.
-const PARAMS: EmvpParams = EmvpParams {
-    k: 512,
-    ell: 512,
-    b: 16,
-    lambda: 128,
+use common::{
+    BlockBuilder, LLM_LAMBDA, LLM_RECORD_LENGTHS, LLM_ROW_COUNTS, MODULUS, PARAMS, bench_parameter,
+    derive_with, elements, field_values, protocol_fixtures, protocol_fixtures_batch, raa_block,
+    ring_block, seeded_rng, suite_group, toeplitz_block,
 };
 
 // Quick-mode row counts, picked to keep both sides of the n-row mask-block
@@ -47,15 +38,16 @@ const ANSWER_BATCH: usize = 4;
 // Batch size of the query_batch cases.
 const QUERY_BATCH: usize = 4;
 
-// LLM-scale record lengths: the model's hidden dimension, so `ell = 4096`
-// matches 7B-class weight matrices and `ell = 8192` 70B-class ones. Each
-// suite derives concrete (k, b) from the record length with the same
-// parameter search a production deployment would run.
-const LLM_RECORD_LENGTHS: [usize; 2] = [4096, 8192];
-// LLM-scale matrix heights; 4096 x 4096 is one attention projection and
-// 16384 x 8192 approaches a large FFN layer.
-const LLM_ROW_COUNTS: [usize; 3] = [4096, 8192, 16384];
-const LLM_LAMBDA: u32 = 128;
+// The fixed eight-thread pool keeps every multi-threaded suite case
+// comparable across machines and across saved baselines: without it, cases
+// measured outside an explicit pool inherit rayon's global pool, whose size
+// is whatever the benchmark machine has cores. `answer`, `plaintext`,
+// `query`, and `decode` all install this pool, and every internal rayon
+// site in the library sizes its parallel decision against it.
+fn benchmark_pool() -> &'static ThreadPool {
+    static POOL: OnceLock<ThreadPool> = OnceLock::new();
+    POOL.get_or_init(|| ThreadPoolBuilder::new().num_threads(8).build().unwrap())
+}
 
 // Row counts per phase for one parameter set.
 struct SuiteRows {
@@ -69,112 +61,6 @@ const QUICK_ROWS: SuiteRows = SuiteRows {
     client: &QUICK_CLIENT_ROW_COUNTS,
     server: &QUICK_SERVER_ROW_COUNTS,
 };
-
-// Sparse column weight `t` of the Ring-LPN benchmark blocks' secret `E`,
-// sized to the project policy floor `POLICY_WEIGHT_FLOOR`.
-const TARGET_COLUMN_WEIGHT: usize = 192;
-
-// The fixed eight-thread pool keeps saved answer/plaintext baselines
-// comparable across runs; LLM-scale server cases install it before every
-// measured iteration.
-fn benchmark_pool() -> &'static ThreadPool {
-    static POOL: OnceLock<ThreadPool> = OnceLock::new();
-    POOL.get_or_init(|| ThreadPoolBuilder::new().num_threads(8).build().unwrap())
-}
-
-fn seeded_rng(domain: u8, size: usize) -> ChaCha20Rng {
-    let mut seed = [domain; 32];
-    for (slot, byte) in seed.iter_mut().zip(size.to_le_bytes()) {
-        *slot ^= byte;
-    }
-    ChaCha20Rng::from_seed(seed)
-}
-
-fn field_values(length: usize, domain: u8) -> Vec<FieldElement<MODULUS>> {
-    let field = PrimeField::<MODULUS>::new();
-    let mut values = vec![field.element_u32(0); length];
-    field.fill_uniform(&mut seeded_rng(domain, length), &mut values);
-    values
-}
-
-fn elements(count: usize) -> Throughput {
-    Throughput::Elements(u64::try_from(count).unwrap())
-}
-
-// Standard-suite benchmark IDs keep their historical shape so saved
-// baselines stay comparable; other suites prefix the parameter.
-fn bench_parameter(tag: &str, rows: usize) -> String {
-    if tag.is_empty() {
-        rows.to_string()
-    } else {
-        format!("{tag}-rows{rows}")
-    }
-}
-
-fn suite_group<'a>(
-    criterion: &'a mut Criterion,
-    name: &str,
-    huge: bool,
-) -> BenchmarkGroup<'a, WallTime> {
-    let mut group = criterion.benchmark_group(name);
-    if huge {
-        // LLM-scale iterations cost seconds; fewer samples keep the suite
-        // run time bounded.
-        group.sample_size(10);
-    }
-    group
-}
-
-// One `n x n` Toeplitz mask block, matching the codeword length n = 2k.
-fn toeplitz_block(
-    params: EmvpParams,
-    stream: &mut ChaCha20Rng,
-    _index: usize,
-) -> Result<ToeplitzFastProduct<MODULUS>, ProtocolError> {
-    Ok(ToeplitzFastProduct::sample(params.n()?, stream)?)
-}
-
-// One `n x n` RAA mask block with three nonzero weights per factor.
-fn raa_block(
-    params: EmvpParams,
-    stream: &mut ChaCha20Rng,
-    _index: usize,
-) -> Result<RaaWeightedProduct<MODULUS>, ProtocolError> {
-    Ok(RaaWeightedProduct::sample_nonzero(params.n()?, 3, stream)?)
-}
-
-// One square `n x n` Ring-LPN mask block with a fixed-weight secret, built
-// by the shared deterministic test/benchmark builder.
-fn ring_block(
-    params: EmvpParams,
-    stream: &mut ChaCha20Rng,
-    _index: usize,
-) -> Result<IrreducibleRingLpn<MODULUS>, ProtocolError> {
-    let n = params.n()?;
-    Ok(trapdoor_matrices::testing::ring_block::<MODULUS, _>(
-        n,
-        TARGET_COLUMN_WEIGHT.min(n),
-        stream,
-    )?)
-}
-
-type BlockBuilder<M> = fn(EmvpParams, &mut ChaCha20Rng, usize) -> Result<M, ProtocolError>;
-
-// The expanded long-term secrets for `rows` matrix rows.
-fn derive_with<M: TdmMask<MODULUS>>(
-    params: EmvpParams,
-    rows: usize,
-    domain: u8,
-    build_block: BlockBuilder<M>,
-) -> DerivedState<MODULUS, M> {
-    let mut rng = seeded_rng(domain ^ 0x80, rows);
-    SecretKey::<MODULUS>::new(params, [domain; 32])
-        .unwrap()
-        .derive(rows, &mut rng, |stream, index| {
-            build_block(params, stream, index)
-        })
-        .unwrap()
-}
 
 fn bench_derive_for<M: TdmMask<MODULUS>>(
     group: &mut BenchmarkGroup<'_, WallTime>,
@@ -218,6 +104,9 @@ fn bench_encrypt_for<M: TdmMask<MODULUS>>(
     });
 }
 
+// One query per iteration on the fixed pool: the mask evaluation inside
+// `query` sizes its parallel decision against the installed pool, so the
+// pinned pool keeps the case comparable across machines.
 fn bench_query_for<M: TdmMask<MODULUS>>(
     group: &mut BenchmarkGroup<'_, WallTime>,
     tag: &str,
@@ -232,17 +121,19 @@ fn bench_query_for<M: TdmMask<MODULUS>>(
     // queries with fresh randomness.
     group.bench_function(BenchmarkId::new(label, bench_parameter(tag, rows)), |b| {
         b.iter(|| {
-            let (encrypted_query, decoding_key) =
-                query(black_box(&mut state), black_box(&record)).unwrap();
-            black_box((encrypted_query, decoding_key))
+            benchmark_pool().install(|| {
+                let (encrypted_query, decoding_key) =
+                    query(black_box(&mut state), black_box(&record)).unwrap();
+                black_box((encrypted_query, decoding_key))
+            })
         });
     });
 }
 
-// One query batch per iteration, either through `query_batch` on the rayon
-// global pool or, as the pre-batch reference, through a sequential
-// `query` loop holding the same derived state. The counter keeps advancing
-// across iterations, so both variants generate fresh randomness each time.
+// One query batch per iteration, either through `query_batch` on the fixed
+// pool or, as the pre-batch reference, through a sequential `query` loop
+// holding the same derived state. The counter keeps advancing across
+// iterations, so both variants generate fresh randomness each time.
 fn bench_query_batch_for<M: TdmMask<MODULUS>>(
     group: &mut BenchmarkGroup<'_, WallTime>,
     tag: &str,
@@ -258,17 +149,22 @@ fn bench_query_batch_for<M: TdmMask<MODULUS>>(
     group.bench_function(
         BenchmarkId::new(format!("batch{batch}"), bench_parameter(tag, rows)),
         |b| {
-            b.iter(|| black_box(query_batch(black_box(&mut state), &queries).unwrap()));
+            b.iter(|| {
+                benchmark_pool()
+                    .install(|| black_box(query_batch(black_box(&mut state), &queries).unwrap()))
+            });
         },
     );
     group.bench_function(
         BenchmarkId::new(format!("serial{batch}"), bench_parameter(tag, rows)),
         |b| {
             b.iter(|| {
-                for _ in 0..batch {
-                    let artifacts = query(black_box(&mut state), black_box(&record)).unwrap();
-                    black_box(artifacts);
-                }
+                benchmark_pool().install(|| {
+                    for _ in 0..batch {
+                        let artifacts = query(black_box(&mut state), black_box(&record)).unwrap();
+                        black_box(artifacts);
+                    }
+                });
             });
         },
     );
@@ -306,48 +202,6 @@ fn bench_plaintext(
             });
         },
     );
-}
-
-// One client run producing the encrypted matrix plus `count` queries with
-// decoding keys, shared by the answer and decode phases. Fixture building
-// happens once per case, never per iteration.
-fn protocol_fixtures_batch(
-    params: EmvpParams,
-    rows: usize,
-    count: usize,
-) -> (
-    EncryptedMatrix<MODULUS>,
-    Vec<EncryptedQuery<MODULUS>>,
-    Vec<DecodingKey<MODULUS>>,
-) {
-    let mut state = derive_with(params, rows, 0x06, toeplitz_block);
-    let matrix = field_values(rows * params.ell, 0x07);
-    let record = field_values(params.ell, 0x08);
-    let encrypted = encrypt(&mut state, &matrix).unwrap();
-    let mut queries = Vec::with_capacity(count);
-    let mut decoding_keys = Vec::with_capacity(count);
-    for _ in 0..count {
-        let (encrypted_query, decoding_key) = query(&mut state, &record).unwrap();
-        queries.push(encrypted_query);
-        decoding_keys.push(decoding_key);
-    }
-    (encrypted, queries, decoding_keys)
-}
-
-fn protocol_fixtures(
-    params: EmvpParams,
-    rows: usize,
-) -> (
-    EncryptedMatrix<MODULUS>,
-    EncryptedQuery<MODULUS>,
-    DecodingKey<MODULUS>,
-) {
-    let (encrypted, mut queries, mut decoding_keys) = protocol_fixtures_batch(params, rows, 1);
-    (
-        encrypted,
-        queries.pop().unwrap(),
-        decoding_keys.pop().unwrap(),
-    )
 }
 
 fn bench_answer(
@@ -434,12 +288,15 @@ fn bench_decode(
         BenchmarkId::from_parameter(bench_parameter(tag, rows)),
         |b| {
             b.iter(|| {
-                decode_into(
-                    black_box(&answer_matrix),
-                    black_box(&decoding_key),
-                    black_box(&mut output),
-                )
-                .unwrap();
+                benchmark_pool()
+                    .install(|| {
+                        decode_into(
+                            black_box(&answer_matrix),
+                            black_box(&decoding_key),
+                            black_box(&mut output),
+                        )
+                    })
+                    .unwrap();
                 black_box(&output);
             });
         },
@@ -533,7 +390,7 @@ fn run_suite(criterion: &mut Criterion, tag: &str, params: EmvpParams, counts: &
                 benchmark_pool(),
             );
         }
-        if !huge && common::calibration_enabled() {
+        if !huge && bench_common::calibration_enabled() {
             for &rows in &ANSWER_CALIBRATION_ROW_COUNTS {
                 bench_answer(&mut answer_group, tag, params, rows, benchmark_pool());
             }
@@ -582,7 +439,7 @@ fn llm_benches(criterion: &mut Criterion) {
 }
 
 fn protocol_benches(c: &mut Criterion) {
-    if common::is_quick() {
+    if bench_common::is_quick() {
         // Fast feedback suite: the legacy parameter set at a few small row
         // counts, keeping both sides of the mask-block boundary in every
         // phase.
@@ -593,7 +450,7 @@ fn protocol_benches(c: &mut Criterion) {
 }
 
 fn criterion_config() -> Criterion {
-    common::criterion_default()
+    bench_common::criterion_default()
 }
 
 criterion_group! {
