@@ -37,6 +37,10 @@ name = "protocol"
 harness = false
 
 [[bench]]
+name = "online"
+harness = false
+
+[[bench]]
 name = "gpu"
 harness = false
 required-features = ["gpu"]
