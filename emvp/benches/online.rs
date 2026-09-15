@@ -32,7 +32,7 @@
 //! are shared with the `protocol` suite (`mod common`), so numbers refer to
 //! identical seeded artifacts.
 
-use std::{hint::black_box, sync::OnceLock};
+use std::hint::black_box;
 
 use criterion::{
     BenchmarkGroup, BenchmarkId, Criterion, criterion_group, criterion_main, measurement::WallTime,
@@ -43,31 +43,21 @@ use emvp::{
 };
 use prime_field_layer::arithmetic_kernels::dot_product;
 use prime_field_layer::{FieldElement, PrimeField};
-use rayon::{ThreadPool, ThreadPoolBuilder};
+use rayon::ThreadPool;
 use trapdoor_matrices::TdmMask;
 
 mod common;
 
 use common::{
-    BlockBuilder, LLM_LAMBDA, LLM_RECORD_LENGTHS, LLM_ROW_COUNTS, MODULUS, PARAMS, bench_parameter,
-    derive_with, elements, field_values, protocol_fixtures, raa_block, ring_block, suite_group,
-    toeplitz_block,
+    BlockBuilder, LLM_LAMBDA, LLM_RECORD_LENGTHS, LLM_ROW_COUNTS, MODULUS, MaskSuite, PARAMS,
+    SUITE_RAA, SUITE_RING, SUITE_TOEPLITZ, bench_parameter, derive_with, elements, field_values,
+    protocol_fixtures, raa_block, ring_block, serial_pool, suite_group, toeplitz_block,
 };
 
 // Quick-mode row counts for the legacy parameter set: they keep both sides
 // of the n-row mask-block boundary (rows = n = 1024) plus the one-row tail
 // block at 1025 in every case.
 const QUICK_ROW_COUNTS: [usize; 3] = [128, 1024, 1025];
-
-// The one-thread pool behind the fairness contract: rayon work installed
-// here stays on a single worker, and `rayon::current_num_threads()` inside
-// the library reports one, which pins every internal serial/parallel
-// decision to its serial tier.
-#[must_use]
-fn serial_pool() -> &'static ThreadPool {
-    static POOL: OnceLock<ThreadPool> = OnceLock::new();
-    POOL.get_or_init(|| ThreadPoolBuilder::new().num_threads(1).build().unwrap())
-}
 
 // A derived client state and its encrypted matrix, sharing one instance:
 // everything the full online round trip needs.
@@ -81,9 +71,10 @@ struct OnlineFixtures<M: TdmMask<MODULUS>> {
 fn online_fixtures<M: TdmMask<MODULUS>>(
     params: EmvpParams,
     rows: usize,
+    suite: MaskSuite,
     build_block: BlockBuilder<M>,
 ) -> OnlineFixtures<M> {
-    let mut state = derive_with(params, rows, 0x06, build_block);
+    let mut state = derive_with(params, rows, 0x06, suite.context, build_block);
     let matrix = field_values(rows * params.ell, 0x07);
     let encrypted = encrypt(&mut state, &matrix).unwrap();
     let record = field_values(params.ell, 0x08);
@@ -99,17 +90,17 @@ fn online_fixtures<M: TdmMask<MODULUS>>(
 fn bench_query_case<M: TdmMask<MODULUS>>(
     group: &mut BenchmarkGroup<'_, WallTime>,
     tag: &str,
-    label: &str,
+    suite: MaskSuite,
     params: EmvpParams,
     rows: usize,
     build_block: BlockBuilder<M>,
     pool: &ThreadPool,
 ) {
-    let mut state = derive_with(params, rows, 0x03, build_block);
+    let mut state = derive_with(params, rows, 0x03, suite.context, build_block);
     let record = field_values(params.ell, 0x04);
     group.throughput(elements(rows * params.ell));
     group.bench_function(
-        BenchmarkId::new(format!("{label}/query"), bench_parameter(tag, rows)),
+        BenchmarkId::new(format!("{}/query", suite.label), bench_parameter(tag, rows)),
         |b| {
             b.iter(|| {
                 pool.install(|| {
@@ -130,7 +121,7 @@ fn bench_query_case<M: TdmMask<MODULUS>>(
 fn bench_total_case<M: TdmMask<MODULUS>>(
     group: &mut BenchmarkGroup<'_, WallTime>,
     tag: &str,
-    label: &str,
+    suite: MaskSuite,
     params: EmvpParams,
     rows: usize,
     build_block: BlockBuilder<M>,
@@ -140,13 +131,13 @@ fn bench_total_case<M: TdmMask<MODULUS>>(
         mut state,
         encrypted,
         record,
-    } = online_fixtures(params, rows, build_block);
+    } = online_fixtures(params, rows, suite, build_block);
     let zero = PrimeField::<MODULUS>::new().element_u32(0);
     let blocks = params.blocks().unwrap();
     let mut decoded = vec![zero; rows];
     group.throughput(elements(rows * params.ell));
     group.bench_function(
-        BenchmarkId::new(format!("{label}/total"), bench_parameter(tag, rows)),
+        BenchmarkId::new(format!("{}/total", suite.label), bench_parameter(tag, rows)),
         |b| {
             b.iter(|| {
                 pool.install(|| {
@@ -294,7 +285,7 @@ fn run_suite(criterion: &mut Criterion, tag: &str, params: EmvpParams, row_count
         bench_query_case(
             &mut group,
             tag,
-            "toeplitz",
+            SUITE_TOEPLITZ,
             params,
             rows,
             toeplitz_block,
@@ -303,16 +294,16 @@ fn run_suite(criterion: &mut Criterion, tag: &str, params: EmvpParams, row_count
         bench_total_case(
             &mut group,
             tag,
-            "toeplitz",
+            SUITE_TOEPLITZ,
             params,
             rows,
             toeplitz_block,
             pool,
         );
-        bench_query_case(&mut group, tag, "raa", params, rows, raa_block, pool);
-        bench_total_case(&mut group, tag, "raa", params, rows, raa_block, pool);
-        bench_query_case(&mut group, tag, "ring", params, rows, ring_block, pool);
-        bench_total_case(&mut group, tag, "ring", params, rows, ring_block, pool);
+        bench_query_case(&mut group, tag, SUITE_RAA, params, rows, raa_block, pool);
+        bench_total_case(&mut group, tag, SUITE_RAA, params, rows, raa_block, pool);
+        bench_query_case(&mut group, tag, SUITE_RING, params, rows, ring_block, pool);
+        bench_total_case(&mut group, tag, SUITE_RING, params, rows, ring_block, pool);
         bench_answer_case(&mut group, tag, params, rows, pool);
         bench_decode_case(&mut group, tag, params, rows, pool);
         bench_plaintext_case(&mut group, tag, params, rows, pool);

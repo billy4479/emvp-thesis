@@ -66,10 +66,6 @@ impl<const MODULUS: u32> PrimeField<MODULUS> {
     /// `[0, p)`.
     #[inline(always)]
     pub(crate) fn montgomery_mul(lhs: u32, rhs: u32) -> u32 {
-        if MODULUS == 2 {
-            return lhs & rhs;
-        }
-
         let product = u64::from(lhs) * u64::from(rhs);
         let adjustment = (product as u32).wrapping_mul(Self::MONTGOMERY_NEG_INV);
         let sum = product.wrapping_add(u64::from(adjustment) * u64::from(MODULUS));
@@ -81,10 +77,6 @@ impl<const MODULUS: u32> PrimeField<MODULUS> {
     /// Scalar Montgomery multiplication expressed to favor conditional moves.
     #[inline(always)]
     pub(crate) fn montgomery_mul_scalar(lhs: u32, rhs: u32) -> u32 {
-        if MODULUS == 2 {
-            return lhs & rhs;
-        }
-
         let product = u64::from(lhs) * u64::from(rhs);
         let adjustment = (product as u32).wrapping_mul(Self::MONTGOMERY_NEG_INV);
         let (sum, carry) = product.overflowing_add(u64::from(adjustment) * u64::from(MODULUS));
@@ -95,9 +87,6 @@ impl<const MODULUS: u32> PrimeField<MODULUS> {
 
     #[inline(always)]
     pub(crate) fn to_montgomery(value: u32) -> u32 {
-        if MODULUS == 2 {
-            return value & 1;
-        }
         // REDC accepts this full-width u32 directly: R2 < p and value < R,
         // so value * R2 < R * p. Canonicalization before conversion is not
         // required.
@@ -106,17 +95,10 @@ impl<const MODULUS: u32> PrimeField<MODULUS> {
 
     #[inline(always)]
     pub(crate) fn from_montgomery(value: u32) -> u32 {
-        if MODULUS == 2 {
-            return value;
-        }
         Self::montgomery_mul_scalar(value, 1)
     }
 
     pub(crate) fn pow_montgomery(mut base: u32, mut exponent: u64) -> u32 {
-        if MODULUS == 2 {
-            return if exponent == 0 { 1 } else { base };
-        }
-
         let mut result = Self::MONTGOMERY_ONE;
         while exponent != 0 {
             if exponent & 1 == 1 {

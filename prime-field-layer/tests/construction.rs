@@ -7,7 +7,6 @@ fn accepts<const MODULUS: u32>() {
 
 #[test]
 fn accepts_representative_primes() {
-    accepts::<2>();
     accepts::<3>();
     accepts::<5>();
     accepts::<17>();
@@ -25,7 +24,6 @@ fn check_two_adicity<const MODULUS: u32>(expected: u32) {
 
 #[test]
 fn reports_two_adicity() {
-    check_two_adicity::<2>(0);
     check_two_adicity::<3>(1);
     check_two_adicity::<17>(4);
     check_two_adicity::<65_537>(16);

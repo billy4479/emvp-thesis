@@ -5,12 +5,16 @@
 
 //! Canonical wire codec throughput at protocol-representative sizes.
 //!
-//! The fixtures mirror the compiled deployment shapes: an encrypted matrix
-//! at the LLM-scale record length, an evaluation batch of 64 encrypted
-//! queries, and a products response of eight answer matrices. Byte counts
-//! cover the full frame, header included.
+//! All fixtures share one `EmvpParams` so every count is semantically
+//! consistent: the upload matrix is the encrypted `rows x n` matrix the
+//! parameters produce (`columns = n = 2k`), the evaluation batch carries 64
+//! encrypted queries of width `n`, and each products answer is the
+//! `rows x blocks` matrix the server returns with `blocks = n / b = 64`.
+//! The representative case is the 64-query evaluation answered by 64
+//! answer matrices. Byte counts cover the full frame, header included.
 
 use std::io::Cursor;
+use std::time::Duration;
 
 use criterion::{Criterion, Throughput, criterion_group, criterion_main};
 use emvp::{AnswerMatrix, EmvpParams, EncryptedMatrix, EncryptedQuery};
@@ -20,22 +24,26 @@ use emvp_network::{
 };
 use prime_field_layer::PrimeField;
 
-/// Matrix shape for the upload fixture: 4096 x 1024 field elements.
+/// Matrix shape for the upload fixture: `4096 x n` field elements, the
+/// encrypted form of a 4096 x `ell` plaintext at the LLM-scale record
+/// length.
 const UPLOAD_ROWS: usize = 4096;
 const UPLOAD_COLUMNS: usize = 1024;
 
 /// Encrypted queries per evaluation entry.
 const EVALUATE_QUERIES: usize = 64;
 
-/// Query width `n` of the evaluation fixture.
+/// Query width `n` of the evaluation fixture (`n = 2k` of [`PARAMS`]).
 const QUERY_WIDTH: usize = 1024;
 
-/// Answered matrices per products entry.
-const PRODUCT_ENTRIES_ANSWERS: usize = 8;
+/// Answered matrices per products entry: one answer per query in the
+/// representative 64-query evaluation.
+const PRODUCT_ENTRIES_ANSWERS: usize = 64;
 
-/// Answer shape of the products fixture: 4096 rows x 16 blocks.
+/// Answer shape of the products fixture: `4096` rows x `blocks = n / b`
+/// blocks, the answer shape [`PARAMS`] produces.
 const ANSWER_ROWS: usize = 4096;
-const ANSWER_BLOCKS: usize = 16;
+const ANSWER_BLOCKS: usize = 64;
 
 const PARAMS: EmvpParams = EmvpParams {
     k: 512,
@@ -118,6 +126,12 @@ fn encoded_products() -> Vec<u8> {
 
 fn bench_codec(criterion: &mut Criterion) {
     let mut group = criterion.benchmark_group("codec");
+    // The representative products frame carries 64 MiB of answers; fewer
+    // samples keep the six-case group bounded without shrinking the
+    // representative fixtures.
+    group.sample_size(20);
+    group.warm_up_time(Duration::from_millis(500));
+    group.measurement_time(Duration::from_secs(2));
 
     let upload = upload_fixture();
     let evaluate = evaluate_fixture();

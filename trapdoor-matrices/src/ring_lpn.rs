@@ -4,33 +4,40 @@
 //! multiplier `a` are public. The sparse `2K`-by-`K` matrix `E` is secret, and
 //! the materialized matrix is `H E`. No parameter set for this construction is
 //! settled; sampling validates the requested parameters against
-//! [`crate::assess`] and reports the outcome as warnings while still
-//! constructing the instance.
+//! [`crate::assess`] and fails closed on a broken assessment, returning the
+//! sound and marginal outcomes together with the assessment as warnings.
 //!
 //! Sparse evaluation indexes memory using the secret support of `E`. Its memory
 //! access pattern can therefore leak that support. Secret matrices, scratch
 //! buffers, and intermediate values are not zeroized on drop.
+//!
+//! Note that the supported base fields are the odd primes of
+//! `prime_field_layer`; `F_2` is unsupported and cannot instantiate this
+//! construction at all.
 
 use prime_field_layer::{ExtensionField, ExtensionFieldScratch, FieldElement, PrimeField};
 use rand_core::CryptoRng;
 
 use super::error::check_len;
-use super::parameters::{ParameterWarning, assess, automatic_ring_modulus};
+use super::parameters::{
+    ParameterWarning, SecurityAssessment, SecurityLevel, assess, automatic_ring_modulus,
+};
+use super::permutation::sample_below;
 use crate::{DenseMatrix, TdmError};
 
-/// Maximum whole-matrix resampling attempts while avoiding empty columns.
+/// Maximum redrawing attempts for a single Bernoulli column.
 ///
-/// The probability that one Bernoulli matrix has no empty column is
-/// `(1 - (1 - weight/(2K))^{2K})^K`, which collapses to about `e^{-K}` for
-/// `weight << K`: the budget is sized for the policy weight regime
-/// (`weight` of the order of the policy floor, 192 in `crate::parameters`),
-/// where the
-/// probability of exhausting it is astronomically small. At tiny weights and
-/// large degrees (say `K = 2048, weight = 1`, which `validate_weight`
-/// accepts) each attempt succeeds with probability about `2^{-1300}` and
-/// sampling deterministically fails after `2K^2` draws per attempt, so the
-/// budget error is the only sane outcome for a request that cannot be
-/// sampled.
+/// One column draw is empty with probability `(1 - weight/(2K))^{2K}`, which
+/// is about `e^{-weight}`, so the probability of exhausting this many
+/// independent redraws of that one column is about `e^{-1024 * weight}`:
+/// astronomically small for every weight the policy accepts, since
+/// `IrreducibleRingLpn::validate_weight` rejects zero before sampling. Unlike
+/// a whole-matrix retry budget, whose success probability collapses as
+/// `e^{-K * weight}` with the degree, the per-column budget does not depend
+/// on `K`, so requests such as `K = 2048, weight = 1` — which whole-matrix
+/// rejection could essentially never sample — draw each column in a handful
+/// of attempts, and the budget error remains the only sane outcome for a
+/// request that somehow cannot be sampled.
 const MAX_EMPTY_COLUMN_RETRIES: usize = 1024;
 
 /// A matrix in compressed sparse column format.
@@ -167,20 +174,22 @@ impl<const MODULUS: u32> IrreducibleRingLpn<MODULUS> {
     /// Constructs an instance and verifies that the public polynomial `f` is
     /// irreducible.
     ///
-    /// The public multiplier is canonicalized coefficient by coefficient. The
-    /// supplied sparse matrix is retained as the secret `E`.
+    /// The public multiplier is canonicalized coefficient by coefficient and
+    /// must hold exactly `K` coefficients. The supplied sparse matrix is
+    /// retained as the secret `E`.
     ///
     /// # Errors
     ///
-    /// Returns an error if `K` is zero, dimensions overflow, `E` is not
-    /// `2K`-by-`K`, or extension-field construction fails.
+    /// Returns an error if `K` is zero, the multiplier length differs from
+    /// `K`, dimensions overflow, `E` is not `2K`-by-`K`, or extension-field
+    /// construction fails.
     pub fn new(
         k: usize,
         modulus: &[u32],
         multiplier: &[u32],
         sparse_matrix: SparseMatrix<MODULUS>,
     ) -> Result<Self, TdmError> {
-        Self::validate_dimensions(k, &sparse_matrix)?;
+        Self::validate_dimensions(k, multiplier, &sparse_matrix)?;
         let extension = ExtensionField::<MODULUS>::new(k, modulus)?;
         Ok(Self::from_parts(k, extension, multiplier, sparse_matrix))
     }
@@ -189,19 +198,21 @@ impl<const MODULUS: u32> IrreducibleRingLpn<MODULUS> {
     /// polynomial `f` is irreducible.
     ///
     /// This skips only the irreducibility test. The extension-field constructor
-    /// still validates the polynomial's length and monicity.
+    /// still validates the polynomial's length and monicity. The multiplier
+    /// must hold exactly `K` coefficients.
     ///
     /// # Errors
     ///
-    /// Returns an error if `K` is zero, dimensions overflow, `E` is not
-    /// `2K`-by-`K`, or extension-ring construction fails.
+    /// Returns an error if `K` is zero, the multiplier length differs from
+    /// `K`, dimensions overflow, `E` is not `2K`-by-`K`, or extension-ring
+    /// construction fails.
     pub fn new_unchecked_irreducible(
         k: usize,
         modulus: &[u32],
         multiplier: &[u32],
         sparse_matrix: SparseMatrix<MODULUS>,
     ) -> Result<Self, TdmError> {
-        Self::validate_dimensions(k, &sparse_matrix)?;
+        Self::validate_dimensions(k, multiplier, &sparse_matrix)?;
         let extension = ExtensionField::<MODULUS>::new_unchecked_irreducible(k, modulus)?;
         Ok(Self::from_parts(k, extension, multiplier, sparse_matrix))
     }
@@ -217,24 +228,33 @@ impl<const MODULUS: u32> IrreducibleRingLpn<MODULUS> {
     /// Each of the `2K^2` cells of the secret `E` receives one exact
     /// Bernoulli trial with probability `weight / (2K)`; a selected cell is
     /// uniform in `F_q*`. An empty column would make the corresponding
-    /// column of `HE` identically zero, so any empty column resamples the
-    /// whole matrix. The weight must be positive and at most `K`.
+    /// column of `HE` identically zero, so a column that comes out empty is
+    /// redrawn — alone, leaving every other column's first draw untouched —
+    /// until it is nonempty. The stored columns are therefore draws from the
+    /// per-cell Bernoulli column distribution conditioned on being nonempty,
+    /// which slightly raises the per-column weight above its expectation.
+    /// The weight must be positive and at most `K`.
     ///
-    /// The returned warnings carry the [`crate::assess`] assessment of
-    /// `(K, weight)`; the instance is constructed regardless.
+    /// Sampling fails closed: a [`SecurityLevel::Broken`] assessment of
+    /// `(K, weight)` returns [`TdmError::InsecureParameters`] before any
+    /// random material is drawn. A sound or marginal assessment constructs
+    /// the instance and returns the assessment as warnings.
     ///
     /// # Errors
     ///
     /// Returns an error for zero `K`, a zero or oversized weight, an
-    /// unsupported field/degree pair, sampling failures, or a failed
-    /// extension-ring construction.
+    /// unsupported field/degree pair, a broken security assessment, sampling
+    /// failures, or a failed extension-ring construction.
     pub fn sample<R: CryptoRng + ?Sized>(
         k: usize,
         weight: usize,
         rng: &mut R,
     ) -> Result<SampledIrreducibleRingLpn<MODULUS>, TdmError> {
+        Self::checked_rows(k)?;
+        Self::validate_weight(k, weight)?;
         let modulus = automatic_ring_modulus::<MODULUS>(k)?;
         let assessment = assess::<MODULUS>(k, weight);
+        Self::reject_broken_assessment(k, weight, &assessment)?;
         let instance = Self::sample_parts(k, weight, &modulus, false, rng)?;
         Ok(SampledIrreducibleRingLpn {
             instance,
@@ -247,25 +267,50 @@ impl<const MODULUS: u32> IrreducibleRingLpn<MODULUS> {
     /// The supplied `modulus` is canonicalized and verified to be irreducible
     /// with Rabin's deterministic test, which can be expensive at large `K`.
     /// The remaining sampling behavior matches [`Self::sample`], and the
-    /// returned warnings carry the same assessment.
+    /// returned warnings carry the same assessment. Like [`Self::sample`],
+    /// this fails closed: a broken assessment aborts before the modulus is
+    /// verified or the matrix is sampled.
     ///
     /// # Errors
     ///
-    /// Returns an error for zero `K`, a zero or oversized weight, an invalid
-    /// or reducible modulus, sampling failures, or a failed extension-ring
-    /// construction.
+    /// Returns an error for zero `K`, a zero or oversized weight, a broken
+    /// security assessment, an invalid or reducible modulus, sampling
+    /// failures, or a failed extension-ring construction.
     pub fn sample_with_modulus<R: CryptoRng + ?Sized>(
         k: usize,
         weight: usize,
         modulus: &[u32],
         rng: &mut R,
     ) -> Result<SampledIrreducibleRingLpn<MODULUS>, TdmError> {
+        Self::checked_rows(k)?;
+        Self::validate_weight(k, weight)?;
         let assessment = assess::<MODULUS>(k, weight);
+        Self::reject_broken_assessment(k, weight, &assessment)?;
         let instance = Self::sample_parts(k, weight, modulus, true, rng)?;
         Ok(SampledIrreducibleRingLpn {
             instance,
             warnings: assessment.warnings,
         })
+    }
+
+    /// Fails closed when the assessment rated the parameters broken.
+    ///
+    /// There is deliberately no sampling entry point that bypasses this
+    /// check; callers who need instances outside the assessed regime must
+    /// construct them explicitly from parts.
+    fn reject_broken_assessment(
+        k: usize,
+        weight: usize,
+        assessment: &SecurityAssessment,
+    ) -> Result<(), TdmError> {
+        if assessment.level == SecurityLevel::Broken {
+            return Err(TdmError::InsecureParameters {
+                degree: k,
+                weight,
+                reasons: assessment.broken_reasons(),
+            });
+        }
+        Ok(())
     }
 
     fn sample_parts<R: CryptoRng + ?Sized>(
@@ -344,13 +389,17 @@ impl<const MODULUS: u32> IrreducibleRingLpn<MODULUS> {
 
     /// Applies `H E` without allocating when `scratch` is reused.
     ///
-    /// The output remains unchanged if validation or extension multiplication
-    /// fails. Sparse accumulation performs secret-dependent memory accesses.
+    /// All input, output, and scratch lengths are checked before any scratch
+    /// buffer or `output` is changed, so a scratch borrowed from an instance
+    /// of a different degree — smaller or larger — is rejected while the
+    /// output keeps its previous value. Sparse accumulation performs
+    /// secret-dependent memory accesses.
     ///
     /// # Errors
     ///
-    /// Returns an error for an input or output length mismatch, or if the
-    /// reusable extension-field multiplication kernel fails.
+    /// Returns an error for an input or output length mismatch, a scratch
+    /// buffer that does not match this instance's dimensions, or a failure in
+    /// the reusable extension-field multiplication kernel.
     pub fn apply(
         &self,
         input: &[FieldElement<MODULUS>],
@@ -359,6 +408,14 @@ impl<const MODULUS: u32> IrreducibleRingLpn<MODULUS> {
     ) -> Result<(), TdmError> {
         check_len("input", self.k, input.len())?;
         check_len("output", self.k, output.len())?;
+        check_len(
+            "scratch sparse product",
+            self.sparse_matrix.rows(),
+            scratch.sparse_product.len(),
+        )?;
+        check_len("scratch u0", self.k, scratch.u0.len())?;
+        check_len("scratch u1", self.k, scratch.u1.len())?;
+        check_len("scratch result", self.k, scratch.result.len())?;
 
         self.sparse_matrix.apply(input, &mut scratch.sparse_product);
         for index in 0..self.k {
@@ -408,8 +465,10 @@ impl<const MODULUS: u32> IrreducibleRingLpn<MODULUS> {
 
     fn validate_dimensions(
         k: usize,
+        multiplier: &[u32],
         sparse_matrix: &SparseMatrix<MODULUS>,
     ) -> Result<(), TdmError> {
+        check_len("multiplier", k, multiplier.len())?;
         let rows = Self::checked_rows(k)?;
         check_len("sparse matrix rows", rows, sparse_matrix.rows())?;
         check_len("sparse matrix columns", k, sparse_matrix.columns())
@@ -444,10 +503,11 @@ impl<const MODULUS: u32> IrreducibleRingLpn<MODULUS> {
 
 /// A sampled instance together with its security-parameter assessment.
 ///
-/// Sampling constructs the instance regardless of the assessment outcome;
-/// the warnings describe how the requested `(K, weight)` pair compares with
-/// the target security policy. An empty warning slice means every assessment
-/// check passed.
+/// Sampling fails closed on a [`SecurityLevel::Broken`] assessment with
+/// [`TdmError::InsecureParameters`], so a returned sample was assessed sound
+/// or marginal. The warnings describe how the requested `(K, weight)` pair
+/// compares with the target security policy; an empty warning slice means
+/// every assessment check passed.
 pub struct SampledIrreducibleRingLpn<const MODULUS: u32> {
     instance: IrreducibleRingLpn<MODULUS>,
     warnings: Vec<ParameterWarning>,
@@ -484,9 +544,14 @@ impl<const MODULUS: u32> SampledIrreducibleRingLpn<MODULUS> {
 
 /// Samples the secret Bernoulli matrix `E` with no empty column.
 ///
-/// Each cell is nonzero with exact probability `weight / rows`, and selected
-/// cells are uniform in `F_q*`. Whole matrices are resampled until no column
-/// is empty; see [`MAX_EMPTY_COLUMN_RETRIES`] for the budget.
+/// Every cell is nonzero with exact probability `weight / rows`, and selected
+/// cells are uniform in `F_q*`. Each column is finalized independently: a
+/// column whose draw comes out empty is redrawn alone, up to
+/// [`MAX_EMPTY_COLUMN_RETRIES`] attempts, so the stored column is a draw from
+/// the per-cell Bernoulli column distribution conditioned on being nonempty
+/// while every other column keeps its first draw. The RNG stream therefore
+/// stays deterministic for a given seed, with consumption that depends on how
+/// often columns came out empty.
 fn sample_bernoulli_matrix<const MODULUS: u32, R: CryptoRng + ?Sized>(
     k: usize,
     rows: usize,
@@ -494,30 +559,49 @@ fn sample_bernoulli_matrix<const MODULUS: u32, R: CryptoRng + ?Sized>(
     rng: &mut R,
 ) -> Result<SparseMatrix<MODULUS>, TdmError> {
     let offsets_capacity = k.checked_add(1).ok_or(TdmError::DimensionOverflow)?;
-    // Each column is nonzero with probability `weight / rows`, so the
-    // expected nonzero count is `k * weight`. Reserving it up front bounds
-    // the entry storage without reallocation, which also keeps the
-    // allocator's timing independent of how the support happened to land.
+    // The expected nonzero count is `k * weight`; reserving it up front is a
+    // capacity hint that bounds typical growth. Columns are conditioned to be
+    // nonempty and the selected cells land randomly, so the final count
+    // varies with the support: the reservation does not prevent
+    // reallocation, and allocation behavior remains dependent on the
+    // sampled data.
     let expected_entries = k.checked_mul(weight).ok_or(TdmError::DimensionOverflow)?;
     let field = PrimeField::<MODULUS>::new();
+    let mut offsets = Vec::with_capacity(offsets_capacity);
+    let mut row_indices = Vec::with_capacity(expected_entries);
+    let mut values = Vec::with_capacity(expected_entries);
+    offsets.push(0);
+    for _column in 0..k {
+        sample_nonempty_column(rows, weight, field, &mut row_indices, &mut values, rng)?;
+        offsets.push(row_indices.len());
+    }
+    SparseMatrix::new(rows, k, offsets, row_indices, values)
+}
+
+/// Samples one nonempty Bernoulli column, redrawing only that column.
+///
+/// Each attempt walks the column's cells in row order: cell `row` is selected
+/// with exact probability `weight / rows` and a selected cell is uniform in
+/// `F_q*`. An empty attempt is discarded — it pushed nothing — and retried;
+/// see [`MAX_EMPTY_COLUMN_RETRIES`] for the budget.
+fn sample_nonempty_column<const MODULUS: u32, R: CryptoRng + ?Sized>(
+    rows: usize,
+    weight: usize,
+    field: PrimeField<MODULUS>,
+    row_indices: &mut Vec<usize>,
+    values: &mut Vec<FieldElement<MODULUS>>,
+    rng: &mut R,
+) -> Result<(), TdmError> {
     for _attempt in 0..MAX_EMPTY_COLUMN_RETRIES {
-        let mut offsets = Vec::with_capacity(offsets_capacity);
-        let mut row_indices = Vec::with_capacity(expected_entries);
-        let mut values = Vec::with_capacity(expected_entries);
-        offsets.push(0);
-        for _column in 0..k {
-            for row in 0..rows {
-                if super::permutation::sample_below(rng, rows)? < weight {
-                    row_indices.push(row);
-                    values.push(field.sample_uniform_nonzero(rng));
-                }
+        let start = row_indices.len();
+        for row in 0..rows {
+            if sample_below(rng, rows)? < weight {
+                row_indices.push(row);
+                values.push(field.sample_uniform_nonzero(rng));
             }
-            offsets.push(row_indices.len());
         }
-        let matrix = SparseMatrix::new(rows, k, offsets, row_indices, values)?;
-        let has_empty_column = matrix.offsets().windows(2).any(|pair| pair[0] == pair[1]);
-        if !has_empty_column {
-            return Ok(matrix);
+        if row_indices.len() > start {
+            return Ok(());
         }
     }
     Err(TdmError::SamplingRetryBudgetExhausted {

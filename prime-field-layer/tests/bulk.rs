@@ -3,7 +3,7 @@
     reason = "test inputs establish that these operations must succeed"
 )]
 
-use prime_field_layer::{FieldElement, FieldError, PrimeField};
+use prime_field_layer::{FieldError, PrimeField};
 
 const PSEUDO_MERSENNE_32_MODULUS: u32 = 4_294_967_291;
 
@@ -60,30 +60,6 @@ fn elementwise_kernels_match_scalar_operations() {
     check_elementwise::<17>();
     check_elementwise::<65_537>();
     check_elementwise::<4_294_967_291>();
-}
-
-#[test]
-fn f2_multiplication_matches_boolean_and() {
-    // F2 takes the `MODULUS == 2` specializations in the Montgomery kernels:
-    // the Montgomery product degenerates to a bitwise AND of the bits.
-    let field = PrimeField::<2>::new();
-    for lhs in 0..2_u32 {
-        for rhs in 0..2_u32 {
-            assert_eq!(field.mul(lhs, rhs), lhs & rhs);
-            let mut values = [lhs, rhs, 1, 0].map(|value| field.element_u32(value));
-            field
-                .mul_elements_assign(&mut values, &[rhs, lhs, 1, 0].map(|v| field.element_u32(v)))
-                .unwrap();
-            assert_eq!(
-                values.map(FieldElement::value),
-                [lhs & rhs, lhs & rhs, 1, 0]
-            );
-        }
-    }
-    let one = PrimeField::<2>::new().element_u32(1);
-    let zero = PrimeField::<2>::new().element_u32(0);
-    assert_eq!((one * one).value(), 1);
-    assert_eq!((one * zero).value(), 0);
 }
 
 fn check_unary_and_scalar<const MODULUS: u32>() {
@@ -291,7 +267,6 @@ fn check_batch_inverse<const MODULUS: u32>() {
 
 #[test]
 fn batch_inverse_matches_scalar_inversion() {
-    check_batch_inverse::<2>();
     check_batch_inverse::<17>();
     check_batch_inverse::<65_537>();
     check_batch_inverse::<1_073_479_681>();
@@ -312,7 +287,6 @@ fn check_batch_inverse_rejects_noncanonical_zero<const MODULUS: u32>() {
 
 #[test]
 fn batch_inverse_rejects_multiples_of_the_modulus_before_mutation() {
-    check_batch_inverse_rejects_noncanonical_zero::<2>();
     check_batch_inverse_rejects_noncanonical_zero::<17>();
     check_batch_inverse_rejects_noncanonical_zero::<65_537>();
     check_batch_inverse_rejects_noncanonical_zero::<1_073_479_681>();
@@ -321,10 +295,10 @@ fn batch_inverse_rejects_multiples_of_the_modulus_before_mutation() {
 
 #[test]
 fn batch_inverse_reduces_noncanonical_nonzero_values() {
-    let binary = PrimeField::<2>::new();
-    let mut binary_values = [3, u32::MAX];
-    binary.batch_inv_assign(&mut binary_values).unwrap();
-    assert_eq!(binary_values, [1, 1]);
+    let ternary = PrimeField::<3>::new();
+    let mut ternary_values = [4, 7];
+    ternary.batch_inv_assign(&mut ternary_values).unwrap();
+    assert_eq!(ternary_values, [1, 1]);
 
     let field = PrimeField::<1_073_479_681>::new();
     let mut values = [1_073_479_682, 2_146_959_361, u32::MAX];
@@ -347,7 +321,6 @@ fn check_element_batch_inverse<const MODULUS: u32>() {
 
 #[test]
 fn element_batch_inverse_matches_scalar_inversion() {
-    check_element_batch_inverse::<2>();
     check_element_batch_inverse::<17>();
     check_element_batch_inverse::<65_537>();
     check_element_batch_inverse::<1_073_479_681>();

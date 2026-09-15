@@ -1,6 +1,6 @@
 use super::{
-    BackendPreference, FieldElement, FieldError, NttBackend, NttPerformanceWarning, NttPlan,
-    PrimeField, Stage, select_backend, twiddle_powers,
+    FieldElement, FieldError, NttBackend, NttPerformanceWarning, NttPlan, PrimeField, Stage,
+    select_backend, twiddle_powers,
 };
 
 impl<const MODULUS: u32> NttPlan<MODULUS> {
@@ -8,46 +8,25 @@ impl<const MODULUS: u32> NttPlan<MODULUS> {
     ///
     /// `length` must be a nonzero power of two dividing `MODULUS - 1`. Setup
     /// takes `O(length + log MODULUS)` field operations and uses `O(length)`
-    /// retained and temporary storage for roots and stage twiddles. Prefer this
-    /// constructor for normal use, then reuse the plan across operations.
+    /// retained and temporary storage for roots and stage twiddles. Reuse the
+    /// plan across operations.
     ///
     /// Modulus bounds choose among lazy Shoup, reduced Shoup, and Montgomery
-    /// butterflies. Use [`Self::new_scalar`] for a construction marked as an
-    /// explicit portable-kernel request.
+    /// butterflies; [`Self::backend`] and [`Self::performance_warning`]
+    /// report the tier that was selected.
     ///
     /// # Errors
     ///
     /// Returns [`FieldError::UnsupportedTransformLength`] for an unsupported
     /// length.
     pub fn new(length: usize) -> Result<Self, FieldError> {
-        Self::with_backend(length, BackendPreference::Auto)
-    }
-
-    /// Constructs a plan marked as an explicit portable-kernel request.
-    ///
-    /// Length requirements, `O(length + log MODULUS)` setup time, and
-    /// `O(length)` allocation are the same as for [`Self::new`]. The produced
-    /// plan behaves identically to one from [`Self::new`];
-    /// [`Self::performance_warning`] reports
-    /// [`NttPerformanceWarning::ScalarRequested`] unless a wide modulus
-    /// produces the more specific Montgomery fallback warning.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`FieldError::UnsupportedTransformLength`] for an unsupported
-    /// length.
-    pub fn new_scalar(length: usize) -> Result<Self, FieldError> {
-        Self::with_backend(length, BackendPreference::Scalar)
-    }
-
-    fn with_backend(length: usize, preference: BackendPreference) -> Result<Self, FieldError> {
         let field = PrimeField::<MODULUS>::new();
         let root = field.root_of_unity(length)?;
         let inverse_root = field.inv(root)?;
         let inverse_length = field.element(u64::from(
             field.inv((length as u64 % u64::from(MODULUS)) as u32)?,
         ));
-        let (backend, warning) = select_backend::<MODULUS>(preference);
+        let (backend, warning) = select_backend::<MODULUS>();
         let forward_powers = twiddle_powers(field, root, length / 2);
         let inverse_powers = twiddle_powers(field, inverse_root, length / 2);
 

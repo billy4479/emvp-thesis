@@ -35,8 +35,14 @@ use std::fmt;
 /// Largest security level [`pow_ge_pow2`] compares exactly.
 pub const POW_MAX_LAMBDA: u32 = 4096;
 
-/// Largest protocol security level supported by the 256-bit PRF key.
-pub const PROTOCOL_MAX_LAMBDA: u32 = 256;
+/// Largest protocol security level this crate claims.
+///
+/// The 1D-SLSN parameter analysis (the attack-cost constraints enforced by
+/// [`EmvpParams::validate`]) is scoped to targets of at most `2^128` work,
+/// so claiming a higher level would advertise a strength the validation
+/// never established. The 256-bit PRF root key stays well above this cap;
+/// the cap bounds the claimed protocol security, not the key material.
+pub const PROTOCOL_MAX_LAMBDA: u32 = 128;
 
 /// Ranks scanned by [`search`] before it gives up.
 const SEARCH_RANK_BUDGET: usize = 10_000_000;
@@ -67,11 +73,10 @@ pub fn pow_ge_pow2(base: u64, exp: u64, lambda: u32) -> bool {
 
 /// An exact integer comparison `factor * base^exp >= 2^lambda`.
 fn scaled_pow_ge_pow2(base: u64, exp: u64, factor: u64, lambda: u32) -> bool {
-    const MAX_LAMBDA: u32 = 4096;
     if lambda == 0 {
         return true;
     }
-    if factor == 0 || lambda > MAX_LAMBDA {
+    if factor == 0 || lambda > POW_MAX_LAMBDA {
         return false;
     }
     if base < 2 {
@@ -137,7 +142,7 @@ const fn exact_bit_length(limbs: &[u64]) -> u64 {
 pub enum ParamsError {
     /// The record length was zero.
     ZeroEll,
-    /// The security level exceeded the 256-bit protocol key strength.
+    /// The security level exceeded the [`PROTOCOL_MAX_LAMBDA`] cap.
     LambdaOutOfScope {
         /// The rejected security parameter.
         lambda: u32,
@@ -206,7 +211,7 @@ impl fmt::Display for ParamsError {
             Self::ZeroEll => formatter.write_str("record length must be nonzero"),
             Self::LambdaOutOfScope { lambda } => write!(
                 formatter,
-                "security level lambda = {lambda} exceeds the 256-bit protocol key strength"
+                "security level lambda = {lambda} exceeds the {PROTOCOL_MAX_LAMBDA}-bit protocol cap"
             ),
             Self::EllExceedsRank { ell, k } => {
                 write!(formatter, "record length {ell} exceeds the rank {k}")
@@ -381,7 +386,7 @@ impl EmvpParams {
     ///
     /// The narrowing `lambda as usize` truncates only on platforms with a
     /// 16-bit `usize`; every caller first rejects `lambda` beyond
-    /// [`PROTOCOL_MAX_LAMBDA`] (256), which fits any `usize` width.
+    /// [`PROTOCOL_MAX_LAMBDA`] (128), which fits any `usize` width.
     #[must_use]
     pub const fn rank_floor(lambda: u32) -> usize {
         (lambda as usize).div_ceil(4)

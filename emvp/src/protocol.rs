@@ -7,10 +7,13 @@
 //!
 //! The key derivation expands the short key into the long-term secrets via
 //! the [`Prf`]: the cyclic dual-code multiplier `g`, the public permutation
-//! `Pi` of length `n = 2k`, and the stack of trapdoored mask blocks. Query
-//! randomness (the codeword and the nonzero block scalars) is derived under a
-//! monotonic query index. Callers persist the next index when reconstructing
-//! state after a restart.
+//! `Pi` of length `n = 2k`, and the stack of trapdoored mask blocks. All of
+//! them are bound to the full public reconstruction context (the caller's
+//! [`MaskContextId`], every [`EmvpParams`] field, the row count, and the
+//! instance nonce) through the hierarchical derivation of
+//! [`SecretKey::derive`]. Query randomness (the codeword and the nonzero
+//! block scalars) is derived under a monotonic query index. Callers persist
+//! the next index when reconstructing state after a restart.
 //!
 //! The data flow, matching the conventions of [`crate::code`] and the
 //! `trapdoor_matrices` mask module:
@@ -54,6 +57,74 @@ use trapdoor_matrices::{DenseMatrix, Permutation, RowStackMask, TdmError, TdmMas
 use crate::code::{CodeError, CyclicCodeScratch, CyclicDualCode};
 use crate::params::{EmvpParams, ParamsError};
 use crate::prf::{Prf, PrfError, purpose};
+
+/// Caller-chosen identifier of the mask suite and its configuration.
+///
+/// Every [`SecretKey::derive`] and [`SecretKey::restore`] call requires one
+/// explicitly, so a caller cannot silently re-derive state under a different
+/// trapdoored-matrix construction, a different builder configuration, or
+/// different protocol parameters while reusing persisted artifacts. The
+/// value is opaque to the protocol: pick any stable `u128` (for example a
+/// random 128-bit tag fixed at deployment time), and change it whenever the
+/// mask construction, its parameters, or anything else about the
+/// `build_block` closure's output changes. It must be persisted alongside
+/// the instance nonce and the next query index, because
+/// [`SecretKey::restore`] accepts it explicitly and reconstruction only
+/// succeeds for the exact context the original derivation used.
+///
+/// The identifier is a domain-separation input, not a secret: distinct
+/// context identifiers under the same root key yield statistically
+/// independent protocol state.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct MaskContextId(u128);
+
+impl MaskContextId {
+    /// Wraps a caller-chosen stable identifier.
+    #[must_use]
+    pub const fn new(value: u128) -> Self {
+        Self(value)
+    }
+
+    /// Convenience constructor for context identifiers that fit a `u64`.
+    #[must_use]
+    pub const fn from_u64(value: u64) -> Self {
+        Self(value as u128)
+    }
+
+    /// Returns the wrapped stable identifier.
+    #[must_use]
+    pub const fn get(self) -> u128 {
+        self.0
+    }
+}
+
+/// Domain and stage constants of the hierarchical instance binding.
+///
+/// [`SecretKey::derive`] expands the root key into the instance PRF with a
+/// fixed-order chain of [`Prf::derive_context`] steps: the domain tag, then
+/// alternating stage tags and context fields. Every stage tag has its high
+/// bit set, so a step never collides with the `stream(purpose, index)`
+/// layout of the PRF windows (which always select stream zero), and every
+/// field occupies exactly one `u128` step, so neither the order nor the
+/// field boundaries can be confused.
+mod binding {
+    /// High bit shared by every stage tag, keeping the chain off the
+    /// stream-zero windows that [`Prf::stream`] addresses.
+    const STAGE_FLAG: u128 = 1_u128 << 127;
+
+    /// Root domain tag: only EMVP instance reconstruction chains pass
+    /// through here.
+    pub const DOMAIN: u128 = STAGE_FLAG | 1;
+    /// Announces the caller's [`MaskContextId`](crate::protocol::MaskContextId)
+    /// step.
+    pub const STAGE_MASK_CONTEXT: u128 = STAGE_FLAG | 2;
+    /// Announces the four [`crate::params::EmvpParams`] field steps.
+    pub const STAGE_PARAMS: u128 = STAGE_FLAG | 3;
+    /// Announces the matrix row count step.
+    pub const STAGE_ROWS: u128 = STAGE_FLAG | 4;
+    /// Announces the instance nonce step, the last field of the chain.
+    pub const STAGE_INSTANCE_NONCE: u128 = STAGE_FLAG | 5;
+}
 
 /// A rejected protocol operation.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -301,14 +372,27 @@ impl<const MODULUS: u32> SecretKey<MODULUS> {
     ///
     /// A fresh 128-bit matrix nonce is sampled from `rng`. The RNG state must
     /// never be replayed under the same root key. Persist the nonce through
-    /// [`DerivedState::instance_nonce`] together with the next query index.
+    /// [`DerivedState::instance_nonce`] together with the next query index
+    /// *and* the [`MaskContextId`] passed here: [`Self::restore`] requires
+    /// the exact same context, so losing it makes the instance
+    /// unreconstructable.
+    ///
+    /// All deterministic instance state (the instance identifier, the code,
+    /// the permutation, the mask streams, and every query's randomness) is
+    /// derived from a PRF bound to the complete public reconstruction
+    /// context: `context`, every [`EmvpParams`] field, `rows`, and the
+    /// instance nonce, chained through [`Self::bound_instance_prf`] in a
+    /// fixed order. Changing any of them therefore yields an independent
+    /// instance even under the same root key and nonce.
     ///
     /// `rows` is the number of matrix rows to support; it determines how
     /// many square mask blocks are stacked. `build_block` constructs one
     /// mask block from the block's PRF stream and index, which is how the
     /// caller picks a trapdoored-matrix construction and its parameters.
-    /// Stacks of two or more blocks construct them across rayon workers, so
-    /// the closure must be callable from several threads (`Fn` plus `Sync`).
+    /// Whenever that construction or its configuration changes, the caller
+    /// must change the [`MaskContextId`] it passes. Stacks of two or more
+    /// blocks construct them across rayon workers, so the closure must be
+    /// callable from several threads (`Fn` plus `Sync`).
     ///
     /// # Errors
     ///
@@ -316,6 +400,7 @@ impl<const MODULUS: u32> SecretKey<MODULUS> {
     /// mask construction, or the closure itself.
     pub fn derive<M, F, R>(
         self,
+        context: MaskContextId,
         rows: usize,
         rng: &mut R,
         build_block: F,
@@ -327,20 +412,32 @@ impl<const MODULUS: u32> SecretKey<MODULUS> {
     {
         let mut nonce = [0_u8; 16];
         rng.fill_bytes(&mut nonce);
-        self.derive_inner(u128::from_le_bytes(nonce), 0, rows, false, &build_block)
+        self.derive_inner(
+            context,
+            u128::from_le_bytes(nonce),
+            0,
+            rows,
+            false,
+            &build_block,
+        )
     }
 
     /// Restores query state for an already encrypted matrix.
     ///
-    /// `instance_nonce` and `next_query_index` must be the durably persisted
-    /// values from the original state. Restored state cannot encrypt another
-    /// matrix, which prevents deterministic mask reuse after restart.
+    /// `context`, `instance_nonce`, and `next_query_index` must be the
+    /// durably persisted values from the original state. The context
+    /// identifier identifies the mask suite and configuration the original
+    /// derivation used; restoring under any other value yields a different
+    /// (wrong) instance rather than the original state. Restored state
+    /// cannot encrypt another matrix, which prevents deterministic mask
+    /// reuse after restart.
     ///
     /// # Errors
     ///
     /// Returns the same errors as [`Self::derive`].
     pub fn restore<M, F>(
         self,
+        context: MaskContextId,
         instance_nonce: u128,
         next_query_index: u64,
         rows: usize,
@@ -350,11 +447,57 @@ impl<const MODULUS: u32> SecretKey<MODULUS> {
         M: TdmMask<MODULUS>,
         F: Fn(&mut ChaCha20Rng, usize) -> Result<M, ProtocolError> + Sync,
     {
-        self.derive_inner(instance_nonce, next_query_index, rows, true, &build_block)
+        self.derive_inner(
+            context,
+            instance_nonce,
+            next_query_index,
+            rows,
+            true,
+            &build_block,
+        )
+    }
+
+    /// The PRF all of one instance's deterministic state derives from.
+    ///
+    /// The chain of [`Prf::derive_context`] steps binds the caller's
+    /// [`MaskContextId`], every [`EmvpParams`] field, the row count, and the
+    /// instance nonce to the root key, in the fixed order documented by the
+    /// `binding` stage constants. Exposed so oracle tests can replicate the
+    /// exact derivation; protocol users obtain the same PRF indirectly through
+    /// [`Self::derive`] and [`Self::restore`].
+    ///
+    /// # Security
+    ///
+    /// The returned PRF exposes every secret derived for this instance,
+    /// including mask and query randomness. It must be protected exactly like
+    /// the root key and must never be shared with the server or another party.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn bound_instance_prf(
+        &self,
+        context: MaskContextId,
+        rows: usize,
+        instance_nonce: u128,
+    ) -> Prf {
+        let params = self.params;
+        self.prf
+            .derive_context(binding::DOMAIN)
+            .derive_context(binding::STAGE_MASK_CONTEXT)
+            .derive_context(context.get())
+            .derive_context(binding::STAGE_PARAMS)
+            .derive_context(params.k as u128)
+            .derive_context(params.ell as u128)
+            .derive_context(params.b as u128)
+            .derive_context(u128::from(params.lambda))
+            .derive_context(binding::STAGE_ROWS)
+            .derive_context(rows as u128)
+            .derive_context(binding::STAGE_INSTANCE_NONCE)
+            .derive_context(instance_nonce)
     }
 
     fn derive_inner<M, F>(
         self,
+        context: MaskContextId,
         instance_nonce: u128,
         next_query_index: u64,
         rows: usize,
@@ -375,7 +518,7 @@ impl<const MODULUS: u32> SecretKey<MODULUS> {
             });
         }
 
-        let prf = self.prf.derive_context(instance_nonce);
+        let prf = self.bound_instance_prf(context, rows, instance_nonce);
         let mut identifier_stream = prf.stream(purpose::INSTANCE_ID, 0)?;
         let mut identifier = [0_u8; 16];
         identifier_stream.fill_bytes(&mut identifier);
@@ -453,6 +596,20 @@ pub struct QueryScratch<const MODULUS: u32, M: TdmMask<MODULUS>> {
 pub struct QueryReservation {
     instance_id: u128,
     query_id: u64,
+}
+
+impl QueryReservation {
+    /// Returns the public matrix-instance identifier the token belongs to.
+    #[must_use]
+    pub const fn instance_id(&self) -> u128 {
+        self.instance_id
+    }
+
+    /// Returns the reserved public query identifier.
+    #[must_use]
+    pub const fn query_id(&self) -> u64 {
+        self.query_id
+    }
 }
 
 /// Iterator over query reservations allocated in one counter update.
@@ -1164,32 +1321,66 @@ pub fn answer_into<const MODULUS: u32>(
     Ok(())
 }
 
+/// Validates the parameters and one query against the encrypted matrix and
+/// returns `(n, b, s, rows)`.
 fn validate_answer<const MODULUS: u32>(
     params: &EmvpParams,
     matrix: &EncryptedMatrix<MODULUS>,
     query: &EncryptedQuery<MODULUS>,
 ) -> Result<(usize, usize, usize, usize), ProtocolError> {
-    params.validate_dimensions()?;
-    let n = params.n()?;
+    let n = validate_matrix_shape(params, matrix)?;
+    validate_query_against_matrix(n, matrix.instance_id(), query)?;
     let b = params.block_size();
     let s = params.blocks()?;
     let rows = matrix.rows();
-    check_len("encrypted matrix columns", n, matrix.columns())?;
-    validate_query_against_matrix(n, matrix, query)?;
     Ok((n, b, s, rows))
 }
 
-/// Checks one query's length and instance identifier against the matrix.
-fn validate_query_against_matrix<const MODULUS: u32>(
-    n: usize,
+/// Validates one encrypted matrix's shape against `params` and returns the
+/// codeword length `n = 2k`.
+///
+/// This is the shape half of the CPU answer-path validation
+/// ([`validate_answer`]) and the single validation entry point shared by the
+/// dispatcher's fast-fail construction and the GPU answerer's upload, so
+/// CPU, dispatch, and GPU reject the same matrix shapes before any work.
+pub(crate) fn validate_matrix_shape<const MODULUS: u32>(
+    params: &EmvpParams,
     matrix: &EncryptedMatrix<MODULUS>,
+) -> Result<usize, ProtocolError> {
+    params.validate_dimensions()?;
+    let n = params.n()?;
+    check_len("encrypted matrix columns", n, matrix.columns())?;
+    let rows = matrix.rows();
+    if rows == 0 {
+        return Err(ProtocolError::LengthMismatch {
+            name: "matrix rows",
+            expected: 1,
+            actual: 0,
+        });
+    }
+    let words = rows
+        .checked_mul(n)
+        .ok_or(ProtocolError::DimensionOverflow)?;
+    check_len("encrypted matrix values", words, matrix.values().len())?;
+    Ok(n)
+}
+
+/// Checks one query's length and instance identifier against the matrix
+/// instance.
+///
+/// Exposed next to [`validate_matrix_shape`] so the server-side dispatch and
+/// device paths can reuse the exact CPU validation; callers pass the
+/// instance identifier of the matrix they answer against.
+pub(crate) fn validate_query_against_matrix<const MODULUS: u32>(
+    n: usize,
+    matrix_instance_id: u128,
     query: &EncryptedQuery<MODULUS>,
 ) -> Result<(), ProtocolError> {
     check_len("encrypted query", n, query.values.len())?;
-    if query.instance_id != matrix.instance_id {
+    if query.instance_id != matrix_instance_id {
         return Err(ProtocolError::InstanceMismatch {
             name: "encrypted query",
-            expected: matrix.instance_id,
+            expected: matrix_instance_id,
             actual: query.instance_id,
         });
     }
@@ -1251,7 +1442,7 @@ pub fn answer_batch<const MODULUS: u32>(
     };
     let (n, b, s, rows) = validate_answer(params, matrix, first)?;
     for query in &queries[1..] {
-        validate_query_against_matrix(n, matrix, query)?;
+        validate_query_against_matrix(n, matrix.instance_id(), query)?;
     }
     let answer_len = rows
         .checked_mul(s)

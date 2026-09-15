@@ -25,7 +25,7 @@ fn check_element_u32_boundaries<const MODULUS: u32>() {
 
 #[test]
 fn element_u32_reduces_boundaries_without_a_preliminary_remainder() {
-    check_element_u32_boundaries::<2>();
+    check_element_u32_boundaries::<3>();
     check_element_u32_boundaries::<17>();
     check_element_u32_boundaries::<4_294_967_291>();
 }
@@ -65,7 +65,7 @@ fn element_has_no_runtime_field_pointer() {
 }
 
 #[test]
-fn raw_words_round_trip_without_conversion() {
+fn raw_words_round_trip_through_the_checked_constructor() {
     let field = PrimeField::<998_244_353>::new();
     for value in [0_u32, 1, 2, 998_244_351, 998_244_352] {
         let element = field.element_u32(value);
@@ -75,29 +75,80 @@ fn raw_words_round_trip_without_conversion() {
             element.to_raw(),
             ((u64::from(value) << 32) % 998_244_353) as u32
         );
-        // from_raw is the exact inverse, and arithmetic round-trips through it.
-        assert_eq!(
-            FieldElement::<998_244_353>::from_raw(element.to_raw()).value(),
-            value
-        );
-        assert_eq!(
-            FieldElement::<998_244_353>::from_raw(element.to_raw()),
-            element
-        );
+        // try_from_raw is the exact checked inverse, and arithmetic
+        // round-trips through it.
+        let recovered = FieldElement::<998_244_353>::try_from_raw(element.to_raw()).unwrap();
+        assert_eq!(recovered.value(), value);
+        assert_eq!(recovered, element);
     }
     // Products computed on raw words match the canonical product, so a GPU
-    // kernel working on to_raw words and returning from_raw values is
+    // kernel working on to_raw words and returning try_from_raw values is
     // indistinguishable from element arithmetic.
     let (a, b) = (
         field.element_u32(123_456_789),
         field.element_u32(987_654_321),
     );
-    let product_from_raw = FieldElement::from_raw(a.to_raw()) * FieldElement::from_raw(b.to_raw());
+    let product_from_raw = FieldElement::try_from_raw(a.to_raw()).unwrap()
+        * FieldElement::try_from_raw(b.to_raw()).unwrap();
     assert_eq!(product_from_raw, a * b);
     assert_eq!(
         product_from_raw.value(),
         field.mul(123_456_789, 987_654_321)
     );
+}
+
+#[test]
+fn try_from_raw_accepts_canonical_boundary_words() {
+    const MODULUS: u32 = 998_244_353;
+    // The canonical value of raw word `w` is `w * R^-1 mod MODULUS` with
+    // `R = 2^32`; `R^-1` has the closed form `R^(MODULUS - 2) mod MODULUS`.
+    let r_inverse = {
+        let modulus = u128::from(MODULUS);
+        let mut exponent = u64::from(MODULUS - 2);
+        let (mut result, mut base) = (1_u128, 1_u128 << 32);
+        while exponent != 0 {
+            if exponent & 1 == 1 {
+                result = result * base % modulus;
+            }
+            base = base * base % modulus;
+            exponent >>= 1;
+        }
+        result as u32
+    };
+
+    // Every word below the modulus is the canonical Montgomery residue of
+    // some element, including the boundary words 0, 1, and MODULUS - 1. Each
+    // accepted word survives the round trip unchanged and decodes to the
+    // canonical value predicted by the closed-form oracle.
+    for raw in [0, 1, 2, MODULUS / 2, MODULUS - 2, MODULUS - 1] {
+        let element = FieldElement::<MODULUS>::try_from_raw(raw).unwrap();
+        assert_eq!(element.to_raw(), raw);
+        assert_eq!(
+            element.value(),
+            (u64::from(raw) * u64::from(r_inverse) % u64::from(MODULUS)) as u32
+        );
+    }
+}
+
+#[test]
+fn try_from_raw_rejects_words_at_and_above_the_modulus() {
+    const MODULUS: u32 = 998_244_353;
+    for raw in [MODULUS, MODULUS + 1, u32::MAX] {
+        assert_eq!(
+            FieldElement::<MODULUS>::try_from_raw(raw),
+            Err(FieldError::NonCanonicalRaw {
+                raw,
+                modulus: MODULUS
+            })
+        );
+    }
+
+    for raw in [3, 4, u32::MAX] {
+        assert_eq!(
+            FieldElement::<3>::try_from_raw(raw),
+            Err(FieldError::NonCanonicalRaw { raw, modulus: 3 })
+        );
+    }
 }
 
 #[test]

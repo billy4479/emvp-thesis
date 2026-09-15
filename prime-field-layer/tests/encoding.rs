@@ -128,11 +128,11 @@ fn batch_fill_uses_caller_storage_and_handles_empty_slices() {
 
 #[test]
 fn sampling_handles_boundary_moduli() {
-    let binary = PrimeField::<2>::new();
+    let ternary = PrimeField::<3>::new();
     let mut rng = ScriptedRng::new([0, 1, u32::MAX]);
-    assert_eq!(binary.sample_uniform(&mut rng).value(), 0);
-    assert_eq!(binary.sample_uniform(&mut rng).value(), 1);
-    assert_eq!(binary.sample_uniform_nonzero(&mut rng).value(), 1);
+    assert_eq!(ternary.sample_uniform(&mut rng).value(), 0);
+    assert_eq!(ternary.sample_uniform(&mut rng).value(), 1);
+    assert_eq!(ternary.sample_uniform_nonzero(&mut rng).value(), 2);
 
     let largest = PrimeField::<4_294_967_291>::new();
     let mut rng = ScriptedRng::new([u32::MAX, 4_294_967_291, 4_294_967_290]);

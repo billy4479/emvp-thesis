@@ -348,16 +348,29 @@ pub fn read_upload_matrices_payload<R: Read>(
 
 /// Reads the accepted-upload payload from an open frame.
 ///
+/// The server assigns one-based consecutive identifiers, so a decoded
+/// identifier of zero is a protocol violation and is rejected here. The
+/// client still validates identifier uniqueness itself, because the codec
+/// only owns the nonzero invariant, not the per-connection assignment.
+///
 /// # Errors
 ///
-/// Returns the framing errors of [`FrameReader`].
+/// Returns [`CodecError::InvalidDimensions`] for a zero identifier, and
+/// the framing errors of [`FrameReader`].
 pub fn read_upload_accepted_payload<R: Read>(
     frame: &mut FrameReader<'_, R>,
 ) -> Result<Vec<u64>, CodecError> {
     let count = frame.read_u64()?;
     let mut identifiers = Vec::new();
     for _ in 0..count {
-        identifiers.push(frame.read_u64()?);
+        let identifier = frame.read_u64()?;
+        if identifier == 0 {
+            return Err(CodecError::InvalidDimensions {
+                name: "matrix identifier",
+                value: 0,
+            });
+        }
+        identifiers.push(identifier);
     }
     Ok(identifiers)
 }
@@ -393,7 +406,9 @@ pub fn read_evaluate_payload<R: Read>(
 /// # Errors
 ///
 /// Returns [`CodecError::CountMismatch`] when an answer's element count
-/// contradicts its dimensions, and the framing errors of [`FrameReader`].
+/// contradicts its dimensions, [`CodecError::InvalidDimensions`] when an
+/// answer declares zero rows or zero blocks, and the framing errors of
+/// [`FrameReader`].
 pub fn read_products_payload<R: Read>(
     frame: &mut FrameReader<'_, R>,
 ) -> Result<Vec<ProductEntry>, CodecError> {
@@ -417,6 +432,18 @@ pub fn read_products_payload<R: Read>(
                     name: "answer values",
                     expected,
                     actual: value_count,
+                });
+            }
+            if rows == 0 {
+                return Err(CodecError::InvalidDimensions {
+                    name: "answer rows",
+                    value: 0,
+                });
+            }
+            if blocks == 0 {
+                return Err(CodecError::InvalidDimensions {
+                    name: "answer blocks",
+                    value: 0,
                 });
             }
             let values = frame.read_field_slice(value_count)?;

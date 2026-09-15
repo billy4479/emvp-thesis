@@ -19,14 +19,23 @@ wgpu = { version = "30", optional = true }
 allocation-counter = { workspace = true }
 bench-common = { path = "../prime-field-layer/benches/common" }
 criterion = { workspace = true }
+# Device-independent parse-and-validate test for the embedded answer WGSL
+# (behind the `gpu` feature). Only the WGSL front end is pulled in; the
+# shader the device compiles is the exact string this validates.
+naga = { version = "30", default-features = false, features = ["wgsl-in"] }
 proptest = { workspace = true }
+# Tests and benches build the shared deterministic Ring-LPN fixtures, which
+# live behind the `test-utils` feature. The normal dependency above stays
+# feature-free so library builds never compile the fixture builders.
+trapdoor-matrices = { path = "../trapdoor-matrices", features = ["test-utils"] }
 
 [features]
 bench-quick = ["bench-common/quick"]
 # Server-side GPU answer path. Everything the GPU touches is public
 # (encrypted) protocol data, so this feature never affects client secrecy.
-# `pollster` backs the blocking `_sync` wrappers, which are library API, so
-# it is an optional regular dependency rather than a dev-dependency.
+# `pollster` backs the genuinely blocking waits inside the synchronous API
+# (adapter and device acquisition, error-scope pops), so it is an optional
+# regular dependency rather than a dev-dependency.
 gpu = ["dep:wgpu", "dep:pollster"]
 
 [lints]

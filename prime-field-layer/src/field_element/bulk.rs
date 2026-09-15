@@ -40,6 +40,11 @@ impl<const MODULUS: u32> PrimeField<MODULUS> {
     /// allocates nothing. Length and zero checks complete before `output` is
     /// mutated.
     ///
+    /// The zero scan exits early at the first zero element, so the running
+    /// time of a rejected call reveals the position of the first zero. This
+    /// batch inversion is variable-time by design; do not use it when that
+    /// timing must be hidden.
+    ///
     /// # Errors
     ///
     /// Returns [`FieldError::LengthMismatch`] if the slices differ in length,

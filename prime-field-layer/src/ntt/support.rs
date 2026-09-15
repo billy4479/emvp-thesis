@@ -2,14 +2,8 @@ use super::{
     FieldElement, NttBackend, NttPerformanceWarning, PrimeField, Twiddle, reduce_once_u64,
 };
 
-#[derive(Clone, Copy)]
-pub(super) enum BackendPreference {
-    Auto,
-    Scalar,
-}
-pub(super) fn select_backend<const MODULUS: u32>(
-    preference: BackendPreference,
-) -> (NttBackend, Option<NttPerformanceWarning>) {
+pub(super) const fn select_backend<const MODULUS: u32>()
+-> (NttBackend, Option<NttPerformanceWarning>) {
     if MODULUS >= 1 << 31 {
         return (
             NttBackend::ScalarMontgomery,
@@ -21,11 +15,7 @@ pub(super) fn select_backend<const MODULUS: u32>(
     } else {
         NttBackend::ScalarShoup
     };
-    let warning = match preference {
-        BackendPreference::Auto => None,
-        BackendPreference::Scalar => Some(NttPerformanceWarning::ScalarRequested),
-    };
-    (backend, warning)
+    (backend, None)
 }
 pub(super) fn make_twiddle<const MODULUS: u32>(
     field: PrimeField<MODULUS>,

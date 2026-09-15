@@ -193,6 +193,88 @@ pub struct SecurityAssessment {
     pub warnings: Vec<ParameterWarning>,
 }
 
+impl SecurityAssessment {
+    /// The float-free tags of every broken-forcing warning, in assessment
+    /// order.
+    ///
+    /// This is the structured payload carried by
+    /// [`TdmError::InsecureParameters`], which cannot embed
+    /// [`ParameterWarning`] directly because the exact cost estimates are
+    /// floating point and the error type derives `Eq`.
+    #[must_use]
+    pub fn broken_reasons(&self) -> Vec<SecurityWarningKind> {
+        self.warnings
+            .iter()
+            .filter_map(SecurityWarningKind::of)
+            .collect()
+    }
+}
+
+/// Float-free tag of one warning that can force [`SecurityLevel::Broken`].
+///
+/// [`ParameterWarning`] carries exact floating-point cost estimates and is
+/// therefore not `Eq`; these tags identify which checks failed without the
+/// estimates. The advisory warnings
+/// ([`ParameterWarning::IsdRefinementMarginBelowTarget`] and
+/// [`ParameterWarning::WeightBelowPolicyDefault`]) never appear here because
+/// they cannot force a broken level.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+pub enum SecurityWarningKind {
+    /// [`ParameterWarning::RingDegreeBelowFloor`].
+    RingDegreeBelowFloor,
+    /// [`ParameterWarning::WeightBelowPlausibilityFloor`].
+    WeightBelowPlausibilityFloor,
+    /// [`ParameterWarning::DecodingCostBelowTarget`].
+    DecodingCostBelowTarget,
+    /// [`ParameterWarning::EnumerationCostBelowTarget`].
+    EnumerationCostBelowTarget,
+    /// [`ParameterWarning::NttLengthUnsupported`].
+    NttLengthUnsupported,
+    /// [`ParameterWarning::DegreeBeyondPlatform`].
+    DegreeBeyondPlatform,
+    /// [`ParameterWarning::WeightOutsideSparseRegime`].
+    WeightOutsideSparseRegime,
+}
+
+impl SecurityWarningKind {
+    /// The tag of `warning`, or `None` for the advisory warnings that can
+    /// never force [`SecurityLevel::Broken`].
+    #[must_use]
+    pub const fn of(warning: &ParameterWarning) -> Option<Self> {
+        match warning {
+            ParameterWarning::RingDegreeBelowFloor { .. } => Some(Self::RingDegreeBelowFloor),
+            ParameterWarning::WeightBelowPlausibilityFloor { .. } => {
+                Some(Self::WeightBelowPlausibilityFloor)
+            }
+            ParameterWarning::DecodingCostBelowTarget { .. } => Some(Self::DecodingCostBelowTarget),
+            ParameterWarning::EnumerationCostBelowTarget { .. } => {
+                Some(Self::EnumerationCostBelowTarget)
+            }
+            ParameterWarning::NttLengthUnsupported { .. } => Some(Self::NttLengthUnsupported),
+            ParameterWarning::DegreeBeyondPlatform { .. } => Some(Self::DegreeBeyondPlatform),
+            ParameterWarning::WeightOutsideSparseRegime { .. } => {
+                Some(Self::WeightOutsideSparseRegime)
+            }
+            ParameterWarning::IsdRefinementMarginBelowTarget { .. }
+            | ParameterWarning::WeightBelowPolicyDefault { .. } => None,
+        }
+    }
+}
+
+impl std::fmt::Display for SecurityWarningKind {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::RingDegreeBelowFloor => "ring degree below floor",
+            Self::WeightBelowPlausibilityFloor => "weight below plausibility floor",
+            Self::DecodingCostBelowTarget => "decoding cost below target",
+            Self::EnumerationCostBelowTarget => "enumeration cost below target",
+            Self::NttLengthUnsupported => "NTT length unsupported",
+            Self::DegreeBeyondPlatform => "degree beyond platform",
+            Self::WeightOutsideSparseRegime => "weight outside sparse regime",
+        })
+    }
+}
+
 /// Assesses a Ring-LPN parameter pair against the target security level.
 ///
 /// The assessment models the attacker's problem as syndrome decoding for a
@@ -460,7 +542,9 @@ fn is_prime_u32(value: u32) -> bool {
 mod tests {
     use prime_field_layer::ExtensionField;
 
-    use super::{SecurityLevel, assess, automatic_ring_modulus, is_prime_u32, mod_pow};
+    use super::{
+        SecurityLevel, SecurityWarningKind, assess, automatic_ring_modulus, is_prime_u32, mod_pow,
+    };
 
     const FIELD: u32 = 1_073_479_681;
 
@@ -505,7 +589,10 @@ mod tests {
                 degree: 12
             })
         ));
-        // F_2 has two-adicity zero.
+        // F_2 has two-adicity zero and is unsupported as a base field
+        // outright (the field layer requires an odd prime), so no
+        // construction can instantiate it; automatic selection rejects the
+        // modulus without touching any field type.
         assert!(matches!(
             automatic_ring_modulus::<2>(8),
             Err(crate::TdmError::AutomaticModulusUnsupported {
@@ -603,6 +690,49 @@ mod tests {
         for (k, weight) in [(0, 0), (4, 0), (4, 5), (usize::MAX, usize::MAX)] {
             assert_eq!(assess::<FIELD>(k, weight).level, SecurityLevel::Broken);
         }
+    }
+
+    #[test]
+    fn broken_reasons_match_the_broken_warnings_exactly() {
+        // A degree below the floor triggers exactly one broken warning.
+        let assessment = assess::<FIELD>(1024, 256);
+        assert_eq!(
+            assessment.broken_reasons(),
+            vec![SecurityWarningKind::RingDegreeBelowFloor]
+        );
+
+        // A small weight at a large degree triggers the plausibility and
+        // decoding checks in assessment order; the enumeration estimate
+        // still clears the target at this weight.
+        let assessment = assess::<FIELD>(8192, 16);
+        assert_eq!(
+            assessment.broken_reasons(),
+            vec![
+                SecurityWarningKind::WeightBelowPlausibilityFloor,
+                SecurityWarningKind::DecodingCostBelowTarget,
+            ]
+        );
+
+        // A tiny weight at a tiny degree fails the enumeration check too.
+        let assessment = assess::<FIELD>(4, 2);
+        assert_eq!(
+            assessment.broken_reasons(),
+            vec![
+                SecurityWarningKind::RingDegreeBelowFloor,
+                SecurityWarningKind::WeightBelowPlausibilityFloor,
+                SecurityWarningKind::DecodingCostBelowTarget,
+                SecurityWarningKind::EnumerationCostBelowTarget,
+            ]
+        );
+
+        // Advisory-only warnings produce no broken reasons: a marginal or
+        // sound assessment never carries one.
+        let assessment = assess::<FIELD>(8192, 100);
+        assert_eq!(assessment.level, SecurityLevel::Marginal);
+        assert!(assessment.broken_reasons().is_empty());
+        let assessment = assess::<FIELD>(8192, 128);
+        assert_eq!(assessment.level, SecurityLevel::Sound);
+        assert!(assessment.broken_reasons().is_empty());
     }
 
     #[test]

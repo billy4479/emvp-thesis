@@ -43,7 +43,7 @@ proptest! {
             linear_convolution::<2_281_701_377>(&lhs, &rhs).unwrap(),
             oracle_linear::<2_281_701_377>(&lhs, &rhs)
         );
-        let plan = NttPlan::<2_281_701_377>::new_scalar(8).unwrap();
+        let plan = NttPlan::<2_281_701_377>::new(8).unwrap();
         prop_assert_eq!(
             plan.cyclic_convolution(&cyclic_lhs, &cyclic_rhs).unwrap(),
             oracle_cyclic::<2_281_701_377>(&cyclic_lhs, &cyclic_rhs)

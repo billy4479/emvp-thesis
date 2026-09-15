@@ -4,7 +4,7 @@
 //! pool, or the GPU. This module is the single decision point between them:
 //! two multiplication-count thresholds split the estimated batch work
 //! `queries * rows * n` into three tiers, and (with the `gpu` feature) the
-//! [`AnswerDispatcher`] runner turns that policy into an executable answer
+//! `AnswerDispatcher` runner turns that policy into an executable answer
 //! server that owns the device hand-off.
 //!
 //! # Thresholds
@@ -14,8 +14,7 @@
 //! pool; smaller workloads stay serial because scheduling overhead dominates.
 //!
 //! `MIN_GPU_MULTIPLICATIONS` (with the `gpu` feature) gates the rayon to GPU
-//! tier. It was calibrated by sweeping both answer paths over the
-//! `answer_dispatch` criterion group (`emvp/benches/dispatch.rs`). The
+//! tier. It was originally calibrated by sweeping both answer paths. The
 //! 2026-09-14 calibration ran on a 12-thread AMD Ryzen 5 2600X against an
 //! NVIDIA GTX 1060 6GB: the raw crossover sits between 2^18 and 2^19
 //! multiplications (the device already edges ahead at 2^19, but only by 4%,
@@ -24,7 +23,8 @@
 //! shapes). The constant is machine-dependent by nature; recalibrate with
 //!
 //! ```text
-//! cargo bench -p emvp --features gpu --bench dispatch -- --save-baseline dispatch-policy
+//! cargo bench -p emvp --features gpu --bench dispatch -- \
+//!     --save-baseline dispatch-policy-v2 'answer_dispatch_llm_v2/(cpu|gpu)'
 //! ```
 //!
 //! when the server hardware changes. On a weaker integrated GPU the
@@ -35,12 +35,24 @@
 //! parallel dispatch needs at least two answer rows per pool thread, so a
 //! batch whose grid is too flat for the configured pool stays single-core
 //! even above the parallel threshold.
+//!
+//! # Device shortfalls demote to the actual CPU tier
+//!
+//! A dispatcher without a usable device (built with `AnswerDispatcher::cpu`
+//! or demoted at construction because the matrix exceeded device capacity)
+//! cannot run GPU-tier batches. Instead of assuming the rayon tier, the
+//! dispatcher recomputes the CPU tier for the same shape under the current
+//! pool: one-threaded pools and grids too flat to parallelize demote all
+//! the way to `AnswerBackend::SingleCore`. `AnswerDispatcher::backend`
+//! reports the same tier `AnswerDispatcher::answer_batch` executes.
 
 #[cfg(feature = "gpu")]
 use rayon::current_num_threads;
 
 #[cfg(feature = "gpu")]
 use crate::gpu::{GpuAnswerer, GpuEncryptedMatrix, GpuError};
+#[cfg(feature = "gpu")]
+use crate::protocol::validate_matrix_shape;
 #[cfg(feature = "gpu")]
 use crate::protocol::{AnswerMatrix, EncryptedMatrix, EncryptedQuery, ProtocolError};
 
@@ -86,11 +98,34 @@ pub(crate) const fn is_parallel_work(work: usize, grid: usize, threads: usize) -
     threads > 1 && grid >= threads.saturating_mul(2) && work >= MIN_PARALLEL_MULTIPLICATIONS
 }
 
+/// Selects the CPU tier for one answer batch: rayon when the work clears
+/// [`MIN_PARALLEL_MULTIPLICATIONS`] and the grid offers at least two rows
+/// per pool thread, single-core otherwise.
+///
+/// This is the escalation base of [`select_answer_backend`] and the tier the
+/// dispatcher falls back to when the raw policy selects the GPU tier but no
+/// usable device exists. All dimension products saturate, so every `usize`
+/// input is accepted.
+pub(crate) const fn select_cpu_backend(
+    queries: usize,
+    rows: usize,
+    n: usize,
+    rayon_threads: usize,
+) -> AnswerBackend {
+    let grid = queries.saturating_mul(rows);
+    let work = grid.saturating_mul(n);
+    if is_parallel_work(work, grid, rayon_threads) {
+        AnswerBackend::Rayon
+    } else {
+        AnswerBackend::SingleCore
+    }
+}
+
 /// Selects the backend for one answer batch under the dispatch policy.
 ///
 /// `queries * rows * n` estimates the batch's field-multiplication work;
 /// work of at least the GPU threshold (with the `gpu` feature) selects the
-/// [`AnswerBackend::Gpu`] tier, and below that the CPU tiers apply: rayon
+/// `AnswerBackend::Gpu` tier, and below that the CPU tiers apply: rayon
 /// when the work clears [`MIN_PARALLEL_MULTIPLICATIONS`] and the grid offers
 /// at least two rows per pool thread, single-core otherwise. All dimension
 /// products saturate, so every `usize` input is accepted.
@@ -101,17 +136,15 @@ pub const fn select_answer_backend(
     n: usize,
     rayon_threads: usize,
 ) -> AnswerBackend {
-    let grid = queries.saturating_mul(rows);
-    let work = grid.saturating_mul(n);
     #[cfg(feature = "gpu")]
-    if work >= MIN_GPU_MULTIPLICATIONS {
-        return AnswerBackend::Gpu;
+    {
+        let grid = queries.saturating_mul(rows);
+        let work = grid.saturating_mul(n);
+        if work >= MIN_GPU_MULTIPLICATIONS {
+            return AnswerBackend::Gpu;
+        }
     }
-    if is_parallel_work(work, grid, rayon_threads) {
-        AnswerBackend::Rayon
-    } else {
-        AnswerBackend::SingleCore
-    }
+    select_cpu_backend(queries, rows, n, rayon_threads)
 }
 
 /// A failed answer-phase dispatch (with the `gpu` feature).
@@ -185,44 +218,6 @@ pub struct AnswerDispatcher<'a, const MODULUS: u32> {
     device: Option<(&'a GpuAnswerer, GpuEncryptedMatrix<MODULUS>)>,
 }
 
-/// Checks the parameter/matrix shape once so the dispatcher fails fast at
-/// construction instead of inside the first answer call. Mirrors the shape
-/// validation of [`GpuAnswerer::upload_matrix`].
-#[cfg(feature = "gpu")]
-fn validate_shapes<const MODULUS: u32>(
-    params: &crate::params::EmvpParams,
-    matrix: &EncryptedMatrix<MODULUS>,
-) -> Result<usize, ProtocolError> {
-    params.validate_dimensions()?;
-    let n = params.n()?;
-    if matrix.columns() != n {
-        return Err(ProtocolError::LengthMismatch {
-            name: "encrypted matrix columns",
-            expected: n,
-            actual: matrix.columns(),
-        });
-    }
-    let rows = matrix.rows();
-    if rows == 0 {
-        return Err(ProtocolError::LengthMismatch {
-            name: "matrix rows",
-            expected: 1,
-            actual: 0,
-        });
-    }
-    let words = rows
-        .checked_mul(n)
-        .ok_or(ProtocolError::DimensionOverflow)?;
-    if matrix.values().len() != words {
-        return Err(ProtocolError::LengthMismatch {
-            name: "encrypted matrix values",
-            expected: words,
-            actual: matrix.values().len(),
-        });
-    }
-    Ok(n)
-}
-
 #[cfg(feature = "gpu")]
 impl<'a, const MODULUS: u32> AnswerDispatcher<'a, MODULUS> {
     /// Builds a dispatcher that runs every batch on the CPU path.
@@ -236,7 +231,7 @@ impl<'a, const MODULUS: u32> AnswerDispatcher<'a, MODULUS> {
         params: crate::params::EmvpParams,
         matrix: &'a EncryptedMatrix<MODULUS>,
     ) -> Result<Self, AnswerDispatchError> {
-        let columns = validate_shapes(&params, matrix)?;
+        let columns = validate_matrix_shape(&params, matrix)?;
         Ok(Self {
             params,
             columns,
@@ -266,10 +261,10 @@ impl<'a, const MODULUS: u32> AnswerDispatcher<'a, MODULUS> {
         matrix: &'a EncryptedMatrix<MODULUS>,
         answerer: Option<&'a GpuAnswerer>,
     ) -> Result<Self, AnswerDispatchError> {
-        let columns = validate_shapes(&params, matrix)?;
+        let columns = validate_matrix_shape(&params, matrix)?;
         let mut device = None;
         if let Some(answerer) = answerer {
-            match answerer.upload_matrix_sync(&params, matrix) {
+            match answerer.upload_matrix(&params, matrix) {
                 Ok(gpu_matrix) => device = Some((answerer, gpu_matrix)),
                 Err(GpuError::UploadTooLarge { .. }) => {}
                 Err(error) => return Err(AnswerDispatchError::Gpu(error)),
@@ -287,9 +282,10 @@ impl<'a, const MODULUS: u32> AnswerDispatcher<'a, MODULUS> {
     /// queries under the current rayon pool.
     ///
     /// This is the effective decision, not the raw policy: a GPU-tier batch
-    /// on a dispatcher without a usable device reports
-    /// [`AnswerBackend::Rayon`], because the CPU path's rayon tier is the
-    /// fallback that would actually execute.
+    /// on a dispatcher without a usable device is demoted to the actual CPU
+    /// tier the CPU path would run for the same shape under the current
+    /// pool, which can be [`AnswerBackend::SingleCore`] for a one-threaded
+    /// pool or a grid too flat to parallelize.
     #[must_use]
     pub fn backend(&self, queries: usize) -> AnswerBackend {
         match select_answer_backend(
@@ -298,7 +294,12 @@ impl<'a, const MODULUS: u32> AnswerDispatcher<'a, MODULUS> {
             self.columns,
             current_num_threads(),
         ) {
-            AnswerBackend::Gpu if self.device.is_none() => AnswerBackend::Rayon,
+            AnswerBackend::Gpu if self.device.is_none() => select_cpu_backend(
+                queries,
+                self.matrix.rows(),
+                self.columns,
+                current_num_threads(),
+            ),
             backend => backend,
         }
     }
@@ -324,15 +325,12 @@ impl<'a, const MODULUS: u32> AnswerDispatcher<'a, MODULUS> {
         &self,
         queries: &[EncryptedQuery<MODULUS>],
     ) -> Result<Vec<AnswerMatrix<MODULUS>>, AnswerDispatchError> {
-        match self.backend(queries.len()) {
-            AnswerBackend::Gpu => {
-                // Unreachable with `backend()` as written today, but the
-                // demotion is re-checked here so the fallback survives any
-                // future divergence between the two methods.
-                let Some((answerer, gpu_matrix)) = self.device.as_ref() else {
-                    return Ok(crate::answer_batch(&self.params, self.matrix, queries)?);
-                };
-                Ok(answerer.answer_batch_sync(gpu_matrix, queries)?)
+        // `backend` only reports the GPU tier when the dispatcher holds a
+        // device-resident matrix, so the `Some` arm covers exactly the
+        // device batches and every other combination runs the CPU path.
+        match (self.backend(queries.len()), self.device.as_ref()) {
+            (AnswerBackend::Gpu, Some((answerer, gpu_matrix))) => {
+                Ok(answerer.answer_batch(gpu_matrix, queries)?)
             }
             _ => Ok(crate::answer_batch(&self.params, self.matrix, queries)?),
         }

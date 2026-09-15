@@ -231,6 +231,51 @@ fn error_round_trips_and_preserves_unknown_codes() {
 }
 
 #[test]
+fn upload_accepted_rejects_zero_identifiers() {
+    let mut buffer = Vec::new();
+    write_upload_accepted(&mut buffer, &[1, 0, 2]).unwrap();
+    assert!(matches!(
+        read_upload_accepted(&mut Cursor::new(&buffer)),
+        Err(CodecError::InvalidDimensions {
+            name: "matrix identifier",
+            value: 0
+        })
+    ));
+}
+
+#[test]
+fn zero_answer_dimensions_are_rejected() {
+    let mut buffer = Vec::new();
+    write_products(&mut buffer, &[product_entry()]).unwrap();
+    // Per answer: 16 (instance id) + 8 (query id) + 8 (rows) + 8 (blocks)
+    // + 8 (value count) after the 9-byte header and three u64 fields.
+    let rows_offset = 9 + 8 + 8 + 8 + 16 + 8;
+    buffer[rows_offset..rows_offset + 8].copy_from_slice(&0_u64.to_le_bytes());
+    buffer[rows_offset + 8..rows_offset + 16].copy_from_slice(&0_u64.to_le_bytes());
+    buffer[rows_offset + 16..rows_offset + 24].copy_from_slice(&0_u64.to_le_bytes());
+    assert!(matches!(
+        read_products(&mut Cursor::new(&buffer)),
+        Err(CodecError::InvalidDimensions {
+            name: "answer rows",
+            value: 0
+        })
+    ));
+
+    let mut blocks_only = Vec::new();
+    write_products(&mut blocks_only, &[product_entry()]).unwrap();
+    blocks_only[rows_offset..rows_offset + 8].copy_from_slice(&1_u64.to_le_bytes());
+    blocks_only[rows_offset + 8..rows_offset + 16].copy_from_slice(&0_u64.to_le_bytes());
+    blocks_only[rows_offset + 16..rows_offset + 24].copy_from_slice(&0_u64.to_le_bytes());
+    assert!(matches!(
+        read_products(&mut Cursor::new(&blocks_only)),
+        Err(CodecError::InvalidDimensions {
+            name: "answer blocks",
+            value: 0
+        })
+    ));
+}
+
+#[test]
 fn empty_message_lists_round_trip() {
     let mut buffer = Vec::new();
     write_upload_matrices(&mut buffer, &[]).unwrap();

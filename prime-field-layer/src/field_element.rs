@@ -51,7 +51,7 @@ impl<const MODULUS: u32> FieldElement<MODULUS> {
     /// `a`, which is exactly the representation [`FieldElement`] keeps
     /// internally. This exposes that word without conversion so callers can
     /// stream field elements into external buffers, such as GPU uploads, in
-    /// the native representation and read them back with [`Self::from_raw`].
+    /// the native representation and read them back with [`Self::try_from_raw`].
     /// The word is always a canonical residue, so equality on raw words
     /// matches equality on elements.
     #[inline(always)]
@@ -60,22 +60,49 @@ impl<const MODULUS: u32> FieldElement<MODULUS> {
         self.montgomery
     }
 
-    /// Wraps a raw Montgomery residue into an element without conversion.
+    /// Wraps a raw Montgomery residue into an element, checking canonicality.
     ///
     /// `raw` must be the canonical Montgomery residue `a * 2^32 mod MODULUS`
     /// of some canonical `a`, that is, a word in `0..MODULUS` as produced by
-    /// [`Self::to_raw`]. This is the inverse of [`Self::to_raw`]. Checking
-    /// the precondition would only need one compare against the modulus, but
-    /// even that is skipped in release builds to keep the zero-copy
-    /// interchange free, so it is a caller obligation: every other
-    /// operation, including the Montgomery kernels, bounds its arithmetic on
-    /// the operands being canonical.
+    /// [`Self::to_raw`]. This is the checked inverse of [`Self::to_raw`]: one
+    /// comparison keeps the zero-copy interchange safe without canonicalizing
+    /// or reducing the word.
+    ///
+    /// Unsupported moduli are rejected during compilation, so `F_2` cannot
+    /// enter through the raw-word interchange either:
+    ///
+    /// ```compile_fail
+    /// let _ = prime_field_layer::FieldElement::<2>::try_from_raw(1);
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FieldError::NonCanonicalRaw`] when `raw >= MODULUS`. Like
+    /// every other construction path, this refuses to compile for moduli the
+    /// crate does not support, such as `F_2`.
     #[inline(always)]
-    #[must_use]
-    pub const fn from_raw(raw: u32) -> Self {
+    pub const fn try_from_raw(raw: u32) -> Result<Self, FieldError> {
+        let () = PrimeField::<MODULUS>::VALID_MODULUS;
+        if raw < MODULUS {
+            Ok(Self::from_raw_unchecked(raw))
+        } else {
+            Err(FieldError::NonCanonicalRaw {
+                raw,
+                modulus: MODULUS,
+            })
+        }
+    }
+
+    /// Wraps a raw word into an element without checking canonicality.
+    ///
+    /// Crate-internal fast path for words whose canonicality the crate has
+    /// already established, such as the output of [`Self::try_from_raw`]'s
+    /// bound check.
+    #[inline(always)]
+    pub(crate) const fn from_raw_unchecked(raw: u32) -> Self {
         debug_assert!(
             raw < MODULUS,
-            "from_raw requires a canonical Montgomery residue"
+            "raw word must be a canonical Montgomery residue"
         );
         Self::from_montgomery(raw)
     }
@@ -83,10 +110,11 @@ impl<const MODULUS: u32> FieldElement<MODULUS> {
     /// Returns the zero-sized field value for this element's modulus.
     ///
     /// This is an `O(1)` type-level association and neither inspects nor
-    /// converts the element.
+    /// converts the element. It routes through [`PrimeField::new`], so the
+    /// odd-prime modulus validation is identical and cannot be bypassed.
     #[must_use]
     pub const fn field(self) -> PrimeField<MODULUS> {
-        PrimeField::<MODULUS>::assume_valid()
+        PrimeField::<MODULUS>::new()
     }
 
     /// Squares this element while retaining Montgomery representation.

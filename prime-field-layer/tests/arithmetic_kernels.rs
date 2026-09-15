@@ -107,7 +107,7 @@ fn check_dense_kernels<const MODULUS: u32>() {
 
 #[test]
 fn dense_kernels_match_canonical_references_at_boundaries_and_tails() {
-    check_dense_kernels::<2>();
+    check_dense_kernels::<3>();
     check_dense_kernels::<1_073_479_681>();
     check_dense_kernels::<2_013_265_921>();
 }
@@ -141,7 +141,7 @@ fn check_batched_scan<const MODULUS: u32>(positions: usize, width: usize) {
 
 #[test]
 fn batched_scan_matches_independent_lane_references_at_boundaries() {
-    check_batched_scan::<2>(7, 3);
+    check_batched_scan::<3>(7, 3);
     check_batched_scan::<1_073_479_681>(7, 3);
     check_batched_scan::<2_013_265_921>(7, 3);
 }
@@ -156,14 +156,14 @@ fn batched_scan_accepts_empty_positions_for_positive_width() {
     let mut values = [];
     let weights = [];
 
-    batched_weighted_inclusive_scan_assign::<2>(&mut values, &weights, 4).unwrap();
+    batched_weighted_inclusive_scan_assign::<3>(&mut values, &weights, 4).unwrap();
 }
 
 #[test]
 fn batched_scan_rejects_zero_width_without_mutation() {
     let mut empty = [];
     assert_eq!(
-        batched_weighted_inclusive_scan_assign::<2>(&mut empty, &[], 0),
+        batched_weighted_inclusive_scan_assign::<3>(&mut empty, &[], 0),
         Err(ArithmeticKernelError::ZeroBatchWidth)
     );
 
@@ -238,7 +238,7 @@ fn check_sparse<const MODULUS: u32>() {
 
 #[test]
 fn sparse_accumulation_matches_reference_with_duplicates_and_boundary_indices() {
-    check_sparse::<2>();
+    check_sparse::<3>();
     check_sparse::<1_073_479_681>();
     check_sparse::<2_013_265_921>();
 }
@@ -303,7 +303,7 @@ fn invalid_sparse_index_reports_entry_and_does_not_mutate_output() {
 
 #[test]
 fn sparse_entries_are_rejected_for_empty_output_before_mutation() {
-    let field = PrimeField::<2>::new();
+    let field = PrimeField::<3>::new();
     let entries = [IndexedValue::new(0, field.element_u32(1))];
     let mut output = [];
 

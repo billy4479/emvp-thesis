@@ -9,8 +9,16 @@ pub enum FieldError {
     DivisionByZero,
     LengthMismatch,
     UnsupportedTransformLength(usize),
-    PlanTooSmall { required: usize, available: usize },
+    PlanTooSmall {
+        required: usize,
+        available: usize,
+    },
     ConvolutionLengthOverflow,
+    /// A raw Montgomery word was not a canonical residue.
+    NonCanonicalRaw {
+        raw: u32,
+        modulus: u32,
+    },
 }
 
 impl fmt::Display for FieldError {
@@ -33,13 +41,21 @@ impl fmt::Display for FieldError {
             ),
             Self::ConvolutionLengthOverflow => formatter
                 .write_str("convolution result or required transform length does not fit in usize"),
+            Self::NonCanonicalRaw { raw, modulus } => write!(
+                formatter,
+                "raw Montgomery word {raw} is not a canonical residue below modulus {modulus}"
+            ),
         }
     }
 }
 
 impl std::error::Error for FieldError {}
 
-/// Arithmetic modulo the compile-time prime `MODULUS`.
+/// Arithmetic modulo the compile-time odd prime `MODULUS`.
+///
+/// The supported invariant is an *odd* prime modulus: every Montgomery and
+/// two-adic kernel assumes `MODULUS > 2`, so `F_2` is deliberately not
+/// supported and fails to compile exactly like a composite modulus.
 ///
 /// Methods whose names end in `_canonical` require every raw `u32` operand to
 /// be less than `MODULUS`. This explicit low-level API avoids a remainder in hot
@@ -51,6 +67,12 @@ impl std::error::Error for FieldError {}
 ///
 /// ```compile_fail
 /// let _ = prime_field_layer::PrimeField::<15>::new();
+/// ```
+///
+/// The even prime is rejected the same way:
+///
+/// ```compile_fail
+/// let _ = prime_field_layer::PrimeField::<2>::new();
 /// ```
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct PrimeField<const MODULUS: u32> {
@@ -64,19 +86,14 @@ impl<const MODULUS: u32> Default for PrimeField<MODULUS> {
 }
 
 impl<const MODULUS: u32> PrimeField<MODULUS> {
-    const VALID_MODULUS: () = assert!(Self::is_prime(MODULUS), "field modulus must be prime");
+    pub(crate) const VALID_MODULUS: () = assert!(
+        MODULUS > 2 && Self::is_prime(MODULUS),
+        "field modulus must be an odd prime"
+    );
     const MODULUS_U64: u64 = MODULUS as u64;
     pub(crate) const MONTGOMERY_NEG_INV: u32 = Self::calculate_montgomery_neg_inv();
-    const MONTGOMERY_R2: u32 = if MODULUS <= 1 {
-        0
-    } else {
-        ((1u128 << 64) % MODULUS as u128) as u32
-    };
-    const MONTGOMERY_ONE: u32 = if MODULUS <= 1 {
-        0
-    } else {
-        ((1u64 << 32) % MODULUS as u64) as u32
-    };
+    const MONTGOMERY_R2: u32 = ((1u128 << 64) % MODULUS as u128) as u32;
+    const MONTGOMERY_ONE: u32 = ((1u64 << 32) % MODULUS as u64) as u32;
     const TWO_ADIC_ROOT: u32 = Self::calculate_two_adic_root();
 
     const fn modular_pow(mut base: u64, mut exponent: u32, modulus: u64) -> u64 {
@@ -145,10 +162,6 @@ impl<const MODULUS: u32> PrimeField<MODULUS> {
     }
 
     const fn calculate_montgomery_neg_inv() -> u32 {
-        if MODULUS <= 2 {
-            return 0;
-        }
-
         let mut inverse = MODULUS;
         let mut iteration = 0;
         while iteration < 5 {
@@ -159,9 +172,6 @@ impl<const MODULUS: u32> PrimeField<MODULUS> {
     }
 
     const fn calculate_two_adic_root() -> u32 {
-        if MODULUS == 2 {
-            return 1;
-        }
         if (MODULUS - 1).trailing_zeros() == 1 {
             return MODULUS - 1;
         }
@@ -179,15 +189,11 @@ impl<const MODULUS: u32> PrimeField<MODULUS> {
 
     /// Constructs the zero-sized field value.
     ///
-    /// Compilation fails when `MODULUS` is not prime.
+    /// Compilation fails when `MODULUS` is not an odd prime.
     #[inline(always)]
     #[must_use]
     pub const fn new() -> Self {
         let () = Self::VALID_MODULUS;
-        Self { _private: () }
-    }
-
-    pub(crate) const fn assume_valid() -> Self {
         Self { _private: () }
     }
 
@@ -231,8 +237,7 @@ impl<const MODULUS: u32> PrimeField<MODULUS> {
     /// by this constant to cancel the low 32 bits before the division by
     /// `2^32`. This is exposed so external accelerators, such as GPU compute
     /// kernels, can replicate the crate's Montgomery multiplication exactly.
-    /// It is zero for `MODULUS = 2`, where no Montgomery form exists; every
-    /// other prime modulus yields a valid constant.
+    /// Every supported (odd prime) modulus yields a valid constant.
     #[must_use]
     pub const fn montgomery_neg_inv(&self) -> u32 {
         Self::MONTGOMERY_NEG_INV

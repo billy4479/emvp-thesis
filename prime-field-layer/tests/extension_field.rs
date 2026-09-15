@@ -229,6 +229,158 @@ fn threshold_behavior_is_degree_only() {
 }
 
 #[test]
+fn dense_degree_dispatch_boundary_matches_oracle_on_both_sides() {
+    const MODULUS: u32 = 1_073_479_681;
+
+    // Dense degree-23 and degree-24 moduli around the schoolbook/NTT
+    // dispatch boundary: non-power-of-two degrees whose full 47-coefficient
+    // products pad to a 64-point transform on the NTT side. Every lower
+    // coefficient is a nonzero deterministic residue so neither path sees
+    // sparse structure.
+    for k in [23_usize, 24] {
+        let mut modulus = vec![0_u32; k + 1];
+        // xorshift64*; `% (MODULUS - 1) + 1` maps the full range onto
+        // [1, MODULUS - 1] so every lower coefficient is nonzero.
+        let mut state = 0x9e37_79b9_7f4a_7c15_u64;
+        for coefficient in modulus.iter_mut().take(k) {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            *coefficient = (state % (u64::from(MODULUS) - 1) + 1) as u32;
+        }
+        modulus[k] = 1;
+
+        let plan = PolynomialReductionPlan::<MODULUS>::new(k, &modulus).unwrap();
+        let expected_algorithm = if k <= 23 {
+            PolynomialAlgorithm::Schoolbook
+        } else {
+            PolynomialAlgorithm::Ntt {
+                transform_length: 64,
+            }
+        };
+        assert_eq!(plan.algorithm(), expected_algorithm, "degree {k}");
+
+        let lhs: Vec<u32> = (0..k)
+            .map(|index| ((index as u64 * 2_654_435_761 + 97) % u64::from(MODULUS)) as u32)
+            .collect();
+        let mut rhs: Vec<u32> = (0..k)
+            .map(|index| ((index as u64 * 1_103_515_245 + 12_345) % u64::from(MODULUS)) as u32)
+            .collect();
+        rhs[0] = u32::MAX;
+
+        // Multiplication and squaring through the extension field itself.
+        let extension = ExtensionField::<MODULUS>::new_unchecked_irreducible(k, &modulus).unwrap();
+        let mut scratch = extension.scratch();
+        let mut product = vec![0; k];
+        let mut square = vec![0; k];
+        extension
+            .mul(&lhs, &rhs, &mut product, &mut scratch)
+            .unwrap();
+        extension.square(&lhs, &mut square, &mut scratch).unwrap();
+        assert_eq!(
+            product,
+            oracle_mul(k, MODULUS, &modulus, &lhs, &rhs),
+            "mul, degree {k}"
+        );
+        assert_eq!(
+            square,
+            oracle_mul(k, MODULUS, &modulus, &lhs, &lhs),
+            "square, degree {k}"
+        );
+
+        // Standalone reduction of the full dense product.
+        let mut wide_product = vec![0_u32; 2 * k - 1];
+        for (lhs_index, &lhs_value) in lhs.iter().enumerate() {
+            for (rhs_index, &rhs_value) in rhs.iter().enumerate() {
+                let index = lhs_index + rhs_index;
+                wide_product[index] = ((u64::from(wide_product[index])
+                    + u64::from(lhs_value) * u64::from(rhs_value))
+                    % u64::from(MODULUS)) as u32;
+            }
+        }
+        let mut reduction_scratch = plan.scratch();
+        let mut reduced = vec![0; k];
+        plan.reduce(&wide_product, &mut reduced, &mut reduction_scratch)
+            .unwrap();
+        assert_eq!(
+            reduced,
+            oracle_reduce(k, MODULUS, &modulus, &wide_product),
+            "reduce, degree {k}"
+        );
+    }
+}
+
+/// Removes trailing zero coefficients.
+fn trim_poly(mut polynomial: Vec<u32>) -> Vec<u32> {
+    while polynomial.last() == Some(&0) {
+        polynomial.pop();
+    }
+    polynomial
+}
+
+/// Returns whether the monic `divisor` divides `dividend` over `F_3`.
+fn divides_over_f3(dividend: &[u32], divisor: &[u32]) -> bool {
+    let mut dividend = trim_poly(dividend.to_vec());
+    while dividend.len() >= divisor.len() {
+        let degree = dividend.len() - divisor.len();
+        let factor = dividend[dividend.len() - 1];
+        for (index, &coefficient) in divisor.iter().enumerate() {
+            let target = degree + index;
+            dividend[target] = (dividend[target] + 3 - factor * coefficient % 3) % 3;
+        }
+        dividend = trim_poly(dividend);
+    }
+    dividend.is_empty()
+}
+
+/// Brute-force reducibility oracle over `F_3`.
+///
+/// A degree-`n` polynomial over a field is reducible exactly when it has a
+/// monic divisor of degree in `1..=n/2`; every such divisor exists exactly
+/// when an irreducible factor of degree at most `n/2` does.
+fn is_reducible_over_f3(polynomial: &[u32]) -> bool {
+    let degree = polynomial.len() - 1;
+    (1..=degree / 2).any(|divisor_degree| {
+        (0..3_u32.pow(divisor_degree as u32)).any(|encoding| {
+            let mut divisor = vec![0_u32; divisor_degree + 1];
+            divisor[divisor_degree] = 1;
+            for (index, coefficient) in divisor.iter_mut().enumerate().take(divisor_degree) {
+                *coefficient = (encoding / 3_u32.pow(index as u32)) % 3;
+            }
+            divides_over_f3(polynomial, &divisor)
+        })
+    })
+}
+
+#[test]
+fn irreducibility_matches_an_exhaustive_small_field_oracle() {
+    // Rabin's test, as run by `ExtensionField::new`, must agree with the
+    // brute-force classification of every monic polynomial of degrees 2-4
+    // over F_3. The expected irreducible counts follow the necklace count
+    // (1/n) * sum_(d | n) mu(d) * 3^(n/d), independently confirming the
+    // oracle itself: 3 quadratic, 8 cubic, and 18 quartic polynomials.
+    const EXPECTED_COUNTS: [(usize, usize); 3] = [(2, 3), (3, 8), (4, 18)];
+    for (degree, expected_count) in EXPECTED_COUNTS {
+        let mut irreducible_count = 0;
+        for encoding in 0..3_u32.pow(degree as u32) {
+            let mut modulus = vec![0_u32; degree + 1];
+            modulus[degree] = 1;
+            for (index, coefficient) in modulus.iter_mut().enumerate().take(degree) {
+                *coefficient = (encoding / 3_u32.pow(index as u32)) % 3;
+            }
+            let accepted = ExtensionField::<3>::new(degree, &modulus).is_ok();
+            assert_eq!(
+                accepted,
+                !is_reducible_over_f3(&modulus),
+                "degree {degree}, modulus {modulus:?}"
+            );
+            irreducible_count += usize::from(accepted);
+        }
+        assert_eq!(irreducible_count, expected_count, "degree {degree}");
+    }
+}
+
+#[test]
 fn caller_scratch_reuses_all_allocations() {
     const MODULUS: u32 = 1_073_479_681;
     let k: usize = 128;

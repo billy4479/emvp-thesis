@@ -237,25 +237,28 @@ fn search_respects_record_lengths() {
 }
 
 #[test]
-fn protocol_security_cannot_exceed_the_prf_key() {
-    let params = EmvpParams {
-        k: 257,
-        ell: 257,
-        b: 2,
-        lambda: PROTOCOL_MAX_LAMBDA + 1,
-    };
-    assert_eq!(
-        params.validate(),
-        Err(ParamsError::LambdaOutOfScope {
-            lambda: PROTOCOL_MAX_LAMBDA + 1,
-        })
-    );
-    assert_eq!(
-        emvp::search(257, PROTOCOL_MAX_LAMBDA + 1),
-        Err(ParamsError::LambdaOutOfScope {
-            lambda: PROTOCOL_MAX_LAMBDA + 1,
-        })
-    );
+fn protocol_security_is_capped_at_128_bits() {
+    // The cap is exact: the first rejected level is 129, and 256 (the old
+    // PRF-key-derived bound) is rejected too.
+    assert_eq!(PROTOCOL_MAX_LAMBDA, 128);
+    for &lambda in &[PROTOCOL_MAX_LAMBDA + 1, 256] {
+        let params = EmvpParams {
+            k: 257,
+            ell: 257,
+            b: 2,
+            lambda,
+        };
+        assert_eq!(
+            params.validate(),
+            Err(ParamsError::LambdaOutOfScope { lambda }),
+            "lambda = {lambda} must be rejected"
+        );
+        assert_eq!(
+            emvp::search(257, lambda),
+            Err(ParamsError::LambdaOutOfScope { lambda }),
+            "search at lambda = {lambda} must be rejected"
+        );
+    }
 }
 
 #[test]

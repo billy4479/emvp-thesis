@@ -59,7 +59,6 @@ fn check_boundaries<const MODULUS: u32>() {
 
 #[test]
 fn arithmetic_matches_oracle_at_boundaries() {
-    check_boundaries::<2>();
     check_boundaries::<3>();
     check_boundaries::<17>();
     check_boundaries::<257>();
@@ -79,7 +78,6 @@ fn check_exhaustive<const MODULUS: u32>() {
 
 #[test]
 fn arithmetic_is_exhaustive_for_tiny_fields() {
-    check_exhaustive::<2>();
     check_exhaustive::<3>();
     check_exhaustive::<5>();
     check_exhaustive::<17>();
@@ -103,7 +101,6 @@ fn check_reduction<const MODULUS: u32>() {
 
 #[test]
 fn reduction_handles_full_u64_range() {
-    check_reduction::<2>();
     check_reduction::<17>();
     check_reduction::<65_537>();
     check_reduction::<1_073_479_681>();
@@ -137,7 +134,6 @@ fn check_exponentiation<const MODULUS: u32>() {
 
 #[test]
 fn exponentiation_matches_oracle() {
-    check_exponentiation::<2>();
     check_exponentiation::<17>();
     check_exponentiation::<65_537>();
     check_exponentiation::<1_073_479_681>();
@@ -166,7 +162,6 @@ fn check_boundary_inverses<const MODULUS: u32>() {
 
 #[test]
 fn inversion_is_multiplicative_and_rejects_zero() {
-    check_all_inverses::<2>();
     check_all_inverses::<3>();
     check_all_inverses::<5>();
     check_all_inverses::<17>();
@@ -193,7 +188,6 @@ fn check_noncanonical_inverses<const MODULUS: u32>() {
 
 #[test]
 fn inversion_reduces_full_width_inputs_before_the_zero_check() {
-    check_noncanonical_inverses::<2>();
     check_noncanonical_inverses::<17>();
     check_noncanonical_inverses::<65_537>();
     check_noncanonical_inverses::<1_073_479_681>();

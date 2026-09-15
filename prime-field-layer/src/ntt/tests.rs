@@ -4,7 +4,7 @@ use super::*;
 fn lazy_boundaries_round_trip_and_normalize_output() {
     const MODULUS: u32 = 1_073_479_681;
 
-    let plan = NttPlan::<MODULUS>::new_scalar(256).unwrap();
+    let plan = NttPlan::<MODULUS>::new(256).unwrap();
     // Every endpoint of the [0, 4p) forward lazy interval, plus the
     // interior boundaries at p and 3p.
     let boundaries = [
@@ -48,7 +48,7 @@ fn lazy_boundaries_round_trip_and_normalize_output() {
 fn lazy_inverse_boundaries_round_trip_and_normalize_output() {
     const MODULUS: u32 = 1_073_479_681;
 
-    let plan = NttPlan::<MODULUS>::new_scalar(256).unwrap();
+    let plan = NttPlan::<MODULUS>::new(256).unwrap();
     // Endpoints of the [0, 2p) inverse lazy interval, seeded directly
     // into the inverse transform without a prior forward pass.
     let boundaries = [0, 1, MODULUS - 1, MODULUS, 2 * MODULUS - 2, 2 * MODULUS - 1];
@@ -82,7 +82,7 @@ fn lazy_inverse_boundaries_round_trip_and_normalize_output() {
 #[test]
 fn transform_outputs_have_canonical_montgomery_words() {
     fn check<const MODULUS: u32>() {
-        let plan = NttPlan::<MODULUS>::new_scalar(256).unwrap();
+        let plan = NttPlan::<MODULUS>::new(256).unwrap();
         let input: Vec<_> = (0_u64..256)
             .map(|index| ((index * 1_103_515_245 + 12_345) % u64::from(MODULUS)) as u32)
             .collect();
@@ -101,7 +101,7 @@ fn transform_outputs_have_canonical_montgomery_words() {
 #[test]
 fn incremental_twiddle_table_preserves_stage_mapping() {
     let field = PrimeField::<65_537>::new();
-    let plan = NttPlan::<65_537>::new_scalar(256).unwrap();
+    let plan = NttPlan::<65_537>::new(256).unwrap();
     let root = field.root_of_unity(256).unwrap();
     for stage in plan.stages.iter() {
         let bits = stage.forward.len().trailing_zeros();

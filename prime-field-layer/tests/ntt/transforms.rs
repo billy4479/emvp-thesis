@@ -39,7 +39,7 @@ fn round_trips_all_modulus_tiers_and_lengths() {
 fn forward_values_match_independent_dft_in_documented_order() {
     let field = PrimeField::<17>::new();
     let input = [0, 1, 2, 3, 16, 15, 8, 9];
-    let plan = NttPlan::<17>::new_scalar(input.len()).unwrap();
+    let plan = NttPlan::<17>::new(input.len()).unwrap();
     let mut actual = plan.elements(&input);
     plan.forward(&mut actual).unwrap();
     let natural = oracle_dft::<17>(&input, field.root_of_unity(input.len()).unwrap());
@@ -59,7 +59,7 @@ fn forward_values_match_independent_dft_in_documented_order() {
 fn incremental_twiddles_match_randomized_wide_prime_dfts() {
     const MODULUS: u32 = 2_281_701_377;
     let field = PrimeField::<MODULUS>::new();
-    let plan = NttPlan::<MODULUS>::new_scalar(16).unwrap();
+    let plan = NttPlan::<MODULUS>::new(16).unwrap();
     let root = field.root_of_unity(16).unwrap();
     let mut state = 0x9e37_79b9_7f4a_7c15u64;
 

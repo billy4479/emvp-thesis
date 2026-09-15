@@ -20,12 +20,14 @@
 //! on those raw words, so uploads and readbacks move the words as-is:
 //! [`GpuAnswerer::upload_matrix`] streams the raw words into the device
 //! buffer, and [`GpuAnswerer::answer_batch`] wraps the returned words with
-//! [`prime_field_layer::FieldElement::from_raw`]. The results are
-//! bit-identical to the CPU [`answer_batch`](crate::answer_batch), which
-//! remains the reference implementation; the parity tests in
+//! the checked [`prime_field_layer::FieldElement::try_from_raw`]. The
+//! results are bit-identical to the CPU [`answer_batch`](crate::answer_batch),
+//! which remains the reference implementation; the parity tests in
 //! `emvp/tests/gpu.rs` pin this property empirically. Because the kernel's
 //! final fold returns a canonical word, equality on raw words matches
-//! equality on elements and no normalization pass is needed.
+//! equality on elements and no normalization pass is needed; a device word
+//! outside `0..p` would be a broken readback and is rejected as
+//! [`GpuError::NonCanonicalWord`] instead of silently canonicalized.
 //!
 //! # Pipelines and constants
 //!
@@ -64,31 +66,42 @@
 //! staging buffer, and the per-query answer vectors are reconstructed in
 //! one pass over the mapped bytes.
 //!
+//! # Blocking behavior
+//!
+//! The API is synchronous. wgpu's adapter search, device request, and
+//! `map_async` completion genuinely require waiting, so
+//! [`GpuAnswerer::new`] blocks on adapter and device acquisition through
+//! [`pollster`] and the readback phase blocks the calling thread with a
+//! [`wgpu::PollType::Wait`] device poll. No method fakes nonblocking
+//! behavior; latency-sensitive callers should run batches on a thread that
+//! is allowed to block.
+//!
 //! # Phase timings
 //!
-//! [`GpuAnswerer::answer_batch_with_timings`] (and its `_sync` form)
-//! reports the host-side wall-clock breakdown of a batch in
-//! [`PhaseTimings`]; the `gpu_answer/phase/*` benchmark cases in
-//! `emvp/benches/gpu.rs` print the breakdown next to the totals.
-//!
-//! The `answer_*_sync` wrappers block the calling thread with
-//! [`pollster`]; the async methods exist so servers can integrate with
-//! async executors, but note that the device wait inside
-//! [`GpuAnswerer::answer_batch_with_timings`] is itself a blocking poll, so
-//! latency-sensitive executors should run the future on a blocking thread.
+//! [`GpuAnswerer::answer_batch_with_timings`] reports the host-side
+//! wall-clock breakdown of a batch in [`PhaseTimings`]. The GPU benchmark
+//! prints a fixed set of diagnostic calls collected outside Criterion timing.
 //!
 //! # Errors
 //!
 //! Every failure mode surfaces as a [`GpuError`] rather than a
 //! [`crate::ProtocolError`]: the GPU path is server plumbing, servers use
 //! [`GpuAnswerer`] directly, and folding it into the protocol error type
-//! would couple client-side decoding to the server's hardware.
+//! would couple client-side decoding to the server's hardware. Shape
+//! validation reuses the protocol crate's server-side checks
+//! ([`crate::protocol::validate_matrix_shape`] and the per-query validator
+//! next to it) so CPU, dispatcher, and GPU reject the same shapes before
+//! any work; those failures are mapped onto their [`GpuError`]
+//! equivalents.
 //!
 //! # Experimental
 //!
 //! This is experimental cryptography running on an unaudited kernel; the
 //! WGSL is compiled by naga at runtime, so shader failures surface as
-//! device errors rather than compile-time failures.
+//! device errors rather than compile-time failures. The parse-and-validate
+//! test in this module pins the embedded shader's WGSL well-formedness
+//! device-independently; only the device-side execution itself needs
+//! hardware.
 
 use std::collections::HashMap;
 use std::fmt;
@@ -98,7 +111,10 @@ use std::time::{Duration, Instant};
 use prime_field_layer::{FieldElement, PrimeField};
 
 use crate::params::EmvpParams;
-use crate::protocol::{AnswerMatrix, EncryptedMatrix, EncryptedQuery};
+use crate::protocol::{
+    AnswerMatrix, EncryptedMatrix, EncryptedQuery, ProtocolError, validate_matrix_shape,
+    validate_query_against_matrix,
+};
 
 /// The answer compute kernel, compiled once per modulus.
 const ANSWER_WGSL: &str = include_str!("answer.wgsl");
@@ -146,8 +162,9 @@ const MAX_ANSWER_WORDS: usize =
 #[non_exhaustive]
 pub enum GpuError {
     /// No compute adapter matched the request. The machine may have no GPU,
-    /// no Vulkan-compatible driver, or the loader may be missing; callers
-    /// (tests, benchmarks) treat this variant as a graceful skip.
+    /// no Vulkan-compatible driver, or the loader may be missing; tests
+    /// mark their adapter-dependent cases `#[ignore = "requires a compute
+    /// adapter"]` and benchmarks print a notice.
     NoAdapter {
         /// The adapter-search failure description.
         reason: String,
@@ -203,6 +220,23 @@ pub enum GpuError {
     Submission(String),
     /// Mapping or reading the staging buffer failed.
     Map(String),
+    /// A device answer word was not a canonical Montgomery residue, so the
+    /// readback is corrupt and cannot be wrapped into a
+    /// [`prime_field_layer::FieldElement`] without silently canonicalizing
+    /// it. Carries the rejected word and the modulus it was checked against.
+    NonCanonicalWord {
+        /// The rejected raw word.
+        word: u32,
+        /// The field modulus the word was checked against.
+        modulus: u32,
+    },
+    /// A protocol validation failure outside the four shapes the shared
+    /// server-side validation produces ([`Self::LengthMismatch`],
+    /// [`Self::DimensionOverflow`], [`Self::Params`], and
+    /// [`Self::InstanceMismatch`]). Unreachable from that validation;
+    /// retained so the mapping from [`ProtocolError`] stays total and
+    /// fail-closed rather than dropping an unexpected variant.
+    Protocol(ProtocolError),
 }
 
 impl fmt::Display for GpuError {
@@ -249,6 +283,11 @@ impl fmt::Display for GpuError {
                 write!(formatter, "GPU submission or poll failed: {reason}")
             }
             Self::Map(reason) => write!(formatter, "GPU readback mapping failed: {reason}"),
+            Self::NonCanonicalWord { word, modulus } => write!(
+                formatter,
+                "device answer word {word} is not a canonical Montgomery residue below modulus {modulus}"
+            ),
+            Self::Protocol(error) => error.fmt(formatter),
         }
     }
 }
@@ -257,6 +296,7 @@ impl std::error::Error for GpuError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Params(error) => Some(error),
+            Self::Protocol(error) => Some(error),
             _ => None,
         }
     }
@@ -265,6 +305,35 @@ impl std::error::Error for GpuError {
 impl From<crate::params::ParamsError> for GpuError {
     fn from(error: crate::params::ParamsError) -> Self {
         Self::Params(error)
+    }
+}
+
+impl From<ProtocolError> for GpuError {
+    fn from(error: ProtocolError) -> Self {
+        match error {
+            // The exact variants the shared server-side shape validation can
+            // produce, mapped onto their precise GPU equivalents.
+            ProtocolError::LengthMismatch {
+                name,
+                expected,
+                actual,
+            } => Self::LengthMismatch {
+                name,
+                expected,
+                actual,
+            },
+            ProtocolError::DimensionOverflow => Self::DimensionOverflow,
+            ProtocolError::Params(error) => Self::Params(error),
+            ProtocolError::InstanceMismatch {
+                name: _,
+                expected,
+                actual,
+            } => Self::InstanceMismatch { expected, actual },
+            // Every other protocol failure is unreachable from the shared
+            // shape validation; keeping the arm total means a future variant
+            // cannot be silently dropped here.
+            other => Self::Protocol(other),
+        }
     }
 }
 
@@ -303,8 +372,9 @@ pub struct PhaseTimings {
     /// run. This is the phase that waits on GPU execution.
     pub wait_readback: Duration,
     /// Reconstructing the per-query answer vectors from the mapped staging
-    /// bytes: the `FieldElement::from_raw` word pass and the split into
-    /// [`AnswerMatrix`]s. Pure host work with no device dependency.
+    /// bytes: the checked `FieldElement::try_from_raw` word pass and the
+    /// split into [`AnswerMatrix`]s. Pure host work with no device
+    /// dependency.
     pub reconstruct: Duration,
 }
 
@@ -395,12 +465,26 @@ impl GpuAnswerer {
     /// the adapter supports, because production encrypted matrices reach
     /// gibibytes while wgpu's default limits cap buffers at 256 MiB.
     ///
+    /// This blocks the calling thread: wgpu's adapter search and device
+    /// request are genuinely asynchronous interfaces, and the acquisition
+    /// waits on them through [`pollster`]. See the module's [blocking
+    /// behavior](self#blocking-behavior) documentation.
+    ///
     /// # Errors
     ///
     /// Returns [`GpuError::NoAdapter`] when no Vulkan/GL adapter is
     /// available (the container case), and [`GpuError::RequestDevice`] when
     /// the adapter rejects the device request.
-    pub async fn new() -> Result<Self, GpuError> {
+    pub fn new() -> Result<Self, GpuError> {
+        pollster::block_on(Self::acquire())
+    }
+
+    /// The async half of [`Self::new`]: adapter and device acquisition.
+    ///
+    /// wgpu's request interfaces are async; [`pollster`] bridges them to
+    /// the synchronous API. Kept private so no public method pretends the
+    /// wait is optional.
+    async fn acquire() -> Result<Self, GpuError> {
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
         let adapter = instance
             .request_adapter(&wgpu::RequestAdapterOptions {
@@ -454,6 +538,11 @@ impl GpuAnswerer {
     /// parameters of `matrix`; they fix the block structure the kernel
     /// answers with.
     ///
+    /// Shape validation reuses
+    /// [`crate::protocol::validate_matrix_shape`], the same check the CPU
+    /// answer path and the [`AnswerDispatcher`](crate::dispatch::AnswerDispatcher)
+    /// run, so all server paths reject the same malformed shapes.
+    ///
     /// # Errors
     ///
     /// Returns an error before any transfer if the parameters are malformed,
@@ -461,29 +550,17 @@ impl GpuAnswerer {
     /// empty, its value length differs from `rows * columns`, the element
     /// count exceeds the device's per-buffer capacity or the kernel's u32
     /// index bound, or the driver refuses the buffer allocation.
-    #[expect(
-        clippy::unused_async,
-        reason = "the async surface stays uniform across the answerer API so callers integrate it with executors uniformly"
-    )]
-    pub async fn upload_matrix<const MODULUS: u32>(
+    pub fn upload_matrix<const MODULUS: u32>(
         &self,
         params: &EmvpParams,
         matrix: &EncryptedMatrix<MODULUS>,
     ) -> Result<GpuEncryptedMatrix<MODULUS>, GpuError> {
         check_modulus::<MODULUS>()?;
-        params.validate_dimensions()?;
-        let n = params.n()?;
-        check_len("encrypted matrix columns", n, matrix.columns())?;
+        let n = validate_matrix_shape(params, matrix)?;
         let rows = matrix.rows();
-        if rows == 0 {
-            return Err(GpuError::LengthMismatch {
-                name: "matrix rows",
-                expected: 1,
-                actual: 0,
-            });
-        }
+        // The shared validator already multiplied `rows * n` successfully,
+        // so this product cannot overflow.
         let words = rows.checked_mul(n).ok_or(GpuError::DimensionOverflow)?;
-        check_len("encrypted matrix values", words, matrix.values().len())?;
         // The u32 narrowing doubles as the kernel's u32 index bound: every
         // matrix index is below `rows * n = words`.
         let words_u32 = u32::try_from(words).map_err(|_conversion| GpuError::UploadTooLarge {
@@ -539,13 +616,12 @@ impl GpuAnswerer {
     /// foreign instance identifier, an index or size would overflow, the
     /// query/output buffers exceed the device's capacity, or the driver
     /// refuses a buffer allocation.
-    pub async fn answer_batch<const MODULUS: u32>(
+    pub fn answer_batch<const MODULUS: u32>(
         &self,
         matrix: &GpuEncryptedMatrix<MODULUS>,
         queries: &[EncryptedQuery<MODULUS>],
     ) -> Result<Vec<AnswerMatrix<MODULUS>>, GpuError> {
         self.answer_batch_with_timings(matrix, queries)
-            .await
             .map(|(answers, _timings)| answers)
     }
 
@@ -564,11 +640,7 @@ impl GpuAnswerer {
     /// # Errors
     ///
     /// Returns the same errors as [`Self::answer_batch`].
-    #[expect(
-        clippy::unused_async,
-        reason = "the async surface stays uniform across the answerer API so callers integrate it with executors uniformly"
-    )]
-    pub async fn answer_batch_with_timings<const MODULUS: u32>(
+    pub fn answer_batch_with_timings<const MODULUS: u32>(
         &self,
         matrix: &GpuEncryptedMatrix<MODULUS>,
         queries: &[EncryptedQuery<MODULUS>],
@@ -635,7 +707,8 @@ impl GpuAnswerer {
 
         let answers = {
             let start = Instant::now();
-            let answers = read_staged_answers(matrix, queries, staging_buffer, &shape)?;
+            let answers =
+                read_staged_answers(matrix.instance_id(), queries, staging_buffer, &shape)?;
             timings.reconstruct = start.elapsed();
             answers
         };
@@ -643,54 +716,6 @@ impl GpuAnswerer {
         // which only costs the next call a fresh allocation.
         lock_recovered(&self.scratch_pool).push(scratch);
         Ok((answers, timings))
-    }
-
-    /// Blocking single-threaded wrapper around [`Self::new`].
-    ///
-    /// # Errors
-    ///
-    /// Returns the same errors as [`Self::new`].
-    pub fn new_sync() -> Result<Self, GpuError> {
-        pollster::block_on(Self::new())
-    }
-
-    /// Blocking wrapper around [`Self::upload_matrix`].
-    ///
-    /// # Errors
-    ///
-    /// Returns the same errors as [`Self::upload_matrix`].
-    pub fn upload_matrix_sync<const MODULUS: u32>(
-        &self,
-        params: &EmvpParams,
-        matrix: &EncryptedMatrix<MODULUS>,
-    ) -> Result<GpuEncryptedMatrix<MODULUS>, GpuError> {
-        pollster::block_on(self.upload_matrix(params, matrix))
-    }
-
-    /// Blocking wrapper around [`Self::answer_batch`].
-    ///
-    /// # Errors
-    ///
-    /// Returns the same errors as [`Self::answer_batch`].
-    pub fn answer_batch_sync<const MODULUS: u32>(
-        &self,
-        matrix: &GpuEncryptedMatrix<MODULUS>,
-        queries: &[EncryptedQuery<MODULUS>],
-    ) -> Result<Vec<AnswerMatrix<MODULUS>>, GpuError> {
-        pollster::block_on(self.answer_batch(matrix, queries))
-    }
-
-    /// Blocking wrapper around [`Self::answer_batch_with_timings`].
-    ///
-    /// # Errors
-    ///
-    /// Returns the same errors as [`Self::answer_batch_with_timings`].
-    pub fn answer_batch_sync_with_timings<const MODULUS: u32>(
-        &self,
-        matrix: &GpuEncryptedMatrix<MODULUS>,
-        queries: &[EncryptedQuery<MODULUS>],
-    ) -> Result<(Vec<AnswerMatrix<MODULUS>>, PhaseTimings), GpuError> {
-        pollster::block_on(self.answer_batch_with_timings(matrix, queries))
     }
 
     /// Returns the cached answer pipeline for this modulus, compiling it on
@@ -803,8 +828,16 @@ impl GpuAnswerer {
         Ok(())
     }
 
-    /// Runs the all-or-nothing validation for one answer batch, mirroring
-    /// the CPU `answer_batch` checks, and returns the kernel's dimensions.
+    /// Runs the all-or-nothing validation for one answer batch and returns
+    /// the kernel's dimensions.
+    ///
+    /// The per-query checks reuse
+    /// [`crate::protocol::validate_query_against_matrix`], the same
+    /// validation the CPU `answer_batch` runs, so CPU, dispatcher, and GPU
+    /// reject the same malformed batches. The matrix shape itself was
+    /// validated at upload time (the stored parameters and dimensions are
+    /// pinned by [`GpuEncryptedMatrix`]); the batch-specific work here is
+    /// the empty-batch rejection and the kernel's device and index bounds.
     fn answer_shape<const MODULUS: u32>(
         &self,
         matrix: &GpuEncryptedMatrix<MODULUS>,
@@ -820,17 +853,12 @@ impl GpuAnswerer {
         let params = matrix.params();
         params.validate_dimensions()?;
         let n = matrix.columns();
+        for query in queries {
+            validate_query_against_matrix(n, matrix.instance_id(), query)?;
+        }
+        let b = params.block_size();
         let s = params.blocks()?;
         let rows = matrix.rows();
-        for query in queries {
-            check_len("encrypted query", n, query.values().len())?;
-            if query.instance_id() != matrix.instance_id() {
-                return Err(GpuError::InstanceMismatch {
-                    expected: matrix.instance_id(),
-                    actual: query.instance_id(),
-                });
-            }
-        }
         let query_words = queries
             .len()
             .checked_mul(n)
@@ -865,7 +893,7 @@ impl GpuAnswerer {
         self.check_buffer_words(u64::from(answer_words_u32))?;
         Ok(AnswerShape {
             n,
-            b: params.block_size(),
+            b,
             s,
             rows,
             batch: queries.len(),
@@ -1249,7 +1277,7 @@ fn fill_query_view<const MODULUS: u32>(
 /// The mapping is released on every path after it succeeded, so a pooled
 /// scratch set is always returned to the pool unmapped.
 fn read_staged_answers<const MODULUS: u32>(
-    matrix: &GpuEncryptedMatrix<MODULUS>,
+    instance_id: u128,
     queries: &[EncryptedQuery<MODULUS>],
     staging_buffer: &wgpu::Buffer,
     shape: &AnswerShape,
@@ -1262,7 +1290,7 @@ fn read_staged_answers<const MODULUS: u32>(
             return Err(GpuError::Map(error.to_string()));
         }
     };
-    let answers = match reconstruct_answers(matrix, queries, shape, &data) {
+    let answers = match reconstruct_answers(instance_id, queries, shape, &data) {
         Ok(answers) => answers,
         Err(error) => {
             drop(data);
@@ -1275,19 +1303,36 @@ fn read_staged_answers<const MODULUS: u32>(
     Ok(answers)
 }
 
+/// Wraps one little-endian staged answer word as a canonical field
+/// element, rejecting a corrupt word precisely.
+fn staged_answer_word<const MODULUS: u32>(word: &[u8]) -> Result<FieldElement<MODULUS>, GpuError> {
+    let raw = u32::from_le_bytes([word[0], word[1], word[2], word[3]]);
+    FieldElement::<MODULUS>::try_from_raw(raw).map_err(|_field_error| GpuError::NonCanonicalWord {
+        word: raw,
+        modulus: MODULUS,
+    })
+}
+
 /// Splits the staged answer bytes into one [`AnswerMatrix`] per query.
 ///
-/// Infallible by the validated shape: `bytes` holds exactly
+/// The byte layout is fixed by the validated shape: `bytes` holds exactly
 /// `queries.len() * words_per_query` little-endian words in query-major
 /// order (the kernel's arena layout), so a length mismatch is unreachable;
 /// the check exists to stay fail-closed.
+///
+/// Each readback word is wrapped with the checked
+/// [`FieldElement::try_from_raw`](prime_field_layer::FieldElement::try_from_raw):
+/// the kernel's final fold produces canonical words, so a word outside
+/// `0..MODULUS` means a corrupt readback and is rejected as
+/// [`GpuError::NonCanonicalWord`] with the offending word, never
+/// canonicalized.
 ///
 /// Each per-query `collect` runs over a trusted-length iterator
 /// (`chunks_exact` over an exact-multiple slice), so it performs one
 /// allocation and writes the [`FieldElement`]s directly: no intermediate
 /// answer arena, no per-element growth, and no later per-query copy.
 fn reconstruct_answers<const MODULUS: u32>(
-    matrix: &GpuEncryptedMatrix<MODULUS>,
+    instance_id: u128,
     queries: &[EncryptedQuery<MODULUS>],
     shape: &AnswerShape,
     bytes: &[u8],
@@ -1307,25 +1352,26 @@ fn reconstruct_answers<const MODULUS: u32>(
             actual: bytes.len(),
         });
     }
-    Ok(queries
+    let answers = queries
         .iter()
         .zip(bytes.chunks_exact(bytes_per_query))
-        .map(|(query, chunk)| {
-            let values: Vec<FieldElement<MODULUS>> = chunk
-                .chunks_exact(WORD_BYTES)
-                .map(|word| {
-                    FieldElement::from_raw(u32::from_le_bytes([word[0], word[1], word[2], word[3]]))
-                })
-                .collect();
-            AnswerMatrix::from_parts(
-                matrix.instance_id(),
-                query.query_id(),
-                values,
-                shape.rows,
-                shape.s,
-            )
-        })
-        .collect())
+        .map(
+            |(query, chunk)| -> Result<AnswerMatrix<MODULUS>, GpuError> {
+                let values: Vec<FieldElement<MODULUS>> = chunk
+                    .chunks_exact(WORD_BYTES)
+                    .map(staged_answer_word)
+                    .collect::<Result<Vec<_>, GpuError>>()?;
+                Ok(AnswerMatrix::from_parts(
+                    instance_id,
+                    query.query_id(),
+                    values,
+                    shape.rows,
+                    shape.s,
+                ))
+            },
+        )
+        .collect::<Result<Vec<_>, GpuError>>()?;
+    Ok(answers)
 }
 
 /// Folds the linear output count into a 2D workgroup dispatch that stays
@@ -1375,20 +1421,6 @@ fn dims_uniform_bytes(
     Ok(bytes)
 }
 
-/// Copies a length check into the GPU module, mirroring
-/// `crate::protocol::check_len`.
-const fn check_len(name: &'static str, expected: usize, actual: usize) -> Result<(), GpuError> {
-    if expected == actual {
-        Ok(())
-    } else {
-        Err(GpuError::LengthMismatch {
-            name,
-            expected,
-            actual,
-        })
-    }
-}
-
 /// Rejects moduli the WGSL arithmetic cannot support: the REDC bound
 /// arguments require `p < 2^31`, and Montgomery form requires `p > 2`.
 const fn check_modulus<const MODULUS: u32>() -> Result<(), GpuError> {
@@ -1407,8 +1439,171 @@ fn byte_len_of_words(words: u32) -> wgpu::BufferAddress {
 #[cfg(test)]
 mod tests {
     use super::{
-        MAX_ANSWER_WORDS, MAX_WORKGROUPS_PER_DIMENSION, WORKGROUP_SIZE_USIZE, dispatch_grid,
+        ANSWER_WGSL, AnswerShape, MAX_ANSWER_WORDS, MAX_WORKGROUPS_PER_DIMENSION,
+        WORKGROUP_SIZE_USIZE, dispatch_grid, reconstruct_answers,
     };
+    use crate::params::EmvpParams;
+    use crate::protocol::{EncryptedMatrix, EncryptedQuery};
+    use prime_field_layer::{FieldElement, PrimeField};
+
+    // The deployment field: p = 998244353 is prime and below 2^30. The
+    // host-reconstruction tests need no adapter, only the field type.
+    const MODULUS: u32 = 998_244_353;
+
+    /// The answer shader must parse as WGSL and pass naga's full validation
+    /// without any adapter: this pins the embedded kernel's well-formedness
+    /// on every machine, so only its execution needs hardware.
+    #[test]
+    fn answer_wgsl_parses_and_validates_device_independently() {
+        let module =
+            naga::front::wgsl::parse_str(ANSWER_WGSL).expect("the answer shader must parse");
+        naga::valid::Validator::new(
+            naga::valid::ValidationFlags::all(),
+            naga::valid::Capabilities::all(),
+        )
+        .validate(&module)
+        .expect("the answer shader must validate");
+    }
+
+    /// The validated shape of the two-query host-reconstruction fixture:
+    /// n = 2 (k = 1), b = 2, s = 1, two rows, two queries.
+    fn host_shape() -> AnswerShape {
+        AnswerShape {
+            n: 2,
+            b: 2,
+            s: 1,
+            rows: 2,
+            batch: 2,
+            query_words_u32: 4,
+            answer_words_u32: 4,
+            answer_words: 4,
+            answer_words_per_query: 2,
+        }
+    }
+
+    /// The canonical Montgomery words of the sums 17, 39, 23, 53: each is
+    /// `value * 2^32 mod p`, derived by hand arithmetic, independently of
+    /// both the kernel and the CPU answer path.
+    const HOST_GOLDEN_WORDS: [u32; 4] = [
+        142_606_263, // 17 * 301989884 mod 998244353
+        796_917_593, // 39 * 301989884 mod 998244353
+        956_301_214, // 23 * 301989884 mod 998244353
+        33_554_204,  // 53 * 301989884 mod 998244353
+    ];
+
+    fn host_queries() -> Vec<EncryptedQuery<MODULUS>> {
+        let field = PrimeField::<MODULUS>::new();
+        vec![
+            EncryptedQuery::from_parts(7, 10, vec![field.element_u32(0); 2]),
+            EncryptedQuery::from_parts(7, 11, vec![field.element_u32(0); 2]),
+        ]
+    }
+
+    fn host_bytes(words: &[u32]) -> Vec<u8> {
+        words.iter().flat_map(|word| word.to_le_bytes()).collect()
+    }
+
+    /// Canonical device words must reconstruct into exactly the elements
+    /// they are the Montgomery images of, split per query in the kernel's
+    /// query-major arena order.
+    #[test]
+    fn reconstruct_answers_accepts_canonical_device_words() {
+        let field = PrimeField::<MODULUS>::new();
+        let queries = host_queries();
+        let answers =
+            reconstruct_answers(7, &queries, &host_shape(), &host_bytes(&HOST_GOLDEN_WORDS))
+                .expect("canonical words must reconstruct");
+        assert_eq!(answers.len(), 2);
+        let expected: Vec<Vec<FieldElement<MODULUS>>> = [[17_u32, 39], [23, 53]]
+            .iter()
+            .map(|sums| sums.iter().map(|&sum| field.element_u32(sum)).collect())
+            .collect();
+        for (answer, expected_values) in answers.iter().zip(&expected) {
+            assert_eq!(answer.values(), expected_values.as_slice());
+            assert_eq!(answer.rows(), 2);
+            assert_eq!(answer.blocks(), 1);
+            assert_eq!(answer.instance_id(), 7);
+        }
+        assert_eq!(answers[0].query_id(), 10);
+        assert_eq!(answers[1].query_id(), 11);
+    }
+
+    /// A device word at or above the modulus is not a canonical Montgomery
+    /// residue: reconstruction must reject it precisely, carrying the
+    /// offending word, instead of silently canonicalizing it.
+    #[test]
+    fn reconstruct_answers_rejects_noncanonical_device_words() {
+        let queries = host_queries();
+        let shape = host_shape();
+        // First query's words are canonical (the Montgomery images of 17
+        // and 39); the second query's first word is the smallest
+        // noncanonical residue, the modulus itself.
+        let mut words = HOST_GOLDEN_WORDS.to_vec();
+        words[2] = MODULUS;
+        let error = reconstruct_answers(7, &queries, &shape, &host_bytes(&words))
+            .expect_err("the modulus itself is not canonical");
+        assert_eq!(
+            error,
+            super::GpuError::NonCanonicalWord {
+                word: MODULUS,
+                modulus: MODULUS,
+            }
+        );
+
+        // The maximum u32 word is rejected the same way.
+        let mut words = HOST_GOLDEN_WORDS.to_vec();
+        words[3] = u32::MAX;
+        assert!(matches!(
+            reconstruct_answers(7, &queries, &host_shape(), &host_bytes(&words)),
+            Err(super::GpuError::NonCanonicalWord {
+                word: u32::MAX,
+                modulus: MODULUS,
+            })
+        ));
+
+        // A byte buffer shorter than the validated shape is rejected
+        // fail-closed before any word is wrapped.
+        let bytes = host_bytes(&HOST_GOLDEN_WORDS);
+        assert!(matches!(
+            reconstruct_answers(7, &queries, &host_shape(), &bytes[..bytes.len() - 1]),
+            Err(super::GpuError::LengthMismatch {
+                name: "staged answer bytes",
+                ..
+            })
+        ));
+    }
+
+    /// The shared matrix-shape validation the GPU upload runs (and the CPU
+    /// answer path and dispatcher reuse) rejects mismatched shapes before
+    /// any device work could be reached.
+    #[test]
+    fn upload_shape_validation_matches_the_cpu_path() {
+        use crate::protocol::validate_matrix_shape;
+        let field = PrimeField::<MODULUS>::new();
+        let params = EmvpParams {
+            k: 1,
+            ell: 1,
+            b: 2,
+            lambda: 7,
+        };
+        let matrix = EncryptedMatrix::from_parts(1, 2, 2, vec![field.element_u32(0); 4]).unwrap();
+        // Matching dimensions: the shared validator accepts and returns the
+        // codeword length n = 2.
+        assert_eq!(validate_matrix_shape(&params, &matrix), Ok(2));
+        let mismatched = EmvpParams {
+            k: 2,
+            ell: 1,
+            b: 2,
+            lambda: 7,
+        };
+        assert!(matches!(
+            validate_matrix_shape(&mismatched, &matrix),
+            Err(crate::protocol::ProtocolError::LengthMismatch {
+                name: "encrypted matrix columns",
+                ..
+            })
+        ));
+    }
 
     /// The largest issued thread index over the whole dispatch must stay
     /// inside `u32`, or the shader's wrapping index arithmetic would let

@@ -12,6 +12,57 @@ fn convolution_variants_match_independent_oracles() {
 }
 
 #[test]
+fn automatic_dispatch_crosses_the_schoolbook_cutoff_in_both_directions() {
+    // The free function dispatches to schoolbook while `min(m, n) <= 2` or
+    // `m * n <= 5184` and to a fresh NTT otherwise. The shapes below sit
+    // exactly on both sides of each rule, including highly rectangular
+    // inputs, and every modulus tier's NTT backend (lazy Shoup, reduced
+    // Shoup, Montgomery) must reproduce the full-width schoolbook oracle.
+    const SCHOOLBOOK_PRODUCT_CUTOFF: usize = 5_184;
+    const SHAPES: [(usize, usize, bool); 8] = [
+        // `m * n == 5184` exactly, square and rectangular: schoolbook.
+        (72, 72, true),
+        (3, 1_728, true),
+        // One coefficient past the cutoff in each dimension: NTT.
+        (72, 73, false),
+        (3, 1_729, false),
+        // Just below the cutoff and just above it.
+        (71, 73, true),
+        (65, 80, false),
+        // The `min(m, n) <= 2` rule keeps a tall operand schoolbook, while a
+        // slightly wider rectangle of comparable size needs the NTT.
+        (2, 2_048, true),
+        (4, 2_048, false),
+    ];
+
+    fn check_shape<const MODULUS: u32>(lhs_length: usize, rhs_length: usize, schoolbook: bool) {
+        assert_eq!(
+            lhs_length.min(rhs_length) <= 2 || lhs_length * rhs_length <= SCHOOLBOOK_PRODUCT_CUTOFF,
+            schoolbook,
+            "shape {lhs_length}x{rhs_length} misclassified"
+        );
+        let lhs: Vec<_> = (0..lhs_length)
+            .map(|index| ((index as u64 * 2_654_435_761 + 97) % u64::from(MODULUS)) as u32)
+            .collect();
+        let rhs: Vec<_> = (0..rhs_length)
+            .map(|index| ((index as u64 * 1_103_515_245 + 12_345) % u64::from(MODULUS)) as u32)
+            .collect();
+        assert_eq!(
+            linear_convolution::<MODULUS>(&lhs, &rhs).unwrap(),
+            oracle_linear::<MODULUS>(&lhs, &rhs),
+            "shape {lhs_length}x{rhs_length}, modulus {MODULUS}"
+        );
+    }
+
+    for &(lhs_length, rhs_length, schoolbook) in &SHAPES {
+        check_shape::<65_537>(lhs_length, rhs_length, schoolbook);
+        check_shape::<1_073_479_681>(lhs_length, rhs_length, schoolbook);
+        check_shape::<2_013_265_921>(lhs_length, rhs_length, schoolbook);
+        check_shape::<2_281_701_377>(lhs_length, rhs_length, schoolbook);
+    }
+}
+
+#[test]
 fn tight_prime_rectangular_linear_convolution_matches_full_width_schoolbook_oracle() {
     const MODULUS: u32 = 2_013_265_921;
     const BOUNDARIES: [u32; 7] = [
@@ -65,8 +116,8 @@ fn empty_linear_inputs_produce_empty_output() {
 
 #[test]
 fn length_one_convolutions_and_unreduced_inputs_are_supported() {
-    let cyclic = NttPlan::<17>::new_scalar(1).unwrap();
-    let negacyclic = NegacyclicPlan::<17>::new_scalar(1).unwrap();
+    let cyclic = NttPlan::<17>::new(1).unwrap();
+    let negacyclic = NegacyclicPlan::<17>::new(1).unwrap();
     assert_eq!(cyclic.cyclic_convolution(&[16], &[16]).unwrap(), vec![1]);
     assert_eq!(negacyclic.convolution(&[16], &[16]).unwrap(), vec![1]);
     assert_eq!(linear_convolution::<17>(&[16], &[16]).unwrap(), vec![1]);

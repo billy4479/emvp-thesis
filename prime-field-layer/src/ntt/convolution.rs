@@ -3,6 +3,13 @@ use super::{
     NttPerformanceWarning, NttPlan, PretransformedLinearOperand, PrimeField, powers,
 };
 
+/// One-shot schoolbook/NTT dispatch threshold on the product count `m * n`.
+///
+/// The `crossover` Criterion target (run with
+/// `EMVP_BENCH_CALIBRATION=1`) compares this simple global cutoff across
+/// modulus tiers and operand shapes. The historical value is retained
+/// conservatively until representative target-hardware runs justify changing
+/// it.
 const SCHOOLBOOK_PRODUCT_CUTOFF: usize = 5_184;
 
 impl<const MODULUS: u32> NttPlan<MODULUS> {
@@ -255,10 +262,10 @@ impl<const MODULUS: u32> NegacyclicPlan<MODULUS> {
     /// Constructs a negacyclic plan with automatic backend dispatch.
     ///
     /// `length` must be a nonzero power of two and `2 * length` must divide
-    /// `MODULUS - 1`, so the field contains the required twist root. Setup takes
-    /// `O(length + log MODULUS)` time and retains `O(length)` NTT and twist
-    /// storage, plus `O(length)` temporary setup storage. Prefer this constructor
-    /// for normal use and reuse the resulting plan.
+    /// `MODULUS - 1`, so the field contains the required twist root. Setup
+    /// takes `O(length + log MODULUS)` time and retains `O(length)` NTT and
+    /// twist storage, plus `O(length)` temporary setup storage. Reuse the
+    /// resulting plan for repeated negacyclic products.
     ///
     /// # Errors
     ///
@@ -266,36 +273,13 @@ impl<const MODULUS: u32> NegacyclicPlan<MODULUS> {
     /// or either required root is unsupported. Backend selection otherwise
     /// follows [`NttPlan::new`].
     pub fn new(length: usize) -> Result<Self, FieldError> {
-        Self::with_scalar_option(length, false)
-    }
-
-    /// Constructs a negacyclic plan requesting portable scalar NTT kernels.
-    ///
-    /// Root requirements, `O(length + log MODULUS)` setup time, and `O(length)`
-    /// storage match [`Self::new`]. Use this for reproducible deployment or
-    /// backend comparison; prefer [`Self::new`] for automatic acceleration.
-    /// Wide modulus tiers still select their applicable scalar arithmetic.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`FieldError::UnsupportedTransformLength`] when the length or its
-    /// doubled twist order is unsupported.
-    pub fn new_scalar(length: usize) -> Result<Self, FieldError> {
-        Self::with_scalar_option(length, true)
-    }
-
-    fn with_scalar_option(length: usize, scalar: bool) -> Result<Self, FieldError> {
         let field = PrimeField::<MODULUS>::new();
         let doubled = length
             .checked_mul(2)
             .ok_or(FieldError::UnsupportedTransformLength(length))?;
         let psi = field.root_of_unity(doubled)?;
         let inverse_psi = field.inv(psi)?;
-        let ntt = if scalar {
-            NttPlan::new_scalar(length)?
-        } else {
-            NttPlan::new(length)?
-        };
+        let ntt = NttPlan::new(length)?;
         let twist = powers(field, psi, length);
         let inverse_twist = powers(field, inverse_psi, length);
         Ok(Self {
@@ -332,7 +316,7 @@ impl<const MODULUS: u32> NegacyclicPlan<MODULUS> {
         self.ntt.backend()
     }
 
-    /// Returns the underlying NTT's scalar-selection warning, if any.
+    /// Returns the underlying NTT's modulus-tier warning, if any.
     ///
     /// This `O(1)` diagnostic has the same meaning as
     /// [`NttPlan::performance_warning`]. `None` does not imply that the scalar
@@ -405,6 +389,12 @@ impl<const MODULUS: u32> NegacyclicPlan<MODULUS> {
 ///
 /// ```compile_fail
 /// let _ = prime_field_layer::linear_convolution::<15>(&[1], &[2]);
+/// ```
+///
+/// The unsupported even prime is rejected the same way:
+///
+/// ```compile_fail
+/// let _ = prime_field_layer::linear_convolution::<2>(&[1], &[2]);
 /// ```
 pub fn linear_convolution<const MODULUS: u32>(
     lhs: &[u32],

@@ -298,6 +298,7 @@ dependencies = [
  "clap",
  "emvp",
  "emvp-network",
+ "getrandom 0.3.4",
  "prime-field-layer",
  "rand_chacha 0.10.0",
  "rand_core 0.10.1",
@@ -428,6 +429,7 @@ dependencies = [
  "allocation-counter",
  "bench-common",
  "criterion",
+ "naga",
  "pollster",
  "prime-field-layer",
  "proptest",
@@ -1497,6 +1499,7 @@ dependencies = [
  "rand_chacha 0.10.0",
  "rand_core 0.10.1",
  "rayon",
+ "trapdoor-matrices",
 ]
 
 [[package]]

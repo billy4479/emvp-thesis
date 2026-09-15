@@ -1,18 +1,96 @@
 #![expect(
+    clippy::expect_used,
     clippy::unwrap_used,
     reason = "fixed test fixtures establish that construction and evaluation must succeed"
 )]
 
+use std::collections::VecDeque;
+use std::convert::Infallible;
+
 use prime_field_layer::{
-    ExtensionField, ExtensionFieldError, FieldElement, FieldError, PrimeField,
+    ExtensionField, ExtensionFieldError, FieldElement, FieldError, PolynomialAlgorithm, PrimeField,
 };
 use proptest::prelude::*;
 use rand_chacha::ChaCha20Rng;
-use rand_core::SeedableRng;
+use rand_core::{SeedableRng, TryCryptoRng, TryRng};
 use trapdoor_matrices::{
-    DenseMatrix, IrreducibleRingLpn, ParameterWarning, Permutation, RaaWeightedProduct,
+    DenseMatrix, IrreducibleRingLpn, Permutation, RaaWeightedProduct, SecurityWarningKind,
     SparseMatrix, TdmError, ToeplitzFastProduct, ToeplitzMap, automatic_ring_modulus,
 };
+
+/// NTT-friendly prime with two-adicity 18: every transform length used by the
+/// policy-grade sampling tests below is supported.
+const FIELD: u32 = 1_073_479_681;
+
+/// The smallest `(degree, weight)` pair the assessment rates sound: the
+/// ring-degree floor of 2048 together with the project policy weight floor of
+/// 192. Every test that must reach the sampler works at this pair, because
+/// sampling now refuses broken assessments outright.
+const SOUND_DEGREE: usize = 2048;
+const SOUND_WEIGHT: usize = 192;
+
+/// A deterministic `CryptoRng` replaying a run-length-coded word script.
+///
+/// Each entry yields the same 32-bit word for the given number of draws, so
+/// tests can script the millions of Bernoulli draws of a policy-grade sample
+/// compactly and exactly. Panics when the script runs dry: a sampler whose
+/// draw pattern deviates from the scripted one exhausts the script and fails
+/// the test loudly instead of silently.
+struct ScriptedRng {
+    runs: VecDeque<(u32, u64)>,
+    current: u32,
+    remaining: u64,
+    draws: u64,
+}
+
+impl ScriptedRng {
+    /// Builds a scripted RNG whose `draws` counter starts at zero.
+    fn new(runs: &[(u32, u64)]) -> Self {
+        let mut runs: VecDeque<(u32, u64)> = runs.iter().copied().collect();
+        let (current, remaining) = runs.pop_front().unwrap_or((0, u64::MAX));
+        Self {
+            runs,
+            current,
+            remaining,
+            draws: 0,
+        }
+    }
+
+    fn next_word(&mut self) -> u32 {
+        self.draws += 1;
+        if self.remaining == 0 {
+            let (word, length) = self.runs.pop_front().expect("scripted RNG exhausted");
+            self.current = word;
+            self.remaining = length;
+        }
+        self.remaining -= 1;
+        self.current
+    }
+}
+
+impl TryRng for ScriptedRng {
+    type Error = Infallible;
+
+    fn try_next_u32(&mut self) -> Result<u32, Self::Error> {
+        Ok(self.next_word())
+    }
+
+    fn try_next_u64(&mut self) -> Result<u64, Self::Error> {
+        let low = u64::from(self.next_word());
+        let high = u64::from(self.next_word());
+        Ok((high << 32) | low)
+    }
+
+    fn try_fill_bytes(&mut self, destination: &mut [u8]) -> Result<(), Self::Error> {
+        for chunk in destination.chunks_mut(4) {
+            let word = self.next_word().to_le_bytes();
+            chunk.copy_from_slice(&word[..chunk.len()]);
+        }
+        Ok(())
+    }
+}
+
+impl TryCryptoRng for ScriptedRng {}
 
 fn elements<const MODULUS: u32>(values: &[u32]) -> Vec<FieldElement<MODULUS>> {
     let field = PrimeField::<MODULUS>::new();
@@ -354,14 +432,20 @@ fn full_toeplitz_product_matches_hand_composition_materialization_and_linearity(
     let y = [7, 11, 13];
     let x_plus_y: [u32; 3] =
         std::array::from_fn(|index| add_mod(x[index], y[index], 1_073_479_681));
-    let rx = fast_product_oracle(&product, &x);
-    let ry = fast_product_oracle(&product, &y);
-    let expected_sum: Vec<_> = rx
+    let mut rx = elements(&[0; 3]);
+    let mut ry = elements(&[0; 3]);
+    let mut rxy = elements(&[0; 3]);
+    product.apply(&elements(&x), &mut rx, &mut scratch).unwrap();
+    product.apply(&elements(&y), &mut ry, &mut scratch).unwrap();
+    product
+        .apply(&elements(&x_plus_y), &mut rxy, &mut scratch)
+        .unwrap();
+    let expected_sum: Vec<_> = values(&rx)
         .iter()
-        .zip(&ry)
-        .map(|(&lhs, &rhs)| add_mod(lhs, rhs, 1_073_479_681))
+        .zip(values(&ry))
+        .map(|(&lhs, rhs)| add_mod(lhs, rhs, 1_073_479_681))
         .collect();
-    assert_eq!(fast_product_oracle(&product, &x_plus_y), expected_sum);
+    assert_eq!(values(&rxy), expected_sum);
 }
 
 #[test]
@@ -548,12 +632,25 @@ fn ring_lpn_matches_independent_sparse_and_polynomial_oracles() {
     let x = [1, 5, 9];
     let y = [4, 8, 16];
     let sum: [u32; 3] = std::array::from_fn(|index| add_mod(x[index], y[index], 17));
-    let expected_sum: Vec<_> = ring_lpn_oracle(&x)
-        .into_iter()
-        .zip(ring_lpn_oracle(&y))
-        .map(|(lhs, rhs)| add_mod(lhs, rhs, 17))
+    let mut rx = elements(&[0; 3]);
+    let mut ry = elements(&[0; 3]);
+    let mut rxy = elements(&[0; 3]);
+    let mut scratch = instance.scratch();
+    instance
+        .apply(&elements(&x), &mut rx, &mut scratch)
+        .unwrap();
+    instance
+        .apply(&elements(&y), &mut ry, &mut scratch)
+        .unwrap();
+    instance
+        .apply(&elements(&sum), &mut rxy, &mut scratch)
+        .unwrap();
+    let expected_sum: Vec<_> = values(&rx)
+        .iter()
+        .zip(values(&ry))
+        .map(|(&lhs, rhs)| add_mod(lhs, rhs, 17))
         .collect();
-    assert_eq!(ring_lpn_oracle(&sum), expected_sum);
+    assert_eq!(values(&rxy), expected_sum);
 }
 
 #[test]
@@ -608,15 +705,20 @@ fn ring_lpn_duplicate_sparse_rows_accumulate_independently() {
 
 #[test]
 fn ring_lpn_sampling_is_reproducible_and_respects_weight_bounds() {
-    let modulus = [1, 3, 0, 1];
-    let k = 3;
+    // The smallest policy-grade pair: sound with an empty warning list, so
+    // the sampler actually constructs the instance. Rabin's irreducibility
+    // test would be far too slow at this degree, so the happy-path runs use
+    // the automatic modulus, whose irreducibility is proven analytically;
+    // the explicit-modulus entry point shares everything downstream of the
+    // assessment and is covered by the fail-closed and validation tests.
+    let modulus = automatic_ring_modulus::<FIELD>(SOUND_DEGREE).unwrap();
 
     let mut first_rng = ChaCha20Rng::from_seed([41; 32]);
     let mut second_rng = ChaCha20Rng::from_seed([41; 32]);
     let first =
-        IrreducibleRingLpn::<17>::sample_with_modulus(k, 2, &modulus, &mut first_rng).unwrap();
+        IrreducibleRingLpn::<FIELD>::sample(SOUND_DEGREE, SOUND_WEIGHT, &mut first_rng).unwrap();
     let second =
-        IrreducibleRingLpn::<17>::sample_with_modulus(k, 2, &modulus, &mut second_rng).unwrap();
+        IrreducibleRingLpn::<FIELD>::sample(SOUND_DEGREE, SOUND_WEIGHT, &mut second_rng).unwrap();
     assert_eq!(
         first.instance().multiplier(),
         second.instance().multiplier()
@@ -625,33 +727,52 @@ fn ring_lpn_sampling_is_reproducible_and_respects_weight_bounds() {
         first.instance().sparse_matrix(),
         second.instance().sparse_matrix()
     );
+    assert_eq!(first.warnings(), second.warnings());
+    assert!(first.warnings().is_empty());
 
+    // Columns are conditioned to be nonempty, so every stored column has at
+    // least one entry and every value is a nonzero field element.
+    let offsets = first.instance().sparse_matrix().offsets();
+    assert!(offsets.windows(2).all(|pair| pair[0] < pair[1]));
+    assert!(
+        first
+            .instance()
+            .sparse_matrix()
+            .values()
+            .iter()
+            .all(|value| value.value() != 0)
+    );
+
+    // Shape validation still precedes the assessment, keeping its precise
+    // typed errors (and running before any expensive modulus work).
     let mut zero_rng = ChaCha20Rng::from_seed([31; 32]);
     assert!(matches!(
-        IrreducibleRingLpn::<17>::sample_with_modulus(k, 0, &modulus, &mut zero_rng),
+        IrreducibleRingLpn::<FIELD>::sample_with_modulus(SOUND_DEGREE, 0, &modulus, &mut zero_rng),
         Err(TdmError::ZeroDimension("column weight"))
     ));
 
     let mut oversized_rng = ChaCha20Rng::from_seed([43; 32]);
     assert!(matches!(
-        IrreducibleRingLpn::<17>::sample_with_modulus(k, 4, &modulus, &mut oversized_rng),
-        Err(TdmError::WeightExceedsColumns {
-            weight: 4,
-            maximum: 3
-        })
+        IrreducibleRingLpn::<FIELD>::sample_with_modulus(
+            SOUND_DEGREE,
+            SOUND_DEGREE + 1,
+            &modulus,
+            &mut oversized_rng
+        ),
+        Err(TdmError::WeightExceedsColumns { weight, maximum })
+            if weight == SOUND_DEGREE + 1 && maximum == SOUND_DEGREE
     ));
 }
 
 #[test]
 fn ring_lpn_sampling_never_produces_empty_columns() {
-    let modulus = automatic_ring_modulus::<17>(8).unwrap();
-    let k = 8;
-    // With weight one over sixteen rows, a Bernoulli column is empty with
-    // probability about (15/16)^16 ~= 0.36, so this exercises resampling.
-    for domain in 1..8u8 {
+    // At the policy-grade pair a Bernoulli column draw is empty with
+    // probability about e^{-192}; conditioning makes every stored column
+    // nonempty by construction, which this checks across seeds.
+    for domain in 1..3u8 {
         let mut rng = ChaCha20Rng::from_seed([domain; 32]);
         let sampled =
-            IrreducibleRingLpn::<17>::sample_with_modulus(k, 1, &modulus, &mut rng).unwrap();
+            IrreducibleRingLpn::<FIELD>::sample(SOUND_DEGREE, SOUND_WEIGHT, &mut rng).unwrap();
         let offsets = sampled.instance().sparse_matrix().offsets();
         assert!(offsets.windows(2).all(|pair| pair[0] < pair[1]));
         assert!(
@@ -666,38 +787,67 @@ fn ring_lpn_sampling_never_produces_empty_columns() {
 }
 
 #[test]
-fn ring_lpn_automatic_sampling_proves_its_modulus_and_reports_assessment() {
-    // F_17 has two-adicity four, so k = 4 gets an irreducible binomial.
-    let mut rng = ChaCha20Rng::from_seed([47; 32]);
-    let sampled = IrreducibleRingLpn::<17>::sample(4, 2, &mut rng).unwrap();
-    let modulus = sampled.instance().modulus();
-    assert_eq!(modulus.len(), 5);
-    assert_eq!(modulus[4], 1);
-    assert!(modulus[1..4].iter().all(|&coefficient| coefficient == 0));
-    assert!(modulus[0] > 0 && modulus[0] < 17);
-    // The analytic proof is confirmed here by Rabin's independent test.
-    ExtensionField::<17>::new(4, modulus).unwrap();
-    // Tiny parameters still construct but are reported as broken: the ring
-    // degree, the plausibility weight, the decoding estimate, and the
-    // enumeration estimate all fail their floors at k = 4.
-    assert_eq!(sampled.warnings().len(), 4);
+fn ring_lpn_sampling_fails_closed_on_broken_assessments() {
+    // A degree below the ring-degree floor is broken, so automatic sampling
+    // refuses before drawing anything: the scripted RNG records zero draws.
+    let mut scripted = ScriptedRng::new(&[(3, u64::MAX)]);
     assert!(matches!(
-        sampled.warnings()[0],
-        ParameterWarning::RingDegreeBelowFloor { .. }
+        IrreducibleRingLpn::<FIELD>::sample(1024, 256, &mut scripted),
+        Err(TdmError::InsecureParameters {
+            degree: 1024,
+            weight: 256,
+            reasons
+        }) if reasons == vec![SecurityWarningKind::RingDegreeBelowFloor]
     ));
+    assert_eq!(scripted.draws, 0);
 
-    // Determinism: the same seed yields the same instance.
-    let mut first_rng = ChaCha20Rng::from_seed([47; 32]);
-    let first = IrreducibleRingLpn::<17>::sample(4, 2, &mut first_rng).unwrap();
-    assert_eq!(
-        first.instance().sparse_matrix(),
-        sampled.instance().sparse_matrix()
-    );
-    assert_eq!(
-        first.instance().multiplier(),
-        sampled.instance().multiplier()
-    );
-    assert_eq!(first.warnings(), sampled.warnings());
+    // The explicit-modulus entry point fails closed the same way, before the
+    // (potentially expensive) irreducibility test would run.
+    let modulus = automatic_ring_modulus::<FIELD>(1024).unwrap();
+    let mut scripted = ScriptedRng::new(&[(3, u64::MAX)]);
+    assert!(matches!(
+        IrreducibleRingLpn::<FIELD>::sample_with_modulus(1024, 256, &modulus, &mut scripted),
+        Err(TdmError::InsecureParameters {
+            degree: 1024,
+            weight: 256,
+            ..
+        })
+    ));
+    assert_eq!(scripted.draws, 0);
+
+    // A tiny weight at a policy-grade degree is broken through the
+    // plausibility floor and the decoding estimate; the structured reasons
+    // name every failed check without floating-point payloads.
+    let mut scripted = ScriptedRng::new(&[(3, u64::MAX)]);
+    assert!(matches!(
+        IrreducibleRingLpn::<FIELD>::sample(8192, 16, &mut scripted),
+        Err(TdmError::InsecureParameters {
+            degree: 8192,
+            weight: 16,
+            reasons
+        }) if reasons == vec![
+            SecurityWarningKind::WeightBelowPlausibilityFloor,
+            SecurityWarningKind::DecodingCostBelowTarget
+        ]
+    ));
+    assert_eq!(scripted.draws, 0);
+
+    // Tiny parameters were previously sampled with warnings; they are now
+    // refused with the full ordered list of broken reasons.
+    let mut rng = ChaCha20Rng::from_seed([47; 32]);
+    assert!(matches!(
+        IrreducibleRingLpn::<17>::sample(4, 2, &mut rng),
+        Err(TdmError::InsecureParameters {
+            degree: 4,
+            weight: 2,
+            reasons
+        }) if reasons == vec![
+            SecurityWarningKind::RingDegreeBelowFloor,
+            SecurityWarningKind::WeightBelowPlausibilityFloor,
+            SecurityWarningKind::DecodingCostBelowTarget,
+            SecurityWarningKind::EnumerationCostBelowTarget
+        ]
+    ));
 }
 
 #[test]
@@ -711,14 +861,10 @@ fn ring_lpn_automatic_sampling_rejects_unsupported_shapes() {
             degree: 3
         })
     ));
-    // F_2 has two-adicity zero.
-    assert!(matches!(
-        IrreducibleRingLpn::<2>::sample(4, 1, &mut rng),
-        Err(TdmError::AutomaticModulusUnsupported {
-            modulus: 2,
-            degree: 4
-        })
-    ));
+    // F_2 is unsupported by the field layer itself (odd-prime invariant), so
+    // it cannot instantiate this construction at all; its automatic-modulus
+    // rejection is covered by the parameter tests, which never touch a field
+    // type.
 }
 
 #[test]
@@ -758,6 +904,311 @@ fn ring_lpn_length_errors_leave_output_unchanged() {
             .is_err()
     );
     assert_eq!(short_output, short_output_before);
+}
+
+#[test]
+fn ring_lpn_constructors_reject_wrong_multiplier_lengths() {
+    let valid_sparse =
+        SparseMatrix::new(6, 3, vec![0, 1, 2, 3], vec![0, 1, 2], elements(&[3, 4, 5])).unwrap();
+
+    for multiplier in [Vec::new(), vec![2, 1], vec![2, 1, 3, 4]] {
+        assert!(matches!(
+            IrreducibleRingLpn::<17>::new(3, &[1, 3, 0, 1], &multiplier, valid_sparse.clone()),
+            Err(TdmError::LengthMismatch {
+                name: "multiplier",
+                expected: 3,
+                ..
+            })
+        ));
+        assert!(matches!(
+            IrreducibleRingLpn::<17>::new_unchecked_irreducible(
+                3,
+                &[1, 3, 0, 1],
+                &multiplier,
+                valid_sparse.clone()
+            ),
+            Err(TdmError::LengthMismatch {
+                name: "multiplier",
+                expected: 3,
+                ..
+            })
+        ));
+    }
+
+    // The exact-length multiplier is accepted by both constructors.
+    let instance = IrreducibleRingLpn::<17>::new(
+        3,
+        &[1, 3, 0, 1],
+        &[2, 1, 3],
+        SparseMatrix::new(
+            6,
+            3,
+            vec![0, 3, 6, 9],
+            vec![0, 3, 5, 1, 3, 4, 2, 4, 5],
+            elements(&[2, 5, 1, 3, 4, 6, 7, 2, 8]),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(instance.multiplier(), &[2, 1, 3]);
+}
+
+/// Builds a deterministic instance of an arbitrary degree over `F_17`, with a
+/// provably irreducible automatic binomial modulus.
+fn explicit_ring_lpn_with_degree(k: usize) -> IrreducibleRingLpn<17> {
+    let rows = k * 2;
+    let mut row_indices = Vec::new();
+    let mut offsets = vec![0usize];
+    let mut entry_values = Vec::new();
+    for column in 0..k {
+        for entry in 0..2usize {
+            row_indices.push((3 * column + entry) % rows);
+            entry_values.push(((column * 7 + entry * 5) % 16 + 1) as u32);
+        }
+        offsets.push(row_indices.len());
+    }
+    let sparse =
+        SparseMatrix::new(rows, k, offsets, row_indices, elements::<17>(&entry_values)).unwrap();
+    let modulus = automatic_ring_modulus::<17>(k).unwrap();
+    let multiplier: Vec<u32> = (0..k).map(|index| (index * 5 + 3) as u32).collect();
+    IrreducibleRingLpn::new_unchecked_irreducible(k, &modulus, &multiplier, sparse).unwrap()
+}
+
+#[test]
+fn ring_lpn_rejects_cross_instance_scratch_and_leaves_output_unchanged() {
+    let small = explicit_ring_lpn();
+    let large = explicit_ring_lpn_with_degree(4);
+
+    // A scratch from the smaller instance is too short for the larger one.
+    let mut small_scratch = small.scratch();
+    let large_sentinel = elements::<17>(&[41, 42, 43, 44]);
+    let mut large_output = large_sentinel.clone();
+    assert!(matches!(
+        large.apply(
+            &elements(&[5, 6, 7, 8]),
+            &mut large_output,
+            &mut small_scratch
+        ),
+        Err(TdmError::LengthMismatch {
+            name: "scratch sparse product",
+            expected: 8,
+            actual: 6
+        })
+    ));
+    assert_eq!(large_output, large_sentinel);
+
+    // A scratch from the larger instance is longer than the smaller one
+    // needs; it must still be rejected rather than silently applied.
+    let mut large_scratch = large.scratch();
+    let small_sentinel = elements::<17>(&[31, 32, 33]);
+    let mut small_output = small_sentinel.clone();
+    assert!(matches!(
+        small.apply(&elements(&[2, 3, 4]), &mut small_output, &mut large_scratch),
+        Err(TdmError::LengthMismatch {
+            name: "scratch sparse product",
+            expected: 6,
+            actual: 8
+        })
+    ));
+    assert_eq!(small_output, small_sentinel);
+}
+
+#[test]
+fn ring_lpn_per_column_retry_redraws_only_the_empty_column() {
+    // Script a policy-grade sample so the first draw of column 0 comes out
+    // empty and every other column succeeds on its first attempt:
+    //
+    // - 2048 uniform multiplier draws of the word 3;
+    // - column 0, attempt 1: 4096 row draws of 4095 (>= weight 192, empty);
+    // - then one successful attempt per column: row 0 hits (word 0 < 192),
+    //   the nonzero entry is drawn from word 1000, and the remaining 4095
+    //   rows draw 4095 and miss.
+    let rows = SOUND_DEGREE * 2;
+    let mut runs = vec![(3, SOUND_DEGREE as u64), (4095, rows as u64)];
+    for _column in 0..SOUND_DEGREE {
+        runs.extend([(0, 1), (1000, 1), (4095, (rows - 1) as u64)]);
+    }
+    let mut scripted = ScriptedRng::new(&runs);
+
+    let sampled =
+        IrreducibleRingLpn::<FIELD>::sample(SOUND_DEGREE, SOUND_WEIGHT, &mut scripted).unwrap();
+    let sparse = sampled.instance().sparse_matrix();
+
+    // Exactly the scripted words were consumed: 2048 for the multiplier, one
+    // wasted 4096-word attempt for column 0, and 4097 words per column. A
+    // whole-matrix retry would consume exactly twice as much.
+    let expected_draws =
+        SOUND_DEGREE as u64 + rows as u64 + SOUND_DEGREE as u64 * (rows as u64 + 1);
+    assert_eq!(scripted.draws, expected_draws);
+    assert_eq!(sampled.instance().multiplier(), vec![3; SOUND_DEGREE]);
+
+    // Every column holds exactly the scripted support: one entry at row 0
+    // with value 1000 % (p - 1) + 1 = 1001.
+    assert_eq!(sparse.offsets(), &(0..=SOUND_DEGREE).collect::<Vec<_>>());
+    assert_eq!(sparse.row_indices(), &vec![0; SOUND_DEGREE]);
+    assert_eq!(
+        sparse
+            .values()
+            .iter()
+            .map(|value| value.value())
+            .collect::<Vec<_>>(),
+        vec![1001; SOUND_DEGREE]
+    );
+
+    // The seeded real RNG stays deterministic: replaying the sample with the
+    // same ChaCha seed reproduces the instance exactly.
+    let mut first_rng = ChaCha20Rng::from_seed([71; 32]);
+    let mut second_rng = ChaCha20Rng::from_seed([71; 32]);
+    let first =
+        IrreducibleRingLpn::<FIELD>::sample(SOUND_DEGREE, SOUND_WEIGHT, &mut first_rng).unwrap();
+    let second =
+        IrreducibleRingLpn::<FIELD>::sample(SOUND_DEGREE, SOUND_WEIGHT, &mut second_rng).unwrap();
+    assert_eq!(
+        first.instance().multiplier(),
+        second.instance().multiplier()
+    );
+    assert_eq!(
+        first.instance().sparse_matrix(),
+        second.instance().sparse_matrix()
+    );
+}
+
+#[test]
+fn ring_lpn_empty_column_retry_budget_is_bounded() {
+    // The constant word 255 maps to row 255 for every row draw, which is
+    // never below the weight 192, so every attempt of every column comes out
+    // empty and the per-column budget must stop the loop deterministically.
+    let mut scripted = ScriptedRng::new(&[(255, u64::MAX)]);
+    assert!(matches!(
+        IrreducibleRingLpn::<FIELD>::sample(SOUND_DEGREE, SOUND_WEIGHT, &mut scripted),
+        Err(TdmError::SamplingRetryBudgetExhausted { retries: 1024 })
+    ));
+    // 2048 multiplier draws, then 1024 attempts of 4096 row draws on the
+    // first column.
+    assert_eq!(
+        scripted.draws,
+        SOUND_DEGREE as u64 + 1024 * (SOUND_DEGREE * 2) as u64
+    );
+}
+
+#[test]
+fn ring_lpn_ntt_reduction_path_matches_oracles_at_degree_32() {
+    let k = 32;
+    let rows = 64;
+    // K = 32 exceeds the schoolbook cutoff, so the extension multiplication
+    // runs the NTT path with a length-64 transform; confirm the kernel
+    // before checking the arithmetic against independent oracles.
+    let modulus = automatic_ring_modulus::<FIELD>(k).unwrap();
+    assert_eq!(
+        ExtensionField::<FIELD>::new_unchecked_irreducible(k, &modulus)
+            .unwrap()
+            .algorithm(),
+        PolynomialAlgorithm::Ntt {
+            transform_length: 64
+        }
+    );
+
+    let field = PrimeField::<FIELD>::new();
+    let mut rng = ChaCha20Rng::seed_from_u64(0x4e00);
+    let multiplier: Vec<u32> = (0..k)
+        .map(|_| field.sample_uniform(&mut rng).value())
+        .collect();
+    let mut row_indices = Vec::new();
+    let mut offsets = vec![0usize];
+    let mut entry_values = Vec::new();
+    for column in 0..k {
+        for entry in 0..4usize {
+            row_indices.push((5 * column + 3 * entry + 1) % rows);
+            entry_values.push(u32::try_from((17 * column + 11 * entry) % 1_000).unwrap() + 1);
+        }
+        offsets.push(row_indices.len());
+    }
+    let sparse = SparseMatrix::new(
+        rows,
+        k,
+        offsets,
+        row_indices,
+        elements::<FIELD>(&entry_values),
+    )
+    .unwrap();
+    let instance =
+        IrreducibleRingLpn::<FIELD>::new_unchecked_irreducible(k, &modulus, &multiplier, sparse)
+            .unwrap();
+
+    // Independent dense oracle for the secret sparse matrix E.
+    let secret = instance.sparse_matrix();
+    let mut dense = vec![0u32; rows * k];
+    for column in 0..k {
+        for entry in secret.offsets()[column]..secret.offsets()[column + 1] {
+            dense[secret.row_indices()[entry] * k + column] = secret.values()[entry].value();
+        }
+    }
+
+    // Independent polynomial oracle: H E x = u0 + a * u1 mod f. The instance
+    // keeps its own canonicalized copy of the multiplier, so the fixture
+    // vector can move into the fixed-size array.
+    let multiplier_array: [u32; 32] = multiplier.try_into().unwrap();
+    let ring_oracle = |input: &[u32]| -> Vec<u32> {
+        let sparse_product = dense_apply(rows, k, &dense, input, FIELD);
+        let u0: [u32; 32] = sparse_product[..k].try_into().unwrap();
+        let u1: [u32; 32] = sparse_product[k..].try_into().unwrap();
+        let reduced = polynomial_mul_reduce::<32>(&multiplier_array, &u1, &modulus, FIELD);
+        u0.iter()
+            .zip(reduced)
+            .map(|(&identity, product)| add_mod(identity, product, FIELD))
+            .collect()
+    };
+
+    let input: Vec<u32> = (0..k)
+        .map(|index| (index as u32 * 123_457 + 9_876_543) % FIELD)
+        .collect();
+    let mut actual = elements::<FIELD>(&vec![0; k]);
+    instance
+        .apply(
+            &elements::<FIELD>(&input),
+            &mut actual,
+            &mut instance.scratch(),
+        )
+        .unwrap();
+    assert_eq!(values(&actual), ring_oracle(&input));
+
+    // The dense materialization agrees with the oracle column by column, so
+    // the whole NTT-mediated map is checked, not just one application.
+    let materialized = instance.materialize().unwrap();
+    let expected_matrix = materialize_oracle(k, FIELD, ring_oracle);
+    assert_eq!(values(materialized.values()), expected_matrix);
+
+    // Linearity of the implementation at NTT degree.
+    let x: Vec<u32> = (0..k)
+        .map(|index| (index as u32 * 31 + 5) % FIELD)
+        .collect();
+    let y: Vec<u32> = (0..k)
+        .map(|index| (index as u32 * 17 + 800) % FIELD)
+        .collect();
+    let sum: Vec<u32> = x
+        .iter()
+        .zip(&y)
+        .map(|(&lhs, &rhs)| add_mod(lhs, rhs, FIELD))
+        .collect();
+    let mut rx = elements::<FIELD>(&vec![0; k]);
+    let mut ry = elements::<FIELD>(&vec![0; k]);
+    let mut rxy = elements::<FIELD>(&vec![0; k]);
+    let mut scratch = instance.scratch();
+    instance
+        .apply(&elements::<FIELD>(&x), &mut rx, &mut scratch)
+        .unwrap();
+    instance
+        .apply(&elements::<FIELD>(&y), &mut ry, &mut scratch)
+        .unwrap();
+    instance
+        .apply(&elements::<FIELD>(&sum), &mut rxy, &mut scratch)
+        .unwrap();
+    let expected_sum: Vec<_> = values(&rx)
+        .iter()
+        .zip(values(&ry))
+        .map(|(&lhs, rhs)| add_mod(lhs, rhs, FIELD))
+        .collect();
+    assert_eq!(values(&rxy), expected_sum);
 }
 
 fn weighted_scan(input: &[u32], weights: &[u32], modulus: u32) -> Vec<u32> {
@@ -873,12 +1324,21 @@ fn raa_order_orientation_zero_weights_and_dense_forms_match_hand_oracle() {
     let x = [1, 4, 8];
     let y = [3, 5, 9];
     let sum: [u32; 3] = std::array::from_fn(|index| add_mod(x[index], y[index], 17));
-    let expected_sum: Vec<_> = explicit_raa_oracle(&x)
-        .into_iter()
-        .zip(explicit_raa_oracle(&y))
-        .map(|(lhs, rhs)| add_mod(lhs, rhs, 17))
+    let mut rx = elements(&[0; 3]);
+    let mut ry = elements(&[0; 3]);
+    let mut rxy = elements(&[0; 3]);
+    let mut scratch = product.scratch();
+    product.apply(&elements(&x), &mut rx, &mut scratch).unwrap();
+    product.apply(&elements(&y), &mut ry, &mut scratch).unwrap();
+    product
+        .apply(&elements(&sum), &mut rxy, &mut scratch)
+        .unwrap();
+    let expected_sum: Vec<_> = values(&rx)
+        .iter()
+        .zip(values(&ry))
+        .map(|(&lhs, rhs)| add_mod(lhs, rhs, 17))
         .collect();
-    assert_eq!(explicit_raa_oracle(&sum), expected_sum);
+    assert_eq!(values(&rxy), expected_sum);
 }
 
 #[test]

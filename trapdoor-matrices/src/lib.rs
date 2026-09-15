@@ -12,8 +12,10 @@
 //! These are experimental constructions, not production cryptographic
 //! primitives. The Ring-LPN construction relies on structured dual-LPN and has
 //! no settled parameter set. [`IrreducibleRingLpn::sample`] therefore sizes
-//! every request against the best-known-attack estimates of [`assess`]
-//! and returns the outcome as warnings while still constructing the instance.
+//! every request against the best-known-attack estimates of [`assess`] and
+//! fails closed: a [`SecurityLevel::Broken`] assessment aborts sampling with
+//! [`TdmError::InsecureParameters`], while sound and marginal requests
+//! construct the instance and return the outcome as warnings.
 //! The Toeplitz and RAA constructions rely on new, speculative
 //! structured-cubic pseudorandomness assumptions. The quasi-cyclic product
 //! of the original EMVP proposal was rejected in favor of the constructions
@@ -23,6 +25,10 @@
 //! scratch object. Sampling uses rejection and has variable RNG consumption.
 //! Secret state is not zeroized on drop. The arithmetic has not received a
 //! formal constant-time audit.
+//!
+//! The deterministic fixed-weight fixture builders used by tests and
+//! benchmarks live in the `testing` module, which is only compiled with the
+//! `test-utils` feature and must not be used for anything security-sensitive.
 
 mod error;
 mod mask;
@@ -31,6 +37,7 @@ mod parameters;
 mod permutation;
 mod raa;
 mod ring_lpn;
+#[cfg(feature = "test-utils")]
 pub mod testing;
 mod toeplitz;
 
@@ -38,8 +45,8 @@ pub use error::TdmError;
 pub use mask::{RowStackMask, TdmMask};
 pub use matrix::DenseMatrix;
 pub use parameters::{
-    ParameterWarning, SecurityAssessment, SecurityLevel, TARGET_SECURITY_BITS, assess,
-    automatic_ring_modulus,
+    ParameterWarning, SecurityAssessment, SecurityLevel, SecurityWarningKind, TARGET_SECURITY_BITS,
+    assess, automatic_ring_modulus,
 };
 pub use permutation::Permutation;
 pub use raa::{RaaScratch, RaaWeightedProduct};

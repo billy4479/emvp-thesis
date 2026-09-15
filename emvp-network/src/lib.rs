@@ -20,9 +20,14 @@
 //!    identifier and its ordered encrypted queries. The server answers
 //!    `Products` with one answer per query, in the same order, or `Error`.
 //!
-//! The connection is strictly sequential: one request, one response. A
-//! rejected request is answered with an `Error` frame and leaves the
-//! connection usable; transport and framing failures close it.
+//! The connection is strictly sequential: one request, one response.
+//! A request that fails validation (malformed frame, rejected parameters,
+//! unknown identifiers) is answered with an `Error` frame and leaves the
+//! connection usable. State violations are fatal instead: a second upload
+//! on a loaded session and an evaluation before the session loaded
+//! anything are answered with an `Error` frame and close the connection
+//! immediately, without the payload being read. Unknown frame kinds and
+//! transport failures also close the connection.
 //!
 //! # Frame format
 //!

@@ -8,6 +8,13 @@
 //! structure of the cyclic code. Encodings are masked by a stack of
 //! trapdoored matrices from the [`trapdoor_matrices`] crate.
 //!
+//! All deterministic instance state is bound to a public reconstruction
+//! context: a caller-chosen [`MaskContextId`] identifying the mask suite
+//! and its configuration, the [`EmvpParams`] fields, the matrix row count,
+//! and the instance nonce. The context identifier, the instance nonce, and
+//! the next query index must be persisted together for
+//! [`SecretKey::restore`] to reconstruct the exact state.
+//!
 //! These are experimental constructions, not production cryptographic
 //! primitives. The security relies on the 1D-SLSN conjecture for the cyclic
 //! dual code, which has no settled parameter set. Secret state is not
@@ -35,8 +42,8 @@ pub use params::{
 };
 pub use prf::{Prf, PrfError, purpose};
 pub use protocol::{
-    AnswerMatrix, DecodingKey, DerivedState, EncryptedMatrix, EncryptedQuery, ProtocolError,
-    QueryReservation, QueryReservations, QueryScratch, SecretKey, answer_batch, answer_into,
-    decode_into, encrypt, query, query_batch, query_with_scratch,
+    AnswerMatrix, DecodingKey, DerivedState, EncryptedMatrix, EncryptedQuery, MaskContextId,
+    ProtocolError, QueryReservation, QueryReservations, QueryScratch, SecretKey, answer_batch,
+    answer_into, decode_into, encrypt, query, query_batch, query_with_scratch,
 };
 pub use trapdoor_matrices::{RowStackMask, TdmMask};

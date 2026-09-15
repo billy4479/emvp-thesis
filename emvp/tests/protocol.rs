@@ -4,16 +4,18 @@
 )]
 
 use emvp::{
-    AnswerMatrix, DecodingKey, DerivedState, EmvpParams, EncryptedMatrix, EncryptedQuery, Prf,
-    ProtocolError, SecretKey, TdmMask, answer_batch, answer_into, decode_into, encrypt, purpose,
-    query, query_batch, query_with_scratch,
+    AnswerMatrix, DecodingKey, DerivedState, EmvpParams, EncryptedMatrix, EncryptedQuery,
+    MaskContextId, ProtocolError, SecretKey, TdmMask, answer_batch, answer_into, decode_into,
+    encrypt, purpose, query, query_batch, query_with_scratch, search,
 };
 use prime_field_layer::{FieldElement, PrimeField};
 use proptest::prelude::*;
 use rand_chacha::ChaCha20Rng;
 use rand_core::SeedableRng;
 use rayon::{ThreadPool, ThreadPoolBuilder};
-use trapdoor_matrices::{DenseMatrix, IrreducibleRingLpn, RaaWeightedProduct, ToeplitzFastProduct};
+use trapdoor_matrices::{
+    DenseMatrix, IrreducibleRingLpn, RaaWeightedProduct, TdmError, ToeplitzFastProduct,
+};
 
 // NTT-friendly prime: 1_073_479_681 - 1 is divisible by 2^18.
 const MODULUS: u32 = 1_073_479_681;
@@ -29,6 +31,24 @@ const fn test_params(ell: usize) -> EmvpParams {
         lambda: 7,
     }
 }
+
+// Stable mask-suite context identifiers. Every derive/restore call names
+// the context of its mask construction and configuration: the suite base
+// separates Toeplitz, RAA, Ring-LPN, and the deliberately failing mask, and
+// each configuration variant of a suite carries its own value. A real
+// deployment fixes one tag per suite and changes it whenever the builder or
+// its configuration changes.
+const CONTEXT_TOEPLITZ: MaskContextId = MaskContextId::from_u64(0x0100);
+const CONTEXT_TOEPLITZ_PADDED: MaskContextId = MaskContextId::from_u64(0x0101);
+const CONTEXT_TOEPLITZ_MULTI_BLOCK: MaskContextId = MaskContextId::from_u64(0x0102);
+const CONTEXT_TOEPLITZ_BLOCK_4: MaskContextId = MaskContextId::from_u64(0x0104);
+const CONTEXT_TOEPLITZ_SINGLE_BLOCK: MaskContextId = MaskContextId::from_u64(0x0105);
+const CONTEXT_TOEPLITZ_ODD_RANK: MaskContextId = MaskContextId::from_u64(0x0106);
+const CONTEXT_TOEPLITZ_ALT: MaskContextId = MaskContextId::from_u64(0x0107);
+const CONTEXT_RAA: MaskContextId = MaskContextId::from_u64(0x0200);
+const CONTEXT_RING: MaskContextId = MaskContextId::from_u64(0x0300);
+const CONTEXT_FAILING: MaskContextId = MaskContextId::from_u64(0x0400);
+const CONTEXT_SEARCHED: MaskContextId = MaskContextId::from_u64(0x0500);
 
 const fn field() -> PrimeField<MODULUS> {
     PrimeField::<MODULUS>::new()
@@ -65,6 +85,39 @@ fn ring_block(
     )?)
 }
 
+// A mask block that succeeds at every construction step but always fails
+// evaluation. It defines the "practical deliberately failing mask" used to
+// pin that a query failure after reservation consumes the reserved
+// identifier, so a retry cannot reuse the query randomness.
+struct FailingApplyMask {
+    inner: ToeplitzFastProduct<MODULUS>,
+}
+
+impl TdmMask<MODULUS> for FailingApplyMask {
+    type Scratch = <ToeplitzFastProduct<MODULUS> as TdmMask<MODULUS>>::Scratch;
+
+    fn dims(&self) -> (usize, usize) {
+        self.inner.dims()
+    }
+
+    fn scratch(&self) -> Self::Scratch {
+        self.inner.scratch()
+    }
+
+    fn apply(
+        &self,
+        _input: &[FieldElement<MODULUS>],
+        _output: &mut [FieldElement<MODULUS>],
+        _scratch: &mut Self::Scratch,
+    ) -> Result<(), TdmError> {
+        Err(TdmError::ZeroDimension("deliberately failing test mask"))
+    }
+
+    fn materialize(&self) -> Result<DenseMatrix<MODULUS>, TdmError> {
+        self.inner.materialize()
+    }
+}
+
 fn derive_toeplitz(
     rows: usize,
     ell: usize,
@@ -73,7 +126,7 @@ fn derive_toeplitz(
     let mut rng = ChaCha20Rng::seed_from_u64(0xd000 + u64::from(key));
     SecretKey::<MODULUS>::new_insecure(test_params(ell), [key; 32])
         .unwrap()
-        .derive(rows, &mut rng, toeplitz_block)
+        .derive(CONTEXT_TOEPLITZ, rows, &mut rng, toeplitz_block)
         .unwrap()
 }
 
@@ -150,7 +203,7 @@ fn end_to_end_works_with_raa_mask() {
     let (rows, ell) = (7_usize, 8_usize);
     let mut state = SecretKey::<MODULUS>::new_insecure(test_params(ell), [4; 32])
         .unwrap()
-        .derive(rows, &mut rng, raa_block)
+        .derive(CONTEXT_RAA, rows, &mut rng, raa_block)
         .unwrap();
     let matrix = random_vector(rows * ell, &mut rng);
     let q = random_vector(ell, &mut rng);
@@ -165,7 +218,111 @@ fn end_to_end_works_with_ring_lpn_mask() {
     let (rows, ell) = (7_usize, 8_usize);
     let mut state = SecretKey::<MODULUS>::new_insecure(test_params(ell), [0x74; 32])
         .unwrap()
-        .derive(rows, &mut rng, ring_block)
+        .derive(CONTEXT_RING, rows, &mut rng, ring_block)
+        .unwrap();
+    let matrix = random_vector(rows * ell, &mut rng);
+    let q = random_vector(ell, &mut rng);
+    let decoded = run_protocol(&mut state, &matrix, &q);
+    let expected = naive_matrix_vector(&matrix, &q, rows, ell);
+    assert_eq!(decoded, expected);
+}
+
+#[test]
+fn end_to_end_works_with_blocks_of_four() {
+    // b = 4 over n = 16 stacks s = 4 blocks, the block-count/b-size middle
+    // ground between the b = 2 default and the s = 1 extreme below.
+    let mut rng = ChaCha20Rng::seed_from_u64(0x9100);
+    let (rows, ell) = (5_usize, 8_usize);
+    let params = EmvpParams {
+        k: 8,
+        ell,
+        b: 4,
+        lambda: 7,
+    };
+    let mut state = SecretKey::<MODULUS>::new_insecure(params, [0x91; 32])
+        .unwrap()
+        .derive(CONTEXT_TOEPLITZ_BLOCK_4, rows, &mut rng, toeplitz_block)
+        .unwrap();
+    let matrix = random_vector(rows * ell, &mut rng);
+    let q = random_vector(ell, &mut rng);
+    assert_eq!(state.params().blocks().unwrap(), 4);
+    let decoded = run_protocol(&mut state, &matrix, &q);
+    let expected = naive_matrix_vector(&matrix, &q, rows, ell);
+    assert_eq!(decoded, expected);
+}
+
+#[test]
+fn end_to_end_works_with_a_single_query_block() {
+    // b = n = 16 collapses the query to one scaled block, s = 1: the
+    // supported single-block shape.
+    let mut rng = ChaCha20Rng::seed_from_u64(0x9200);
+    let (rows, ell) = (5_usize, 8_usize);
+    let params = EmvpParams {
+        k: 8,
+        ell,
+        b: 16,
+        lambda: 7,
+    };
+    let mut state = SecretKey::<MODULUS>::new_insecure(params, [0x92; 32])
+        .unwrap()
+        .derive(
+            CONTEXT_TOEPLITZ_SINGLE_BLOCK,
+            rows,
+            &mut rng,
+            toeplitz_block,
+        )
+        .unwrap();
+    let matrix = random_vector(rows * ell, &mut rng);
+    let q = random_vector(ell, &mut rng);
+    assert_eq!(state.params().blocks().unwrap(), 1);
+    let decoded = run_protocol(&mut state, &matrix, &q);
+    let expected = naive_matrix_vector(&matrix, &q, rows, ell);
+    assert_eq!(decoded, expected);
+}
+
+#[test]
+fn end_to_end_works_with_a_non_power_of_two_rank() {
+    // k = 12 gives n = 24 and b = 6 gives s = 4: neither n nor b is a power
+    // of two, exercising the structural path beyond power-of-two shapes.
+    let mut rng = ChaCha20Rng::seed_from_u64(0x9300);
+    let (rows, ell) = (5_usize, 7_usize);
+    let params = EmvpParams {
+        k: 12,
+        ell,
+        b: 6,
+        lambda: 7,
+    };
+    let mut state = SecretKey::<MODULUS>::new_insecure(params, [0x93; 32])
+        .unwrap()
+        .derive(
+            CONTEXT_TOEPLITZ_ODD_RANK,
+            rows,
+            &mut rng,
+            |stream, _index| Ok(ToeplitzFastProduct::sample(24, stream)?),
+        )
+        .unwrap();
+    let matrix = random_vector(rows * ell, &mut rng);
+    let q = random_vector(ell, &mut rng);
+    assert_eq!(state.params().n().unwrap(), 24);
+    let decoded = run_protocol(&mut state, &matrix, &q);
+    let expected = naive_matrix_vector(&matrix, &q, rows, ell);
+    assert_eq!(decoded, expected);
+}
+
+#[test]
+fn end_to_end_works_with_a_searched_parameter_set() {
+    // The full validation a production deployment would run: the parameter
+    // search at a modest record length and security level, then
+    // `SecretKey::new` (not `new_insecure`) so the concrete attack-cost
+    // constraints must pass too.
+    let params = search(16, 8).unwrap();
+    let mut rng = ChaCha20Rng::seed_from_u64(0x9400);
+    let (rows, ell) = (2 * 32 + 5, params.ell);
+    let mut state = SecretKey::<MODULUS>::new(params, [0x94; 32])
+        .unwrap()
+        .derive(CONTEXT_SEARCHED, rows, &mut rng, |stream, _index| {
+            Ok(ToeplitzFastProduct::sample(params.n().unwrap(), stream)?)
+        })
         .unwrap();
     let matrix = random_vector(rows * ell, &mut rng);
     let q = random_vector(ell, &mut rng);
@@ -196,12 +353,12 @@ fn instance_id_domain_separates_reconstructed_keys() {
     let mut first_rng = ChaCha20Rng::seed_from_u64(100);
     let mut first = SecretKey::<MODULUS>::new_insecure(test_params(ell), [6; 32])
         .unwrap()
-        .derive(rows, &mut first_rng, toeplitz_block)
+        .derive(CONTEXT_TOEPLITZ, rows, &mut first_rng, toeplitz_block)
         .unwrap();
     let mut second_rng = ChaCha20Rng::seed_from_u64(101);
     let mut second = SecretKey::<MODULUS>::new_insecure(test_params(ell), [6; 32])
         .unwrap()
-        .derive(rows, &mut second_rng, toeplitz_block)
+        .derive(CONTEXT_TOEPLITZ, rows, &mut second_rng, toeplitz_block)
         .unwrap();
 
     let first_ciphertext = encrypt(&mut first, &matrix).unwrap();
@@ -241,7 +398,13 @@ fn query_counter_can_be_resumed_without_reusing_randomness() {
 
     let mut resumed = SecretKey::<MODULUS>::new_insecure(test_params(ell), [8; 32])
         .unwrap()
-        .restore(state.instance_nonce(), 2, rows, toeplitz_block)
+        .restore(
+            CONTEXT_TOEPLITZ,
+            state.instance_nonce(),
+            2,
+            rows,
+            toeplitz_block,
+        )
         .unwrap();
     let (resumed_query, _) = query(&mut resumed, &q).unwrap();
 
@@ -335,7 +498,10 @@ fn caller_owned_buffers_are_fully_overwritten() {
 fn shorter_records_are_padded() {
     let mut rng = ChaCha20Rng::seed_from_u64(9);
     let (rows, ell) = (4_usize, 5_usize);
-    let mut state = derive_toeplitz(rows, ell, 10);
+    let mut state = SecretKey::<MODULUS>::new_insecure(test_params(ell), [10; 32])
+        .unwrap()
+        .derive(CONTEXT_TOEPLITZ_PADDED, rows, &mut rng, toeplitz_block)
+        .unwrap();
     let matrix = random_vector(rows * ell, &mut rng);
     let q = random_vector(ell, &mut rng);
     let decoded = run_protocol(&mut state, &matrix, &q);
@@ -347,7 +513,10 @@ fn shorter_records_are_padded() {
 fn taller_matrices_stack_extra_mask_blocks() {
     let mut rng = ChaCha20Rng::seed_from_u64(11);
     let (rows, ell) = (2 * 16 + 3, 8_usize);
-    let mut state = derive_toeplitz(rows, ell, 12);
+    let mut state = SecretKey::<MODULUS>::new_insecure(test_params(ell), [12; 32])
+        .unwrap()
+        .derive(CONTEXT_TOEPLITZ_MULTI_BLOCK, rows, &mut rng, toeplitz_block)
+        .unwrap();
     assert_eq!(state.mask().block_count(), 3);
     let matrix = random_vector(rows * ell, &mut rng);
     let q = random_vector(ell, &mut rng);
@@ -364,7 +533,7 @@ fn wrong_instance_is_rejected() {
     let nonce = state.instance_nonce();
     let mut other = SecretKey::<MODULUS>::new_insecure(test_params(ell), [15; 32])
         .unwrap()
-        .restore(nonce, 0, rows, toeplitz_block)
+        .restore(CONTEXT_TOEPLITZ, nonce, 0, rows, toeplitz_block)
         .unwrap();
     let matrix = random_vector(rows * ell, &mut rng);
     let q = random_vector(ell, &mut rng);
@@ -374,6 +543,95 @@ fn wrong_instance_is_rejected() {
         answer_into(&state.params(), &encrypted, &query_wrong, &mut []),
         Err(ProtocolError::InstanceMismatch { .. })
     ));
+}
+
+#[test]
+fn reconstruction_context_changes_isolate_instances() {
+    // Under the same root key and the same persisted nonce, changing the
+    // mask context identifier, the row count, or any parameter must each
+    // yield an independent instance; restoring the exact context must
+    // reproduce the original state bit for bit; and artifacts must not mix
+    // across instances.
+    let mut rng = ChaCha20Rng::seed_from_u64(0x9000);
+    let (rows, ell) = (5_usize, 8_usize);
+    let q = random_vector(ell, &mut rng);
+    let nonce = 0x1234_5678_9abc_def0_u128;
+
+    let restore_state = |context: MaskContextId, rows: usize, ell: usize| {
+        SecretKey::<MODULUS>::new_insecure(test_params(ell), [0x90; 32])
+            .unwrap()
+            .restore(context, nonce, 0, rows, toeplitz_block)
+            .unwrap()
+    };
+
+    let mut baseline = restore_state(CONTEXT_TOEPLITZ, rows, ell);
+    let (baseline_query, _baseline_key) = query(&mut baseline, &q).unwrap();
+
+    // Exact restore: the same context, rows, params, key, and nonce
+    // reproduce the instance and its query artifacts bit for bit.
+    let mut exact = restore_state(CONTEXT_TOEPLITZ, rows, ell);
+    assert_eq!(baseline.instance_id(), exact.instance_id());
+    let (exact_query, _exact_key) = query(&mut exact, &q).unwrap();
+    assert_eq!(baseline_query, exact_query);
+
+    // Each changed context field derives an independent instance.
+    let other_context = restore_state(CONTEXT_TOEPLITZ_ALT, rows, ell);
+    let other_rows = restore_state(CONTEXT_TOEPLITZ, rows + 1, ell);
+    let other_params = restore_state(CONTEXT_TOEPLITZ, rows, ell - 3);
+    assert_ne!(baseline.instance_id(), other_context.instance_id());
+    assert_ne!(baseline.instance_id(), other_rows.instance_id());
+    assert_ne!(baseline.instance_id(), other_params.instance_id());
+
+    // Artifact mixing is rejected: a query of the baseline instance does
+    // not answer against a matrix carrying the other-context instance id.
+    // (Restored states cannot encrypt, so the foreign matrix is rebuilt
+    // from the other instance's public identifier.)
+    let zero = field().element_u32(0);
+    let n = baseline.params().n().unwrap();
+    let other_encrypted =
+        EncryptedMatrix::from_parts(other_context.instance_id(), rows, n, vec![zero; rows * n])
+            .unwrap();
+    assert_ne!(baseline.instance_id(), other_encrypted.instance_id());
+    assert!(matches!(
+        answer_into(
+            &baseline.params(),
+            &other_encrypted,
+            &baseline_query,
+            &mut []
+        ),
+        Err(ProtocolError::InstanceMismatch { .. })
+    ));
+}
+
+#[test]
+fn a_failed_query_still_consumes_its_reserved_identifier() {
+    // `query` reserves the identifier before the mask evaluation, so a
+    // mask failure after that point must consume the identifier: retrying
+    // continues from the next index instead of reusing the randomness.
+    let mut rng = ChaCha20Rng::seed_from_u64(0x9600);
+    let (rows, ell) = (5_usize, 8_usize);
+    let mut state = SecretKey::<MODULUS>::new_insecure(test_params(ell), [0x96; 32])
+        .unwrap()
+        .derive(CONTEXT_FAILING, rows, &mut rng, |stream, _index| {
+            Ok(FailingApplyMask {
+                inner: ToeplitzFastProduct::sample(16, stream)?,
+            })
+        })
+        .unwrap();
+    let q = random_vector(ell, &mut rng);
+    assert_eq!(
+        query(&mut state, &q),
+        Err(ProtocolError::Mask(TdmError::ZeroDimension(
+            "deliberately failing test mask"
+        )))
+    );
+    assert_eq!(
+        state.next_query_index(),
+        1,
+        "the post-reservation failure must consume the identifier"
+    );
+    let reservation = state.reserve_query_ids(1).unwrap().next().unwrap();
+    assert_eq!(reservation.query_id(), 1, "the next id must not be reused");
 }
 
 // Independent naive reimplementation of the encryption pipeline, in plain
@@ -456,8 +714,12 @@ fn permutation_direction_is_pinned_by_naive_oracle() {
 
     // Naive query, correct scatter direction.
     let (_encrypted_query, decoding_key) = query(&mut state, &query_vector).unwrap();
-    let mut query_rng = Prf::new([18; 32])
-        .derive_context(state.instance_nonce())
+    // Replicate the protocol's exact derivation of the query codeword
+    // stream: the bound instance PRF over the same key, context, row count,
+    // and nonce that the derived state used.
+    let mut query_rng = SecretKey::<MODULUS>::new_insecure(test_params(ell), [18; 32])
+        .unwrap()
+        .bound_instance_prf(CONTEXT_TOEPLITZ, rows, state.instance_nonce())
         .stream(purpose::QUERY_CODEWORD, 0)
         .unwrap();
     let codeword: Vec<u32> = {
@@ -601,7 +863,7 @@ fn malformed_answer_is_validated_before_output_allocation() {
 fn derive_rejects_a_mask_with_the_wrong_protocol_width() {
     let key = SecretKey::<MODULUS>::new_insecure(test_params(8), [21; 32]).unwrap();
     let mut rng = ChaCha20Rng::seed_from_u64(21);
-    let result = key.derive(1, &mut rng, |stream, _index| {
+    let result = key.derive(CONTEXT_TOEPLITZ, 1, &mut rng, |stream, _index| {
         Ok(ToeplitzFastProduct::sample(8, stream)?)
     });
     assert!(matches!(
@@ -726,7 +988,13 @@ fn answer_batch_rejects_malformed_batches_before_answering() {
 
     let mut other = SecretKey::<MODULUS>::new_insecure(test_params(ell), [0x83; 32])
         .unwrap()
-        .restore(state.instance_nonce(), 0, rows, toeplitz_block)
+        .restore(
+            CONTEXT_TOEPLITZ,
+            state.instance_nonce(),
+            0,
+            rows,
+            toeplitz_block,
+        )
         .unwrap();
     let (foreign_query, _) = query(&mut other, &q).unwrap();
     assert!(matches!(
@@ -890,13 +1158,19 @@ proptest! {
         }
         assert_eq!(state.next_query_index(), batch as u64);
 
-        // A fresh state over the same key and nonce assigns the same
-        // identifier range, so batched artifacts must equal the serial
+        // A fresh state over the same key, context, and nonce assigns the
+        // same identifier range, so batched artifacts must equal the serial
         // ones bit for bit.
         let mut batched_state =
             SecretKey::<MODULUS>::new_insecure(params, [0x8a; 32])
                 .unwrap()
-                .restore(state.instance_nonce(), 0, rows, toeplitz_block)
+                .restore(
+                    CONTEXT_TOEPLITZ,
+                    state.instance_nonce(),
+                    0,
+                    rows,
+                    toeplitz_block,
+                )
                 .unwrap();
         let queries: Vec<&[FieldElement<MODULUS>]> =
             (0..batch).map(|_| q.as_slice()).collect();

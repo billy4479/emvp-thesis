@@ -1,18 +1,22 @@
 //! One client connection: the handshake, the load-once session state
 //! machine, and request validation and evaluation.
 //!
-//! The session lifecycle is `Empty` until the one permitted matrix-set
-//! upload succeeds, then `Loaded`. Upload failures are atomic: no
-//! identifiers are assigned, no budget stays reserved, and the connection
-//! closes so the client can retry with a fresh session. Evaluation
-//! requests are validated in full before any GPU work; a validation
-//! failure is answered and leaves the session usable, while a GPU failure
-//! after registration closes the session and releases its matrices.
+//! The session phase is explicitly `Empty` or `Loaded`: the one permitted
+//! matrix-set upload moves `Empty` to `Loaded` atomically. Upload failures
+//! are atomic too: no identifiers are assigned, no budget stays reserved,
+//! and the connection closes so the client can retry with a fresh session.
+//! Both state violations — a second upload on a loaded session, and an
+//! evaluation before any upload — are answered with the structured error
+//! and close the session immediately, without the offending payload being
+//! read or drained. Request-validation failures (malformed frames,
+//! rejected parameters, unknown identifiers) are answered in-band; a
+//! validation failure of an evaluation leaves the session usable, while a
+//! GPU failure after registration closes the session and releases its
+//! matrices.
 
-use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
-use emvp::{EmvpParams, EncryptedQuery, GpuEncryptedMatrix, GpuError};
+use emvp::{EmvpParams, EncryptedQuery};
 use emvp_network::{
     CodecError, ErrorCode, EvaluateEntry, FrameHeader, FrameKind, FrameReader, HandshakeError,
     MatrixUpload, PROTOCOL_MODULUS, ProductEntry, read_evaluate_payload, read_frame_header,
@@ -20,14 +24,8 @@ use emvp_network::{
     write_upload_accepted,
 };
 
-use crate::coordinator::GpuCoordinator;
+use crate::executor::{MatrixExecutor, MatrixInfo, StoreError};
 use crate::failure::RequestFailure;
-
-/// The per-connection view of one stored encrypted matrix.
-struct MatrixInfo {
-    instance_id: u128,
-    width: usize,
-}
 
 /// How a session continues after one frame.
 enum Outcome {
@@ -45,8 +43,8 @@ pub enum SessionError {
     Handshake(HandshakeError),
     /// The transport or a frame failed mid-session.
     Transport(CodecError),
-    /// A GPU operation failed after the session had loaded matrices.
-    Gpu(GpuError),
+    /// The matrix store failed after the session had loaded matrices.
+    Store(StoreError),
 }
 
 impl fmt::Display for SessionError {
@@ -54,7 +52,7 @@ impl fmt::Display for SessionError {
         match self {
             Self::Handshake(error) => error.fmt(formatter),
             Self::Transport(error) => error.fmt(formatter),
-            Self::Gpu(error) => error.fmt(formatter),
+            Self::Store(error) => error.fmt(formatter),
         }
     }
 }
@@ -64,7 +62,7 @@ impl std::error::Error for SessionError {
         match self {
             Self::Handshake(error) => Some(error),
             Self::Transport(error) => Some(error),
-            Self::Gpu(error) => Some(error),
+            Self::Store(error) => Some(error),
         }
     }
 }
@@ -78,18 +76,34 @@ impl std::error::Error for SessionError {
 ///
 /// # Errors
 ///
-/// Returns the handshake, transport, or GPU failure that ended the
-/// session. Protocol-level rejections are answered in-band and close the
+/// Returns the handshake, transport, or matrix-store failure that ended
+/// the session. Protocol-level rejections are answered in-band; state
+/// violations and unknown frame kinds are answered and close the
 /// connection without surfacing here.
-pub fn serve_connection<S: std::io::Read + std::io::Write>(
-    stream: &mut S,
-    gpu: &GpuCoordinator,
-) -> Result<(), SessionError> {
+pub fn serve_connection<S, E>(stream: &mut S, executor: &E) -> Result<(), SessionError>
+where
+    S: std::io::Read + std::io::Write,
+    E: MatrixExecutor,
+{
     server_handshake(stream).map_err(SessionError::Handshake)?;
-    let mut session = Session::new(gpu);
+    let mut session = Session::new(executor);
     loop {
-        let Some(header) = read_frame_header(stream).map_err(SessionError::Transport)? else {
-            return Ok(());
+        let header = match read_frame_header(stream) {
+            Ok(Some(header)) => header,
+            Ok(None) => return Ok(()),
+            // The header byte and length are already consumed, and the
+            // session is closing, so the payload is never read.
+            Err(CodecError::UnknownFrameKind { kind }) => {
+                send_error(
+                    stream,
+                    ErrorCode::UnknownFrameKind,
+                    &format!("unknown frame kind {kind}"),
+                );
+                return Err(SessionError::Transport(CodecError::UnknownFrameKind {
+                    kind,
+                }));
+            }
+            Err(error) => return Err(SessionError::Transport(error)),
         };
         match session.handle_frame(stream, header) {
             Outcome::Continue => {}
@@ -98,31 +112,57 @@ pub fn serve_connection<S: std::io::Read + std::io::Write>(
     }
 }
 
-/// The mutable state of one connection.
-struct Session<'a> {
-    gpu: &'a GpuCoordinator,
-    matrices: BTreeMap<u64, GpuEncryptedMatrix<PROTOCOL_MODULUS>>,
-    reserved_bytes: u64,
-    next_id: u64,
+/// The explicit phase of the load-once session state machine.
+enum Phase<M> {
+    /// No matrix set has been loaded on this connection.
+    Empty,
+    /// The one permitted upload succeeded; handles are stored in upload
+    /// order and map to the one-based identifiers `1..=len`.
+    Loaded {
+        /// The stored handles, in upload order.
+        matrices: Vec<M>,
+        /// The residency bytes this session reserved.
+        reserved_bytes: u64,
+    },
 }
 
-impl Session<'_> {
-    const fn new(gpu: &GpuCoordinator) -> Session<'_> {
+impl<M> Phase<M> {
+    /// The stored handles, if the session has loaded its matrix set.
+    fn matrices(&self) -> Option<&[M]> {
+        match self {
+            Self::Empty => None,
+            Self::Loaded { matrices, .. } => Some(matrices),
+        }
+    }
+}
+
+/// The mutable state of one connection.
+struct Session<'a, E: MatrixExecutor> {
+    executor: &'a E,
+    phase: Phase<E::Matrix>,
+}
+
+impl<E: MatrixExecutor> Session<'_, E> {
+    const fn new(executor: &E) -> Session<'_, E> {
         Session {
-            gpu,
-            matrices: BTreeMap::new(),
-            reserved_bytes: 0,
-            next_id: 1,
+            executor,
+            phase: Phase::Empty,
         }
     }
 
-    /// The stored matrix's public identity, if the identifier is loaded.
-    fn info(&self, matrix_id: u64) -> Option<MatrixInfo> {
-        let matrix = self.matrices.get(&matrix_id)?;
-        Some(MatrixInfo {
-            instance_id: matrix.instance_id(),
-            width: matrix.params().n().ok()?,
-        })
+    /// Maps a one-based matrix identifier onto its stored slot.
+    ///
+    /// Identifiers are assigned once, consecutively from one, so the
+    /// mapping is a checked index into the upload-order handle vector.
+    fn matrix_slot(&self, matrix_id: u64) -> Option<(usize, MatrixInfo)> {
+        let index = usize::try_from(matrix_id.checked_sub(1)?).ok()?;
+        let handle = self.phase.matrices()?.get(index)?;
+        Some((index, self.executor.info(handle)?))
+    }
+
+    /// The stored handle at an upload-order index.
+    fn matrix_handle(&self, index: usize) -> Option<&E::Matrix> {
+        self.phase.matrices()?.get(index)
     }
 
     fn handle_frame<S: std::io::Read + std::io::Write>(
@@ -151,13 +191,15 @@ impl Session<'_> {
         stream: &mut S,
         payload_len: u64,
     ) -> Outcome {
-        if !self.matrices.is_empty() {
+        // A state violation is fatal: the error is sent without reading
+        // or draining the payload, and the session closes immediately.
+        if matches!(self.phase, Phase::Loaded { .. }) {
             send_error(
                 stream,
                 ErrorCode::AlreadyLoaded,
                 "this session already loaded a matrix set",
             );
-            return Outcome::Continue;
+            return Outcome::Close(None);
         }
         let mut frame = FrameReader::new(stream, payload_len);
         let uploads = match read_upload_matrices_payload(&mut frame)
@@ -176,48 +218,40 @@ impl Session<'_> {
         let total_bytes = match validate_uploads(&uploads) {
             Ok(bytes) => bytes,
             Err(failure) => {
-                send_error(stream, ErrorCode::UploadFailed, &failure.to_string());
+                send_error(stream, failure.code(), &failure.to_string());
                 return Outcome::Close(None);
             }
         };
-        if !self.gpu.reserve(total_bytes) {
-            let message = format!(
-                "the matrix set needs {total_bytes} GPU bytes and exceeds the residency budget"
-            );
-            send_error(stream, ErrorCode::UploadFailed, &message);
-            return Outcome::Close(None);
-        }
-        let gpu_guard = self.gpu.lock_gpu();
-        let mut handles = Vec::new();
-        for upload in &uploads {
-            match self
-                .gpu
-                .answerer()
-                .upload_matrix_sync(&upload.params, &upload.matrix)
-            {
-                Ok(handle) => handles.push(handle),
-                Err(error) => {
-                    drop(handles);
-                    drop(gpu_guard);
-                    self.gpu.release(total_bytes);
-                    send_error(stream, ErrorCode::UploadFailed, &error.to_string());
-                    return Outcome::Close(Some(SessionError::Gpu(error)));
-                }
+        let handles = match self.executor.upload_set(total_bytes, &uploads) {
+            Ok(handles) => handles,
+            Err(StoreError::BudgetExceeded { requested_bytes }) => {
+                send_error(
+                    stream,
+                    ErrorCode::UploadFailed,
+                    &StoreError::BudgetExceeded { requested_bytes }.to_string(),
+                );
+                return Outcome::Close(None);
             }
-        }
-        drop(gpu_guard);
+            Err(error) => {
+                send_error(stream, ErrorCode::UploadFailed, &error.to_string());
+                return Outcome::Close(Some(SessionError::Store(error)));
+            }
+        };
+        // Identifiers are assigned once, consecutively from one, so they
+        // map back onto the stored handles by checked index.
         let mut identifiers = Vec::with_capacity(handles.len());
-        for handle in handles {
-            identifiers.push(self.next_id);
-            self.matrices.insert(self.next_id, handle);
-            self.next_id += 1;
+        for (index, _) in handles.iter().enumerate() {
+            identifiers.push(index as u64 + 1);
         }
-        self.reserved_bytes += total_bytes;
+        self.phase = Phase::Loaded {
+            matrices: handles,
+            reserved_bytes: total_bytes,
+        };
         eprintln!(
             "server: loaded {} matrices ({} bytes, {} bytes reserved process-wide)",
             identifiers.len(),
             total_bytes,
-            self.gpu.reserved_bytes()
+            self.executor.reserved_bytes()
         );
         match write_upload_accepted(stream, &identifiers) {
             Ok(_) => Outcome::Continue,
@@ -226,17 +260,19 @@ impl Session<'_> {
     }
 
     fn handle_evaluate<S: std::io::Read + std::io::Write>(
-        &mut self,
+        &self,
         stream: &mut S,
         payload_len: u64,
     ) -> Outcome {
-        if self.matrices.is_empty() {
+        // A state violation is fatal: the error is sent without reading
+        // or draining the payload, and the session closes immediately.
+        if self.phase.matrices().is_none() {
             send_error(
                 stream,
                 ErrorCode::NotLoaded,
                 "no matrix set has been loaded on this connection",
             );
-            return Outcome::Continue;
+            return Outcome::Close(None);
         }
         let mut frame = FrameReader::new(stream, payload_len);
         let entries = match read_evaluate_payload(&mut frame)
@@ -249,7 +285,8 @@ impl Session<'_> {
                 return Outcome::Close(Some(SessionError::Transport(error)));
             }
         };
-        let prepared = match prepare_evaluate(entries, &mut |matrix_id| self.info(matrix_id)) {
+        let prepared = match prepare_evaluate(entries, &mut |matrix_id| self.matrix_slot(matrix_id))
+        {
             Ok(prepared) => prepared,
             Err(failure) => {
                 let code = failure.code();
@@ -257,42 +294,26 @@ impl Session<'_> {
                 return Outcome::Continue;
             }
         };
-        let gpu_guard = self.gpu.lock_gpu();
         let mut products = Vec::with_capacity(prepared.len());
-        for (matrix_id, queries) in prepared {
-            // Validation pinned every identifier to a stored matrix, and
-            // nothing mutates the map during evaluation.
-            let Some(stored) = self.matrices.get(&matrix_id) else {
-                drop(gpu_guard);
+        for (matrix_id, index, queries) in prepared {
+            // Validation pinned every identifier to a stored slot, and
+            // nothing mutates the phase during evaluation.
+            let Some(matrix) = self.matrix_handle(index) else {
                 send_error(
                     stream,
                     ErrorCode::Internal,
                     "a validated matrix identifier disappeared",
                 );
-                return Outcome::Close(Some(SessionError::Transport(CodecError::TruncatedFrame)));
+                return Outcome::Close(None);
             };
-            match self
-                .gpu
-                .answerer()
-                .answer_batch_sync_with_timings(stored, &queries)
-            {
-                Ok((answers, timings)) => {
-                    eprintln!(
-                        "server: matrix {matrix_id}: answered {} queries in {} ms",
-                        queries.len(),
-                        timings.total().as_millis()
-                    );
-                    products.push(ProductEntry { matrix_id, answers });
-                }
+            match self.executor.answer_batch(matrix_id, matrix, &queries) {
+                Ok(answers) => products.push(ProductEntry { matrix_id, answers }),
                 Err(error) => {
-                    drop(gpu_guard);
-                    self.matrices.clear();
                     send_error(stream, ErrorCode::GpuFailure, &error.to_string());
-                    return Outcome::Close(Some(SessionError::Gpu(error)));
+                    return Outcome::Close(Some(SessionError::Store(error)));
                 }
             }
         }
-        drop(gpu_guard);
         match write_products(stream, &products) {
             Ok(_) => Outcome::Continue,
             Err(error) => Outcome::Close(Some(SessionError::Transport(error))),
@@ -300,16 +321,15 @@ impl Session<'_> {
     }
 }
 
-impl Drop for Session<'_> {
+impl<E: MatrixExecutor> Drop for Session<'_, E> {
     fn drop(&mut self) {
-        self.matrices.clear();
-        if self.reserved_bytes > 0 {
-            self.gpu.release(self.reserved_bytes);
-            self.reserved_bytes = 0;
+        if let Phase::Loaded { reserved_bytes, .. } = &self.phase {
+            let reserved_bytes = *reserved_bytes;
+            self.phase = Phase::Empty;
+            self.executor.release(reserved_bytes);
         }
     }
 }
-
 /// Writes an `Error` frame; a failed write means the transport is already
 /// gone, which the caller handles by closing.
 fn send_error<S: std::io::Write>(stream: &mut S, code: ErrorCode, message: &str) {
@@ -320,15 +340,19 @@ fn send_error<S: std::io::Write>(stream: &mut S, code: ErrorCode, message: &str)
 
 /// Validates one matrix set for upload and totals its GPU byte footprint.
 ///
-/// The set is validated in full before any reservation or device work, so
-/// a rejection cannot leave a partial upload behind.
+/// The set must be nonempty and is validated in full before any
+/// reservation or device work, so a rejection cannot leave a partial
+/// upload behind.
 ///
 /// # Errors
 ///
-/// Returns the first structural problem: malformed parameters, a matrix
-/// whose width disagrees with its parameters, or arithmetic overflow while
-/// totaling the footprint.
+/// Returns the first structural problem: an empty set, malformed
+/// parameters, a matrix whose width disagrees with its parameters, or
+/// arithmetic overflow while totaling the footprint.
 pub fn validate_uploads(uploads: &[MatrixUpload]) -> Result<u64, RequestFailure> {
+    if uploads.is_empty() {
+        return Err(RequestFailure::EmptyRequest);
+    }
     let mut total_bytes = 0_u64;
     for upload in uploads {
         validate_params(&upload.params)?;
@@ -362,27 +386,28 @@ fn validate_params(params: &EmvpParams) -> Result<(), RequestFailure> {
 }
 
 /// Validates an evaluation request in full and flattens it into one
-/// `(matrix id, queries)` pair per entry, in request order.
+/// `(matrix id, slot, queries)` triple per entry, in request order.
 ///
 /// Every entry must reference a distinct loaded matrix, carry at least one
 /// query, and every query must match its matrix's width, instance
 /// identifier, and carry a query identifier unique within its entry. The
-/// whole request is checked before any GPU work begins.
+/// whole request is checked before any GPU work begins. The slot is the
+/// upload-order index the one-based identifier maps onto.
 ///
 /// # Errors
 ///
 /// Returns the first validation failure.
 fn prepare_evaluate(
     entries: Vec<EvaluateEntry>,
-    info: &mut dyn FnMut(u64) -> Option<MatrixInfo>,
-) -> Result<Vec<(u64, Vec<EncryptedQuery<PROTOCOL_MODULUS>>)>, RequestFailure> {
+    lookup: &mut dyn FnMut(u64) -> Option<(usize, MatrixInfo)>,
+) -> Result<Vec<(u64, usize, Vec<EncryptedQuery<PROTOCOL_MODULUS>>)>, RequestFailure> {
     if entries.is_empty() {
         return Err(RequestFailure::EmptyRequest);
     }
-    let mut matrix_ids = BTreeSet::new();
+    let mut matrix_ids = std::collections::BTreeSet::new();
     let mut prepared = Vec::with_capacity(entries.len());
     for entry in entries {
-        let Some(matrix) = info(entry.matrix_id) else {
+        let Some((slot, matrix)) = lookup(entry.matrix_id) else {
             return Err(RequestFailure::UnknownMatrix {
                 id: entry.matrix_id,
             });
@@ -395,7 +420,7 @@ fn prepare_evaluate(
         if entry.queries.is_empty() {
             return Err(RequestFailure::EmptyRequest);
         }
-        let mut query_ids = BTreeSet::new();
+        let mut query_ids = std::collections::BTreeSet::new();
         for query in &entry.queries {
             let width = query.values().len();
             if width != matrix.width {
@@ -417,7 +442,7 @@ fn prepare_evaluate(
                 });
             }
         }
-        prepared.push((entry.matrix_id, entry.queries));
+        prepared.push((entry.matrix_id, slot, entry.queries));
     }
     Ok(prepared)
 }
@@ -427,11 +452,12 @@ mod tests {
     use std::io::Write;
     use std::os::unix::net::UnixStream;
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::thread;
 
     use emvp::{
-        AnswerMatrix, DecodingKey, DerivedState, EmvpParams, GpuError, ProtocolError, SecretKey,
-        encrypt, query,
+        AnswerMatrix, DecodingKey, DerivedState, EmvpParams, EncryptedQuery, MaskContextId,
+        ProtocolError, SecretKey, encrypt, query,
     };
     use emvp_network::{
         ErrorCode, EvaluateEntry, MatrixUpload, PROTOCOL_MODULUS, ProductEntry, client_handshake,
@@ -443,8 +469,11 @@ mod tests {
     use rand_core::SeedableRng;
     use trapdoor_matrices::ToeplitzFastProduct;
 
-    use super::{RequestFailure, prepare_evaluate, serve_connection, validate_uploads};
-    use crate::coordinator::GpuCoordinator;
+    use super::{
+        MatrixExecutor, RequestFailure, SessionError, StoreError, prepare_evaluate,
+        serve_connection, validate_uploads,
+    };
+    use crate::executor::MatrixInfo;
 
     const PARAMS: EmvpParams = EmvpParams {
         k: 8,
@@ -452,6 +481,8 @@ mod tests {
         b: 2,
         lambda: 7,
     };
+
+    const CONTEXT: MaskContextId = MaskContextId::from_u64(0x0100);
 
     const fn field() -> PrimeField<PROTOCOL_MODULUS> {
         PrimeField::<PROTOCOL_MODULUS>::new()
@@ -482,7 +513,7 @@ mod tests {
         let mut rng = ChaCha20Rng::seed_from_u64(seed);
         let mut state = SecretKey::<PROTOCOL_MODULUS>::new_insecure(PARAMS, [key; 32])
             .unwrap()
-            .derive(rows, &mut rng, toeplitz_block)
+            .derive(CONTEXT, rows, &mut rng, toeplitz_block)
             .unwrap();
         let plaintext = values(rows * PARAMS.ell, seed ^ 0xFF);
         let matrix = encrypt(&mut state, &plaintext).unwrap();
@@ -494,6 +525,92 @@ mod tests {
             state,
             plaintext,
         )
+    }
+
+    /// One stored matrix of the deterministic CPU store.
+    struct FakeMatrix {
+        params: EmvpParams,
+        matrix: emvp::EncryptedMatrix<PROTOCOL_MODULUS>,
+    }
+
+    /// A deterministic CPU store: uploads clone the ciphertexts, answers
+    /// run the CPU protocol path, and the reservation is an atomic counter
+    /// tests can inspect after the session drops.
+    #[derive(Clone)]
+    struct FakeExecutor {
+        max_bytes: u64,
+        reserved: Arc<AtomicU64>,
+    }
+
+    impl FakeExecutor {
+        fn new(max_bytes: u64) -> Self {
+            Self {
+                max_bytes,
+                reserved: Arc::new(AtomicU64::new(0)),
+            }
+        }
+
+        fn reserved(&self) -> u64 {
+            self.reserved.load(Ordering::SeqCst)
+        }
+    }
+
+    impl MatrixExecutor for FakeExecutor {
+        type Matrix = FakeMatrix;
+
+        fn upload_set(
+            &self,
+            total_bytes: u64,
+            uploads: &[MatrixUpload],
+        ) -> Result<Vec<FakeMatrix>, StoreError> {
+            let projected = self
+                .reserved
+                .load(Ordering::SeqCst)
+                .checked_add(total_bytes)
+                .ok_or(StoreError::BudgetExceeded {
+                    requested_bytes: total_bytes,
+                })?;
+            if projected > self.max_bytes {
+                return Err(StoreError::BudgetExceeded {
+                    requested_bytes: total_bytes,
+                });
+            }
+            self.reserved.store(projected, Ordering::SeqCst);
+            Ok(uploads
+                .iter()
+                .map(|upload| FakeMatrix {
+                    params: upload.params,
+                    matrix: upload.matrix.clone(),
+                })
+                .collect())
+        }
+
+        fn info(&self, matrix: &FakeMatrix) -> Option<MatrixInfo> {
+            Some(MatrixInfo {
+                instance_id: matrix.matrix.instance_id(),
+                width: matrix.matrix.columns(),
+            })
+        }
+
+        fn answer_batch(
+            &self,
+            _matrix_id: u64,
+            matrix: &FakeMatrix,
+            queries: &[EncryptedQuery<PROTOCOL_MODULUS>],
+        ) -> Result<Vec<AnswerMatrix<PROTOCOL_MODULUS>>, StoreError> {
+            emvp::answer_batch(&matrix.params, &matrix.matrix, queries)
+                .map_err(StoreError::Protocol)
+        }
+
+        fn release(&self, bytes: u64) {
+            let previous = self.reserved.load(Ordering::SeqCst);
+            self.reserved
+                .store(previous.saturating_sub(bytes), Ordering::SeqCst);
+        }
+
+        fn reserved_bytes(&self) -> u64 {
+            self.reserved()
+        }
     }
 
     #[test]
@@ -529,13 +646,24 @@ mod tests {
     }
 
     #[test]
+    fn validate_uploads_rejects_an_empty_set() {
+        assert!(matches!(
+            validate_uploads(&[]),
+            Err(RequestFailure::EmptyRequest)
+        ));
+    }
+
+    #[test]
     fn evaluate_preparation_enforces_the_request_contract() {
-        let mut info = |matrix_id: u64| {
+        let mut lookup = |matrix_id: u64| {
             if matrix_id == 7 {
-                Some(super::MatrixInfo {
-                    instance_id: 42,
-                    width: 16,
-                })
+                Some((
+                    0_usize,
+                    MatrixInfo {
+                        instance_id: 42,
+                        width: 16,
+                    },
+                ))
             } else {
                 None
             }
@@ -549,19 +677,20 @@ mod tests {
 
         let ok = prepare_evaluate(
             vec![entry(7, vec![make_query(0, 16, 42), make_query(1, 16, 42)])],
-            &mut info,
+            &mut lookup,
         )
         .unwrap();
         assert_eq!(ok.len(), 1);
         assert_eq!(ok[0].0, 7);
-        assert_eq!(ok[0].1.len(), 2);
+        assert_eq!(ok[0].1, 0);
+        assert_eq!(ok[0].2.len(), 2);
 
         assert!(matches!(
-            prepare_evaluate(vec![], &mut info),
+            prepare_evaluate(vec![], &mut lookup),
             Err(RequestFailure::EmptyRequest)
         ));
         assert!(matches!(
-            prepare_evaluate(vec![entry(9, vec![make_query(0, 16, 42)])], &mut info),
+            prepare_evaluate(vec![entry(9, vec![make_query(0, 16, 42)])], &mut lookup),
             Err(RequestFailure::UnknownMatrix { id: 9 })
         ));
         assert!(matches!(
@@ -570,19 +699,19 @@ mod tests {
                     entry(7, vec![make_query(0, 16, 42)]),
                     entry(7, vec![make_query(1, 16, 42)]),
                 ],
-                &mut info,
+                &mut lookup,
             ),
             Err(RequestFailure::DuplicateMatrix { id: 7 })
         ));
         assert!(matches!(
-            prepare_evaluate(vec![entry(7, vec![make_query(3, 15, 42)])], &mut info,),
+            prepare_evaluate(vec![entry(7, vec![make_query(3, 15, 42)])], &mut lookup,),
             Err(RequestFailure::QueryWidth {
                 expected: 16,
                 actual: 15
             })
         ));
         assert!(matches!(
-            prepare_evaluate(vec![entry(7, vec![make_query(3, 16, 43)])], &mut info,),
+            prepare_evaluate(vec![entry(7, vec![make_query(3, 16, 43)])], &mut lookup,),
             Err(RequestFailure::InstanceMismatch {
                 expected: 42,
                 actual: 43
@@ -594,7 +723,7 @@ mod tests {
                     7,
                     vec![make_query(5, 16, 42), make_query(5, 16, 42),]
                 )],
-                &mut info,
+                &mut lookup,
             ),
             Err(RequestFailure::DuplicateQuery {
                 matrix_id: 7,
@@ -602,30 +731,21 @@ mod tests {
             })
         ));
         assert!(matches!(
-            prepare_evaluate(vec![entry(7, vec![])], &mut info),
+            prepare_evaluate(vec![entry(7, vec![])], &mut lookup),
             Err(RequestFailure::EmptyRequest)
         ));
-    }
-
-    /// Probes for a compute device; `None` means "skip this test".
-    fn coordinator() -> Option<Arc<GpuCoordinator>> {
-        match GpuCoordinator::new(1 << 30) {
-            Ok(gpu) => Some(Arc::new(gpu)),
-            Err(GpuError::NoAdapter { reason }) => {
-                println!("skipping server test: no compute adapter ({reason})");
-                None
-            }
-            Err(error) => panic!("unexpected coordinator failure: {error}"),
-        }
+        // A zero identifier maps to no slot: one-based identifiers only.
+        assert!(lookup(0).is_none());
+        assert!(lookup(1).is_none());
     }
 
     fn spawn_server(
         server_stream: UnixStream,
-        gpu: Arc<GpuCoordinator>,
-    ) -> thread::JoinHandle<Result<(), super::SessionError>> {
+        executor: FakeExecutor,
+    ) -> thread::JoinHandle<Result<(), SessionError>> {
         thread::spawn(move || {
             let mut server_stream = server_stream;
-            serve_connection(&mut server_stream, &gpu)
+            serve_connection(&mut server_stream, &executor)
         })
     }
 
@@ -633,11 +753,13 @@ mod tests {
         state: &mut DerivedState<PROTOCOL_MODULUS, ToeplitzFastProduct<PROTOCOL_MODULUS>>,
         seed: u64,
     ) -> (
-        emvp::EncryptedQuery<PROTOCOL_MODULUS>,
+        EncryptedQuery<PROTOCOL_MODULUS>,
         DecodingKey<PROTOCOL_MODULUS>,
+        Vec<FieldElement<PROTOCOL_MODULUS>>,
     ) {
         let q = values(PARAMS.ell, seed);
-        query(state, &q).unwrap()
+        let (encrypted, key) = query(state, &q).unwrap();
+        (encrypted, key, q)
     }
 
     fn naive_product(
@@ -668,11 +790,9 @@ mod tests {
 
     #[test]
     fn full_session_uploads_evaluates_and_answers_correctly() {
-        let Some(gpu) = coordinator() else {
-            return;
-        };
+        let executor = FakeExecutor::new(1 << 20);
         let (mut client, server_stream) = UnixStream::pair().unwrap();
-        let server = spawn_server(server_stream, gpu);
+        let server = spawn_server(server_stream, executor.clone());
         client_handshake(&mut client).unwrap();
 
         let (upload_a, mut state_a, plaintext_a) = upload(5, 0x11, 100);
@@ -681,9 +801,9 @@ mod tests {
         let (ids, _) = read_upload_accepted(&mut client).unwrap();
         assert_eq!(ids, vec![1, 2]);
 
-        let (query_a0, key_a0) = random_query(&mut state_a, 200);
-        let (query_a1, key_a1) = random_query(&mut state_a, 201);
-        let (query_of_b, key_of_b) = random_query(&mut state_b, 202);
+        let (query_a0, key_a0, plain_a0) = random_query(&mut state_a, 200);
+        let (query_a1, key_a1, plain_a1) = random_query(&mut state_a, 201);
+        let (query_of_b, key_of_b, plain_b) = random_query(&mut state_b, 202);
         let entries = vec![
             EvaluateEntry {
                 matrix_id: ids[0],
@@ -691,7 +811,7 @@ mod tests {
             },
             EvaluateEntry {
                 matrix_id: ids[1],
-                queries: vec![query_of_b.clone()],
+                queries: vec![query_of_b],
             },
         ];
         write_evaluate(&mut client, &entries).unwrap();
@@ -701,10 +821,10 @@ mod tests {
         let ProductEntry { matrix_id, answers } = &products[0];
         assert_eq!(*matrix_id, ids[0]);
         assert_eq!(answers.len(), 2);
-        for ((answer, key), sent_query) in answers
+        for ((answer, key), plaintext_query) in answers
             .iter()
             .zip([&key_a0, &key_a1])
-            .zip(&entries[0].queries)
+            .zip([&plain_a0, &plain_a1])
         {
             assert_eq!(answer.instance_id(), state_a.instance_id());
             assert_eq!(answer.query_id(), key.query_id());
@@ -713,7 +833,7 @@ mod tests {
             let decoded_product = decoded(answer, key);
             assert_eq!(
                 decoded_product,
-                naive_product(&plaintext_a, sent_query.values(), 5)
+                naive_product(&plaintext_a, plaintext_query, 5)
             );
         }
         let ProductEntry { matrix_id, answers } = &products[1];
@@ -721,56 +841,52 @@ mod tests {
         assert_eq!(answers.len(), 1);
         assert_eq!(answers[0].rows(), 21);
         let decoded_product = decoded(&answers[0], &key_of_b);
-        assert_eq!(
-            decoded_product,
-            naive_product(&plaintext_b, query_of_b.values(), 21)
-        );
+        assert_eq!(decoded_product, naive_product(&plaintext_b, &plain_b, 21));
 
         drop(client);
         server.join().unwrap().unwrap();
+        // The session released its reservation on drop.
+        assert_eq!(executor.reserved(), 0);
     }
 
     #[test]
-    fn a_second_upload_is_rejected_and_the_session_survives() {
-        let Some(gpu) = coordinator() else {
-            return;
-        };
+    fn a_second_upload_is_rejected_and_closes_the_session() {
+        let executor = FakeExecutor::new(1 << 20);
         let (mut client, server_stream) = UnixStream::pair().unwrap();
-        let server = spawn_server(server_stream, gpu);
+        let server = spawn_server(server_stream, executor);
         client_handshake(&mut client).unwrap();
 
-        let (upload_a, mut state_a, _) = upload(5, 0x11, 300);
+        let (upload_a, _, _) = upload(5, 0x11, 300);
         write_upload_matrices(&mut client, &[upload_a]).unwrap();
         let (ids, _) = read_upload_accepted(&mut client).unwrap();
+        assert_eq!(ids, vec![1]);
 
+        // The server answers the state violation and closes immediately;
+        // the second payload is never read or drained. The client sends
+        // only the frame header, so the close carries no unread data and
+        // the error frame is delivered deterministically.
         let (upload_b, _, _) = upload(7, 0x33, 301);
-        write_upload_matrices(&mut client, &[upload_b]).unwrap();
-        let (error, _) = read_error(&mut client).unwrap();
-        assert_eq!(error.code(), Some(ErrorCode::AlreadyLoaded));
-
-        let (query_a0, key_a0) = random_query(&mut state_a, 302);
-        write_evaluate(
+        let payload_len = emvp_network::write_upload_matrices(&mut Vec::new(), &[upload_b])
+            .unwrap()
+            - emvp_network::HEADER_BYTES;
+        emvp_network::write_frame_header(
             &mut client,
-            &[EvaluateEntry {
-                matrix_id: ids[0],
-                queries: vec![query_a0],
-            }],
+            emvp_network::FrameKind::UploadMatrices,
+            payload_len,
         )
         .unwrap();
-        let (products, _) = read_products(&mut client).unwrap();
-        assert_eq!(products[0].answers[0].query_id(), key_a0.query_id());
+        let (error, _) = read_error(&mut client).unwrap();
+        assert_eq!(error.code(), Some(ErrorCode::AlreadyLoaded));
+        assert!(read_frame_header(&mut client).unwrap().is_none());
 
-        drop(client);
         server.join().unwrap().unwrap();
     }
 
     #[test]
     fn a_failed_upload_is_atomic_and_closes_the_session() {
-        let Some(gpu) = coordinator() else {
-            return;
-        };
+        let executor = FakeExecutor::new(1 << 20);
         let (mut client, server_stream) = UnixStream::pair().unwrap();
-        let server = spawn_server(server_stream, gpu);
+        let server = spawn_server(server_stream, executor);
         client_handshake(&mut client).unwrap();
 
         // `b = 3` does not divide `n = 16`: structurally invalid parameters.
@@ -784,7 +900,7 @@ mod tests {
         };
         write_upload_matrices(&mut client, &[malformed]).unwrap();
         let (error, _) = read_error(&mut client).unwrap();
-        assert_eq!(error.code(), Some(ErrorCode::UploadFailed));
+        assert_eq!(error.code(), Some(ErrorCode::InvalidParameters));
 
         // The server closed the connection without assigning identifiers.
         assert!(read_frame_header(&mut client).unwrap().is_none());
@@ -792,48 +908,93 @@ mod tests {
     }
 
     #[test]
-    fn evaluation_before_an_upload_is_answered_with_an_error() {
-        let Some(gpu) = coordinator() else {
-            return;
-        };
+    fn an_upload_exceeding_the_budget_closes_the_session() {
+        let (upload_a, _, _) = upload(5, 0x11, 500);
+        let needed = validate_uploads(std::slice::from_ref(&upload_a)).unwrap();
+        let executor = FakeExecutor::new(needed - 1);
         let (mut client, server_stream) = UnixStream::pair().unwrap();
-        let server = spawn_server(server_stream, gpu);
+        let server = spawn_server(server_stream, executor);
+        client_handshake(&mut client).unwrap();
+
+        write_upload_matrices(&mut client, &[upload_a]).unwrap();
+        let (error, _) = read_error(&mut client).unwrap();
+        assert_eq!(error.code(), Some(ErrorCode::UploadFailed));
+        assert!(read_frame_header(&mut client).unwrap().is_none());
+
+        server.join().unwrap().unwrap();
+    }
+
+    #[test]
+    fn an_empty_upload_set_is_rejected() {
+        let executor = FakeExecutor::new(1 << 20);
+        let (mut client, server_stream) = UnixStream::pair().unwrap();
+        let server = spawn_server(server_stream, executor);
+        client_handshake(&mut client).unwrap();
+
+        write_upload_matrices(&mut client, &[]).unwrap();
+        let (error, _) = read_error(&mut client).unwrap();
+        assert_eq!(error.code(), Some(ErrorCode::EmptyRequest));
+        assert!(read_frame_header(&mut client).unwrap().is_none());
+
+        server.join().unwrap().unwrap();
+    }
+
+    #[test]
+    fn evaluation_before_an_upload_is_answered_and_closes() {
+        let executor = FakeExecutor::new(1 << 20);
+        let (mut client, server_stream) = UnixStream::pair().unwrap();
+        let server = spawn_server(server_stream, executor);
         client_handshake(&mut client).unwrap();
 
         let entry = EvaluateEntry {
             matrix_id: 1,
-            queries: vec![emvp::EncryptedQuery::from_parts(1, 0, values(16, 500))],
+            queries: vec![emvp::EncryptedQuery::from_parts(1, 0, values(16, 600))],
         };
-        for _ in 0..2 {
-            write_evaluate(&mut client, std::slice::from_ref(&entry)).unwrap();
-            let (error, _) = read_error(&mut client).unwrap();
-            assert_eq!(error.code(), Some(ErrorCode::NotLoaded));
-        }
+        // The client sends only the frame header, so the session closes
+        // with no unread data and the error frame is delivered cleanly.
+        let payload_len =
+            emvp_network::write_evaluate(&mut Vec::new(), std::slice::from_ref(&entry)).unwrap()
+                - emvp_network::HEADER_BYTES;
+        emvp_network::write_frame_header(
+            &mut client,
+            emvp_network::FrameKind::Evaluate,
+            payload_len,
+        )
+        .unwrap();
+        let (error, _) = read_error(&mut client).unwrap();
+        assert_eq!(error.code(), Some(ErrorCode::NotLoaded));
 
-        drop(client);
+        // The session closed: the answer never leaves the connection
+        // usable for a second request.
+        assert!(read_frame_header(&mut client).unwrap().is_none());
         server.join().unwrap().unwrap();
     }
 
     #[test]
     fn server_directed_frames_close_the_session() {
-        let Some(gpu) = coordinator() else {
-            return;
-        };
+        let executor = FakeExecutor::new(1 << 20);
         let (mut client, server_stream) = UnixStream::pair().unwrap();
-        let server = spawn_server(server_stream, gpu);
+        let server = spawn_server(server_stream, executor);
         client_handshake(&mut client).unwrap();
 
-        // A client must never send server-to-client frames.
+        // A client must never send server-to-client frames. The client sends
+        // only the frame header, so the session closes with no unread data
+        // and the error frame is delivered deterministically.
         let mut buffer = Vec::new();
-        emvp_network::write_products(
+        let written = emvp_network::write_products(
             &mut buffer,
             &[ProductEntry {
                 matrix_id: 1,
-                answers: vec![AnswerMatrix::from_parts(1, 0, values(8, 600), 4, 2)],
+                answers: vec![AnswerMatrix::from_parts(1, 0, values(8, 700), 4, 2)],
             }],
         )
         .unwrap();
-        client.write_all(&buffer).unwrap();
+        emvp_network::write_frame_header(
+            &mut client,
+            emvp_network::FrameKind::Products,
+            written - emvp_network::HEADER_BYTES,
+        )
+        .unwrap();
         let (error, _) = read_error(&mut client).unwrap();
         assert_eq!(error.code(), Some(ErrorCode::UnexpectedFrame));
 
@@ -842,8 +1003,31 @@ mod tests {
         let outcome = server.join().unwrap();
         assert!(matches!(
             outcome,
-            Err(super::SessionError::Transport(
+            Err(SessionError::Transport(
                 emvp_network::CodecError::UnexpectedFrame { .. }
+            ))
+        ));
+    }
+
+    #[test]
+    fn an_unknown_frame_kind_gets_a_structured_error() {
+        let executor = FakeExecutor::new(1 << 20);
+        let (mut client, server_stream) = UnixStream::pair().unwrap();
+        let server = spawn_server(server_stream, executor);
+        client_handshake(&mut client).unwrap();
+
+        // A kind byte outside the protocol: the server reads the header,
+        // answers the structured error, and closes without the payload.
+        client.write_all(&[0x2A, 0, 0, 0, 0, 0, 0, 0, 0]).unwrap();
+        let (error, _) = read_error(&mut client).unwrap();
+        assert_eq!(error.code(), Some(ErrorCode::UnknownFrameKind));
+        assert!(read_frame_header(&mut client).unwrap().is_none());
+
+        let outcome = server.join().unwrap();
+        assert!(matches!(
+            outcome,
+            Err(SessionError::Transport(
+                emvp_network::CodecError::UnknownFrameKind { kind: 0x2A }
             ))
         ));
     }

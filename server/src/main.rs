@@ -8,6 +8,7 @@
 //! `--max-gpu-bytes`.
 
 mod coordinator;
+mod executor;
 mod failure;
 mod session;
 
@@ -63,7 +64,7 @@ fn main() -> ExitCode {
                 |_| "unknown peer".to_string(),
                 |address| address.to_string(),
             );
-            match session::serve_connection(&mut stream, &gpu) {
+            match session::serve_connection(&mut stream, &*gpu) {
                 Ok(()) => eprintln!("server: {peer} disconnected"),
                 Err(error) => eprintln!("server: {peer} session failed: {error}"),
             }

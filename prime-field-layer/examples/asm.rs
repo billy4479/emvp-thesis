@@ -22,16 +22,6 @@ fn inverse_auto(plan: &NttPlan<P1>, values: &mut [FieldElement<P1>]) {
 }
 
 #[inline(never)]
-fn forward_scalar(plan: &NttPlan<P1>, values: &mut [FieldElement<P1>]) {
-    black_box(plan.forward(black_box(values))).unwrap();
-}
-
-#[inline(never)]
-fn inverse_scalar(plan: &NttPlan<P1>, values: &mut [FieldElement<P1>]) {
-    black_box(plan.inverse(black_box(values))).unwrap();
-}
-
-#[inline(never)]
 fn pointwise(plan: &NttPlan<P1>, lhs: &mut [FieldElement<P1>], rhs: &[FieldElement<P1>]) {
     black_box(plan.pointwise_mul_assign(black_box(lhs), black_box(rhs))).unwrap();
 }
@@ -74,7 +64,6 @@ fn dot_pseudo_mersenne(lhs: &[u32], rhs: &[u32]) -> u32 {
 
 fn main() {
     let auto = black_box(NttPlan::<P1>::new(1024).unwrap());
-    let scalar = black_box(NttPlan::<P1>::new_scalar(1024).unwrap());
     let reduced = black_box(NttPlan::<P2>::new(1024).unwrap());
 
     let mut values = auto.elements(&black_box((0..1024).collect::<Vec<u32>>()));
@@ -82,8 +71,6 @@ fn main() {
 
     forward_auto(&auto, &mut values);
     inverse_auto(&auto, &mut values);
-    forward_scalar(&scalar, &mut values);
-    inverse_scalar(&scalar, &mut values);
     pointwise(&auto, &mut values, &rhs);
     let reduced_input: Vec<u32> = values.iter().map(|value| value.value()).collect();
     forward_reduced(&reduced, &mut black_box(reduced.elements(&reduced_input)));

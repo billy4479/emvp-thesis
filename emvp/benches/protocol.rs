@@ -3,7 +3,7 @@
     reason = "benchmarks use fixed valid parameters and keep setup beside measurements"
 )]
 
-use std::{hint::black_box, sync::OnceLock};
+use std::hint::black_box;
 
 use criterion::{
     BatchSize, BenchmarkGroup, BenchmarkId, Criterion, criterion_group, criterion_main,
@@ -14,15 +14,16 @@ use emvp::{
     query_batch, search,
 };
 use prime_field_layer::{FieldElement, PrimeField};
-use rayon::{ThreadPool, ThreadPoolBuilder, prelude::*};
+use rayon::{ThreadPool, prelude::*};
 use trapdoor_matrices::TdmMask;
 
 mod common;
 
 use common::{
-    BlockBuilder, LLM_LAMBDA, LLM_RECORD_LENGTHS, LLM_ROW_COUNTS, MODULUS, PARAMS, bench_parameter,
-    derive_with, elements, field_values, protocol_fixtures, protocol_fixtures_batch, raa_block,
-    ring_block, seeded_rng, suite_group, toeplitz_block,
+    BlockBuilder, LLM_LAMBDA, LLM_RECORD_LENGTHS, LLM_ROW_COUNTS, MODULUS, MaskSuite, PARAMS,
+    SUITE_RAA, SUITE_RING, SUITE_TOEPLITZ, bench_parameter, benchmark_pool, derive_with, elements,
+    field_values, protocol_fixtures, protocol_fixtures_batch, raa_block, ring_block, seeded_rng,
+    suite_group, toeplitz_block,
 };
 
 // Quick-mode row counts, picked to keep both sides of the n-row mask-block
@@ -37,17 +38,6 @@ const ANSWER_CALIBRATION_ROW_COUNTS: [usize; 3] = [16, 31, 32];
 const ANSWER_BATCH: usize = 4;
 // Batch size of the query_batch cases.
 const QUERY_BATCH: usize = 4;
-
-// The fixed eight-thread pool keeps every multi-threaded suite case
-// comparable across machines and across saved baselines: without it, cases
-// measured outside an explicit pool inherit rayon's global pool, whose size
-// is whatever the benchmark machine has cores. `answer`, `plaintext`,
-// `query`, and `decode` all install this pool, and every internal rayon
-// site in the library sizes its parallel decision against it.
-fn benchmark_pool() -> &'static ThreadPool {
-    static POOL: OnceLock<ThreadPool> = OnceLock::new();
-    POOL.get_or_init(|| ThreadPoolBuilder::new().num_threads(8).build().unwrap())
-}
 
 // Row counts per phase for one parameter set.
 struct SuiteRows {
@@ -65,43 +55,49 @@ const QUICK_ROWS: SuiteRows = SuiteRows {
 fn bench_derive_for<M: TdmMask<MODULUS>>(
     group: &mut BenchmarkGroup<'_, WallTime>,
     tag: &str,
-    label: &str,
+    suite: MaskSuite,
     params: EmvpParams,
     rows: usize,
     build_block: BlockBuilder<M>,
 ) {
-    group.bench_function(BenchmarkId::new(label, bench_parameter(tag, rows)), |b| {
-        b.iter(|| {
-            let mut rng = seeded_rng(0xf2, rows);
-            black_box(
-                SecretKey::<MODULUS>::new(params, [0x72; 32])
-                    .unwrap()
-                    .derive(rows, &mut rng, |stream, index| {
-                        build_block(params, stream, index)
-                    })
-                    .unwrap(),
-            )
-        });
-    });
+    group.bench_function(
+        BenchmarkId::new(suite.label, bench_parameter(tag, rows)),
+        |b| {
+            b.iter(|| {
+                let mut rng = seeded_rng(0xf2, rows);
+                black_box(
+                    SecretKey::<MODULUS>::new(params, [0x72; 32])
+                        .unwrap()
+                        .derive(suite.context, rows, &mut rng, |stream, index| {
+                            build_block(params, stream, index)
+                        })
+                        .unwrap(),
+                )
+            });
+        },
+    );
 }
 
 fn bench_encrypt_for<M: TdmMask<MODULUS>>(
     group: &mut BenchmarkGroup<'_, WallTime>,
     tag: &str,
-    label: &str,
+    suite: MaskSuite,
     params: EmvpParams,
     rows: usize,
     build_block: BlockBuilder<M>,
 ) {
     let matrix = field_values(rows * params.ell, 0x02);
     group.throughput(elements(rows * params.ell));
-    group.bench_function(BenchmarkId::new(label, bench_parameter(tag, rows)), |b| {
-        b.iter_batched(
-            || derive_with(params, rows, 0x01, build_block),
-            |mut state| black_box(encrypt(black_box(&mut state), black_box(&matrix)).unwrap()),
-            BatchSize::SmallInput,
-        );
-    });
+    group.bench_function(
+        BenchmarkId::new(suite.label, bench_parameter(tag, rows)),
+        |b| {
+            b.iter_batched(
+                || derive_with(params, rows, 0x01, suite.context, build_block),
+                |mut state| black_box(encrypt(black_box(&mut state), black_box(&matrix)).unwrap()),
+                BatchSize::SmallInput,
+            );
+        },
+    );
 }
 
 // One query per iteration on the fixed pool: the mask evaluation inside
@@ -110,24 +106,27 @@ fn bench_encrypt_for<M: TdmMask<MODULUS>>(
 fn bench_query_for<M: TdmMask<MODULUS>>(
     group: &mut BenchmarkGroup<'_, WallTime>,
     tag: &str,
-    label: &str,
+    suite: MaskSuite,
     params: EmvpParams,
     rows: usize,
     build_block: BlockBuilder<M>,
 ) {
-    let mut state = derive_with(params, rows, 0x03, build_block);
+    let mut state = derive_with(params, rows, 0x03, suite.context, build_block);
     let record = field_values(params.ell, 0x04);
     // The stream keeps advancing across iterations, mirroring repeated
     // queries with fresh randomness.
-    group.bench_function(BenchmarkId::new(label, bench_parameter(tag, rows)), |b| {
-        b.iter(|| {
-            benchmark_pool().install(|| {
-                let (encrypted_query, decoding_key) =
-                    query(black_box(&mut state), black_box(&record)).unwrap();
-                black_box((encrypted_query, decoding_key))
-            })
-        });
-    });
+    group.bench_function(
+        BenchmarkId::new(suite.label, bench_parameter(tag, rows)),
+        |b| {
+            b.iter(|| {
+                benchmark_pool().install(|| {
+                    let (encrypted_query, decoding_key) =
+                        query(black_box(&mut state), black_box(&record)).unwrap();
+                    black_box((encrypted_query, decoding_key))
+                })
+            });
+        },
+    );
 }
 
 // One query batch per iteration, either through `query_batch` on the fixed
@@ -137,12 +136,13 @@ fn bench_query_for<M: TdmMask<MODULUS>>(
 fn bench_query_batch_for<M: TdmMask<MODULUS>>(
     group: &mut BenchmarkGroup<'_, WallTime>,
     tag: &str,
+    suite: MaskSuite,
     params: EmvpParams,
     rows: usize,
     batch: usize,
     build_block: BlockBuilder<M>,
 ) {
-    let mut state = derive_with(params, rows, 0x03, build_block);
+    let mut state = derive_with(params, rows, 0x03, suite.context, build_block);
     let record = field_values(params.ell, 0x04);
     let queries: Vec<&[FieldElement<MODULUS>]> = (0..batch).map(|_| record.as_slice()).collect();
     group.throughput(elements(batch * params.ell));
@@ -313,18 +313,19 @@ fn run_query_suite(criterion: &mut Criterion, tag: &str, params: EmvpParams, cou
         bench_query_for(
             &mut query_group,
             tag,
-            "toeplitz",
+            SUITE_TOEPLITZ,
             params,
             rows,
             toeplitz_block,
         );
-        bench_query_for(&mut query_group, tag, "raa", params, rows, raa_block);
-        bench_query_for(&mut query_group, tag, "ring", params, rows, ring_block);
+        bench_query_for(&mut query_group, tag, SUITE_RAA, params, rows, raa_block);
+        bench_query_for(&mut query_group, tag, SUITE_RING, params, rows, ring_block);
     }
     for &rows in counts.client {
         bench_query_batch_for(
             &mut query_group,
             tag,
+            SUITE_TOEPLITZ,
             params,
             rows,
             QUERY_BATCH,
@@ -345,13 +346,13 @@ fn run_suite(criterion: &mut Criterion, tag: &str, params: EmvpParams, counts: &
             bench_derive_for(
                 &mut derive_group,
                 tag,
-                "toeplitz",
+                SUITE_TOEPLITZ,
                 params,
                 rows,
                 toeplitz_block,
             );
-            bench_derive_for(&mut derive_group, tag, "raa", params, rows, raa_block);
-            bench_derive_for(&mut derive_group, tag, "ring", params, rows, ring_block);
+            bench_derive_for(&mut derive_group, tag, SUITE_RAA, params, rows, raa_block);
+            bench_derive_for(&mut derive_group, tag, SUITE_RING, params, rows, ring_block);
         }
         derive_group.finish();
     }
@@ -362,13 +363,20 @@ fn run_suite(criterion: &mut Criterion, tag: &str, params: EmvpParams, counts: &
             bench_encrypt_for(
                 &mut encrypt_group,
                 tag,
-                "toeplitz",
+                SUITE_TOEPLITZ,
                 params,
                 rows,
                 toeplitz_block,
             );
-            bench_encrypt_for(&mut encrypt_group, tag, "raa", params, rows, raa_block);
-            bench_encrypt_for(&mut encrypt_group, tag, "ring", params, rows, ring_block);
+            bench_encrypt_for(&mut encrypt_group, tag, SUITE_RAA, params, rows, raa_block);
+            bench_encrypt_for(
+                &mut encrypt_group,
+                tag,
+                SUITE_RING,
+                params,
+                rows,
+                ring_block,
+            );
         }
         encrypt_group.finish();
     }

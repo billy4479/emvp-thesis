@@ -1,14 +1,25 @@
-//! Fixtures and helpers shared by the `protocol` and `online` benchmark
-//! targets.
+//! Fixtures and helpers shared by all `emvp` benchmark targets.
 //!
-//! Both suites build their protocol artifacts from the same seeded builders,
-//! so measurements taken by either target refer to identical fixtures.
+//! Every suite builds its protocol artifacts from the same seeded builders,
+//! so measurements taken by any target refer to identical fixtures. The
+//! fixed-size rayon pools here pin the thread counts each suite's fairness
+//! contract needs; suites intentionally differ in which pool they install.
+
+// Every bench target compiles this module wholesale but uses only the
+// subset of helpers its suite needs, so each target sees some dead items.
+#![expect(
+    dead_code,
+    reason = "each bench target uses a different subset of the shared helpers"
+)]
+
+use std::sync::OnceLock;
 
 use criterion::{BenchmarkGroup, Criterion, Throughput, measurement::WallTime};
-use emvp::{DerivedState, EmvpParams, ProtocolError, SecretKey};
+use emvp::{DerivedState, EmvpParams, MaskContextId, ProtocolError, SecretKey};
 use prime_field_layer::{FieldElement, PrimeField};
 use rand_chacha::ChaCha20Rng;
 use rand_core::SeedableRng;
+use rayon::{ThreadPool, ThreadPoolBuilder};
 use trapdoor_matrices::{IrreducibleRingLpn, RaaWeightedProduct, TdmMask, ToeplitzFastProduct};
 
 // NTT-friendly prime: 1_073_479_681 - 1 is divisible by 2^18.
@@ -53,6 +64,33 @@ pub fn field_values(length: usize, domain: u8) -> Vec<FieldElement<MODULUS>> {
     let mut values = vec![field.element_u32(0); length];
     field.fill_uniform(&mut seeded_rng(domain, length), &mut values);
     values
+}
+
+// The fixed eight-thread pool keeps every multi-threaded suite case
+// comparable across machines and across saved baselines: without it, cases
+// measured outside an explicit pool inherit rayon's global pool, whose size
+// is whatever the benchmark machine has cores. The `protocol` suite's
+// `answer`, `plaintext`, `query`, and `decode` cases, the `online` suite's
+// serial cases' counterpart, and the GPU suites' CPU references all install
+// this pool, and every internal rayon site in the library sizes its
+// parallel decision against it. The GPU and dispatch suites use it for
+// their CPU-vs-GPU comparisons so both sides see the same pool.
+#[must_use]
+pub fn benchmark_pool() -> &'static ThreadPool {
+    static POOL: OnceLock<ThreadPool> = OnceLock::new();
+    POOL.get_or_init(|| ThreadPoolBuilder::new().num_threads(8).build().unwrap())
+}
+
+// The one-thread pool behind the online suite's fairness contract: rayon
+// work installed here stays on a single worker, and
+// `rayon::current_num_threads()` inside the library reports one, which pins
+// every internal serial/parallel decision to its serial tier. Deliberately
+// different from `benchmark_pool`: the online suite measures single-core
+// protocol overhead, not throughput.
+#[must_use]
+pub fn serial_pool() -> &'static ThreadPool {
+    static POOL: OnceLock<ThreadPool> = OnceLock::new();
+    POOL.get_or_init(|| ThreadPoolBuilder::new().num_threads(1).build().unwrap())
 }
 
 pub fn elements(count: usize) -> Throughput {
@@ -119,17 +157,54 @@ pub fn ring_block(
 
 pub type BlockBuilder<M> = fn(EmvpParams, &mut ChaCha20Rng, usize) -> Result<M, ProtocolError>;
 
-// The expanded long-term secrets for `rows` matrix rows.
+// Stable mask-suite context identifiers, one per mask construction. The
+// context identifies the suite plus its configuration: within these suites
+// each builder's configuration is fully determined by the derived suite
+// parameters, which the protocol binds separately, and the row count is
+// bound too. A real deployment changes the tag whenever the builder or its
+// configuration changes.
+pub const CONTEXT_TOEPLITZ: MaskContextId = MaskContextId::from_u64(0x544f_4550);
+pub const CONTEXT_RAA: MaskContextId = MaskContextId::from_u64(0x5241_4141);
+pub const CONTEXT_RING: MaskContextId = MaskContextId::from_u64(0x5249_4e47);
+
+/// One benchmark mask suite: its case label and stable context constant.
+///
+/// Bench cases are identified by the label; the context is what the
+/// protocol's derivation binds the fixtures to.
+#[derive(Clone, Copy)]
+pub struct MaskSuite {
+    /// The case label, matching the historical bench IDs.
+    pub label: &'static str,
+    /// The stable context constant of the suite's mask construction.
+    pub context: MaskContextId,
+}
+
+pub const SUITE_TOEPLITZ: MaskSuite = MaskSuite {
+    label: "toeplitz",
+    context: CONTEXT_TOEPLITZ,
+};
+pub const SUITE_RAA: MaskSuite = MaskSuite {
+    label: "raa",
+    context: CONTEXT_RAA,
+};
+pub const SUITE_RING: MaskSuite = MaskSuite {
+    label: "ring",
+    context: CONTEXT_RING,
+};
+
+// The expanded long-term secrets for `rows` matrix rows. `context` selects
+// the mask construction's stable context constant.
 pub fn derive_with<M: TdmMask<MODULUS>>(
     params: EmvpParams,
     rows: usize,
     domain: u8,
+    context: MaskContextId,
     build_block: BlockBuilder<M>,
 ) -> DerivedState<MODULUS, M> {
     let mut rng = seeded_rng(domain ^ 0x80, rows);
     SecretKey::<MODULUS>::new(params, [domain; 32])
         .unwrap()
-        .derive(rows, &mut rng, |stream, index| {
+        .derive(context, rows, &mut rng, |stream, index| {
             build_block(params, stream, index)
         })
         .unwrap()
@@ -149,7 +224,7 @@ pub fn protocol_fixtures_batch(
     Vec<emvp::EncryptedQuery<MODULUS>>,
     Vec<emvp::DecodingKey<MODULUS>>,
 ) {
-    let mut state = derive_with(params, rows, 0x06, toeplitz_block);
+    let mut state = derive_with(params, rows, 0x06, CONTEXT_TOEPLITZ, toeplitz_block);
     let matrix = field_values(rows * params.ell, 0x07);
     let record = field_values(params.ell, 0x08);
     let encrypted = emvp::encrypt(&mut state, &matrix).unwrap();

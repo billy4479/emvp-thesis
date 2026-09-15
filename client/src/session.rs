@@ -3,15 +3,17 @@
 //!
 //! The flow is generic over the transport (any `Read + Write` pair, so
 //! tests can use in-memory duplexes) and over the trapdoored mask
-//! construction, which the caller picks before the first derivation. The
-//! client keeps every secret locally: plaintext matrices, plaintext
-//! queries, derived state, and decoding keys never cross the stream.
+//! construction, which the caller picks before the first derivation. This
+//! function owns the connection handshake: exactly one happens here,
+//! before the first frame. The client keeps every secret locally:
+//! plaintext matrices, plaintext queries, derived state, and decoding keys
+//! never cross the stream.
 
 use std::time::{Duration, Instant};
 
 use emvp::{
-    AnswerMatrix, DecodingKey, EncryptedMatrix, EncryptedQuery, ProtocolError, SecretKey, TdmMask,
-    decode_into, encrypt, query_batch,
+    AnswerMatrix, DecodingKey, EncryptedMatrix, EncryptedQuery, MaskContextId, ProtocolError,
+    SecretKey, TdmMask, decode_into, encrypt, query_batch,
 };
 use emvp_network::{
     EvaluateEntry, FrameKind, FrameReader, MatrixUpload, PROTOCOL_MODULUS, ProductEntry,
@@ -21,7 +23,9 @@ use emvp_network::{
 use prime_field_layer::PrimeField;
 use rand_chacha::ChaCha20Rng;
 
-use crate::demo::{Field, derive_rng, matrix_key, plaintext_values, query_rng};
+use crate::demo::{
+    Field, MasterSeed, derive_rng, matrix_key, plaintext_len, plaintext_values, query_rng,
+};
 use crate::error::RunError;
 
 /// Everything one demo invocation needs besides the transport.
@@ -31,10 +35,12 @@ pub struct Config {
     pub rows: Vec<usize>,
     /// Encrypted queries generated per matrix.
     pub queries: usize,
-    /// The deterministic seed of all data and keys.
-    pub seed: u64,
+    /// The 256-bit master seed all data and keys derive from.
+    pub master_seed: MasterSeed,
     /// The searched protocol parameters.
     pub params: emvp::EmvpParams,
+    /// The stable context identifier of the mask suite and configuration.
+    pub mask_context: MaskContextId,
 }
 
 /// What one run did and how long it took.
@@ -48,6 +54,8 @@ pub struct Report {
     pub evaluate_bytes: u64,
     /// Bytes read for the products response, header included.
     pub products_bytes: u64,
+    /// The connection handshake.
+    pub handshake_duration: Duration,
     /// Deriving and encrypting every matrix locally.
     pub derive_duration: Duration,
     /// Writing the upload and reading its acknowledgment.
@@ -67,7 +75,7 @@ struct Instance {
     rows: usize,
     /// The plaintext matrix, row-major.
     plaintext: Vec<Field>,
-    /// The deterministic plaintext query vectors, in generation order.
+    /// The plaintext query vectors, in generation order.
     plaintext_queries: Vec<Vec<Field>>,
     /// The encrypted queries sent to the server.
     queries: Vec<EncryptedQuery<PROTOCOL_MODULUS>>,
@@ -79,10 +87,11 @@ struct Instance {
 
 /// Runs the whole demo against one connected stream.
 ///
-/// Derives and encrypts one matrix per configured row count, uploads the
-/// set once, evaluates the configured number of encrypted queries per
-/// matrix, and verifies every returned product against the plaintext
-/// matrix-vector product. Returns the run's report on full verification.
+/// Performs the connection's single handshake, then derives and encrypts
+/// one matrix per configured row count, uploads the set once, evaluates
+/// the configured number of encrypted queries per matrix, and verifies
+/// every returned product against the plaintext matrix-vector product.
+/// Returns the run's report on full verification.
 ///
 /// # Errors
 ///
@@ -105,7 +114,9 @@ where
     }
     let derive_duration = derive_start.elapsed();
 
+    let handshake_start = Instant::now();
     client_handshake(stream)?;
+    let handshake_duration = handshake_start.elapsed();
 
     let upload_start = Instant::now();
     let uploads: Vec<MatrixUpload> = instances
@@ -117,12 +128,7 @@ where
         .collect();
     let upload_bytes = write_upload_matrices(stream, &uploads)?;
     let matrix_ids = read_upload_reply(stream)?;
-    if matrix_ids.len() != instances.len() {
-        return Err(RunError::UploadAcknowledge {
-            uploaded: instances.len(),
-            acknowledged: matrix_ids.len(),
-        });
-    }
+    validate_upload_reply(&matrix_ids, instances.len())?;
     let upload_duration = upload_start.elapsed();
 
     let evaluate_start = Instant::now();
@@ -174,12 +180,43 @@ where
         upload_bytes,
         evaluate_bytes,
         products_bytes,
+        handshake_duration,
         derive_duration,
         upload_duration,
         evaluate_duration,
         verify_duration,
         verified_queries,
     })
+}
+
+/// Checks the upload acknowledgment against the upload: one identifier per
+/// matrix, each nonzero and distinct.
+///
+/// # Errors
+///
+/// Returns the count mismatch or the identifier problem.
+fn validate_upload_reply(identifiers: &[u64], uploaded: usize) -> Result<(), RunError> {
+    if identifiers.len() != uploaded {
+        return Err(RunError::UploadAcknowledge {
+            uploaded,
+            acknowledged: identifiers.len(),
+        });
+    }
+    if identifiers.contains(&0) {
+        return Err(RunError::UploadIdentifiers {
+            problem: "an identifier is zero",
+        });
+    }
+    let mut seen = std::collections::BTreeSet::new();
+    if identifiers
+        .iter()
+        .any(|identifier| !seen.insert(*identifier))
+    {
+        return Err(RunError::UploadIdentifiers {
+            problem: "an identifier appears twice",
+        });
+    }
+    Ok(())
 }
 
 /// Reads the upload acknowledgment, mapping a rejection to its error.
@@ -245,17 +282,24 @@ where
     M: TdmMask<PROTOCOL_MODULUS>,
     F: Fn(&mut ChaCha20Rng, usize) -> Result<M, ProtocolError> + Sync,
 {
-    let key = matrix_key(config.seed, index);
+    // User-controlled allocation sizes are checked before any buffer.
+    let plaintext_len = plaintext_len(rows, config.params.ell)?;
+    let key = matrix_key(&config.master_seed, index)?;
     let state = SecretKey::<PROTOCOL_MODULUS>::new(config.params, key)
         .map_err(RunError::Protocol)?
-        .derive(rows, &mut derive_rng(config.seed, index), build_block)
+        .derive(
+            config.mask_context,
+            rows,
+            &mut derive_rng(&config.master_seed, index)?,
+            build_block,
+        )
         .map_err(RunError::Protocol)?;
-    let plaintext = plaintext_values(rows * config.params.ell, config.seed, index);
+    let plaintext = plaintext_values(plaintext_len, &config.master_seed, index)?;
     let mut state = state;
     let encrypted = encrypt(&mut state, &plaintext)?;
 
     let field = PrimeField::<PROTOCOL_MODULUS>::new();
-    let mut query_source = query_rng(config.seed, index);
+    let mut query_source = query_rng(&config.master_seed, index)?;
     let plaintext_queries: Vec<Vec<Field>> = (0..config.queries)
         .map(|_| {
             let mut query = vec![field.element_u32(0); config.params.ell];
@@ -317,7 +361,6 @@ fn plaintext_product(plaintext: &[Field], query: &[Field], rows: usize) -> Vec<F
         })
         .collect()
 }
-
 #[cfg(test)]
 mod tests {
     use std::os::unix::net::UnixStream;
@@ -332,7 +375,9 @@ mod tests {
     use trapdoor_matrices::ToeplitzFastProduct;
 
     use super::{Config, run};
-    use crate::demo::PROTOCOL_MODULUS;
+    use crate::demo::{
+        CONTEXT_TOEPLITZ, PROTOCOL_MODULUS, master_seed_from_u64, random_master_seed,
+    };
     use crate::error::RunError;
 
     fn params() -> EmvpParams {
@@ -355,9 +400,10 @@ mod tests {
     }
 
     /// Serves one session the way the server binary does, except products
-    /// are computed on the CPU and `corrupt` flips one answer word of each
-    /// matrix's first query.
-    fn fake_server(stream: &mut UnixStream, corrupt: bool) {
+    /// are computed on the CPU, `corrupt` flips one answer word of each
+    /// matrix's first query, and `acknowledged` overrides the identifiers
+    /// of the upload acknowledgment.
+    fn fake_server(stream: &mut UnixStream, corrupt: bool, acknowledged: Option<Vec<u64>>) {
         server_handshake(stream).unwrap();
         let header = read_frame_header(stream).unwrap().unwrap();
         assert_eq!(header.kind, FrameKind::UploadMatrices);
@@ -372,7 +418,7 @@ mod tests {
                 matrix: upload.matrix,
             })
             .collect();
-        let identifiers: Vec<u64> = (1..=stored.len() as u64).collect();
+        let identifiers = acknowledged.unwrap_or_else(|| (1..=stored.len() as u64).collect());
         write_upload_accepted(stream, &identifiers).unwrap();
 
         loop {
@@ -416,8 +462,9 @@ mod tests {
         Config {
             rows: vec![2, 3],
             queries: 2,
-            seed: 7,
+            master_seed: master_seed_from_u64(7),
             params: params(),
+            mask_context: CONTEXT_TOEPLITZ,
         }
     }
 
@@ -426,7 +473,7 @@ mod tests {
         let (mut client_stream, server_stream) = UnixStream::pair().unwrap();
         let server = thread::spawn(move || {
             let mut server_stream = server_stream;
-            fake_server(&mut server_stream, false);
+            fake_server(&mut server_stream, false, None);
         });
         let report = run::<ToeplitzFastProduct<PROTOCOL_MODULUS>, _, _>(
             &mut client_stream,
@@ -448,7 +495,7 @@ mod tests {
         let (mut client_stream, server_stream) = UnixStream::pair().unwrap();
         let server = thread::spawn(move || {
             let mut server_stream = server_stream;
-            fake_server(&mut server_stream, true);
+            fake_server(&mut server_stream, true, None);
         });
         let outcome = run::<ToeplitzFastProduct<PROTOCOL_MODULUS>, _, _>(
             &mut client_stream,
@@ -463,6 +510,55 @@ mod tests {
                 query_id: 0
             })
         ));
+
+        drop(client_stream);
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn duplicate_acknowledged_ids_are_rejected() {
+        let (mut client_stream, server_stream) = UnixStream::pair().unwrap();
+        let server = thread::spawn(move || {
+            let mut server_stream = server_stream;
+            fake_server(&mut server_stream, false, Some(vec![1, 1]));
+        });
+        let outcome = run::<ToeplitzFastProduct<PROTOCOL_MODULUS>, _, _>(
+            &mut client_stream,
+            &config(),
+            toeplitz_builder(params().n().unwrap()),
+        );
+
+        assert!(matches!(
+            outcome,
+            Err(RunError::UploadIdentifiers {
+                problem: "an identifier appears twice"
+            })
+        ));
+
+        drop(client_stream);
+        server.join().unwrap();
+    }
+
+    /// A secure-mode structural test: the whole run completes from a
+    /// fresh OS master seed. No equality is asserted between draws.
+    #[test]
+    fn a_fresh_os_master_seed_completes_the_session() {
+        let (mut client_stream, server_stream) = UnixStream::pair().unwrap();
+        let server = thread::spawn(move || {
+            let mut server_stream = server_stream;
+            fake_server(&mut server_stream, false, None);
+        });
+        let mut secure_config = config();
+        secure_config.master_seed = random_master_seed().unwrap();
+        let report = run::<ToeplitzFastProduct<PROTOCOL_MODULUS>, _, _>(
+            &mut client_stream,
+            &secure_config,
+            toeplitz_builder(params().n().unwrap()),
+        )
+        .unwrap();
+
+        assert_eq!(report.matrix_ids, vec![1, 2]);
+        assert_eq!(report.verified_queries, 4);
 
         drop(client_stream);
         server.join().unwrap();

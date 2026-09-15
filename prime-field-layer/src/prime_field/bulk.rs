@@ -208,21 +208,17 @@ impl<const MODULUS: u32> PrimeField<MODULUS> {
     /// scratch `Vec` so the reverse pass does not recompute them; this is the
     /// operation's only allocation.
     ///
+    /// The zero scan exits early at the first zero operand, so the running
+    /// time of a rejected call reveals the position of the first zero. This
+    /// batch inversion is variable-time by design; do not use it when that
+    /// timing must be hidden.
+    ///
     /// # Errors
     ///
     /// Returns [`FieldError::DivisionByZero`] when any value is zero modulo
     /// `MODULUS`. The check completes before any value is changed.
     pub fn batch_inv_assign(&self, values: &mut [u32]) -> Result<(), FieldError> {
         if values.is_empty() {
-            return Ok(());
-        }
-        if MODULUS == 2 {
-            if values.iter().any(|value| value & 1 == 0) {
-                return Err(FieldError::DivisionByZero);
-            }
-            // MONTGOMERY_ONE is zero for this modulus, so the Montgomery
-            // seeding below cannot represent the identity.
-            values.fill(1);
             return Ok(());
         }
 

@@ -7,6 +7,7 @@ edition = "2024"
 clap = { workspace = true }
 emvp = { path = "../emvp" }
 emvp-network = { path = "../emvp-network" }
+getrandom = "0.3"
 prime-field-layer = { path = "../prime-field-layer" }
 rand_chacha = { workspace = true }
 rand_core = { workspace = true }

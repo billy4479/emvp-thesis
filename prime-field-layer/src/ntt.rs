@@ -83,8 +83,8 @@ mod support;
 mod tests;
 
 use support::{
-    BackendPreference, add_mod, halve_interval, normalize, powers, reduce_once, select_backend,
-    shoup_mul, shoup_mul_lazy_for, sub_mod, twiddle_powers,
+    add_mod, halve_interval, normalize, powers, reduce_once, select_backend, shoup_mul,
+    shoup_mul_lazy_for, sub_mod, twiddle_powers,
 };
 
 pub use convolution::linear_convolution;
@@ -122,8 +122,6 @@ pub enum NttBackend {
 /// reason. `None` means the selected plan has no warning.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum NttPerformanceWarning {
-    /// [`NttPlan::new_scalar`] explicitly requested the portable kernel.
-    ScalarRequested,
     /// The modulus is at least `2^31`, requiring Montgomery butterflies.
     MontgomeryFallback,
 }
@@ -131,7 +129,6 @@ pub enum NttPerformanceWarning {
 impl fmt::Display for NttPerformanceWarning {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::ScalarRequested => formatter.write_str("the scalar backend was requested"),
             Self::MontgomeryFallback => {
                 formatter.write_str("the modulus requires scalar Montgomery butterflies")
             }

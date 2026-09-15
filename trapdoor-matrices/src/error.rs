@@ -2,6 +2,8 @@ use std::fmt;
 
 use prime_field_layer::{ArithmeticKernelError, ExtensionFieldError, FieldError};
 
+use super::parameters::SecurityWarningKind;
+
 /// An invalid TDM instance, input, or arithmetic operation.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum TdmError {
@@ -40,6 +42,20 @@ pub enum TdmError {
         entry: usize,
         row: usize,
         rows: usize,
+    },
+    /// Sampling refused because the security assessment rated the parameter
+    /// pair broken.
+    ///
+    /// Carries the requested degree and weight plus the float-free
+    /// [`SecurityWarningKind`] tags of every broken-forcing warning, in
+    /// assessment order. The exact cost estimates behind each tag can be
+    /// recovered by rerunning [`crate::assess`], whose warnings carry the
+    /// floating-point estimates this variant deliberately omits to keep
+    /// `TdmError` equality exact.
+    InsecureParameters {
+        degree: usize,
+        weight: usize,
+        reasons: Vec<SecurityWarningKind>,
     },
     /// Prime-field or NTT arithmetic failed.
     Field(FieldError),
@@ -94,6 +110,24 @@ impl fmt::Display for TdmError {
                 formatter,
                 "Bernoulli sampling produced an empty column in {retries} attempts"
             ),
+            Self::InsecureParameters {
+                degree,
+                weight,
+                reasons,
+            } => {
+                write!(
+                    formatter,
+                    "parameter pair (degree {degree}, weight {weight}) is assessed as broken and \
+                     sampling was refused: "
+                )?;
+                for (position, reason) in reasons.iter().enumerate() {
+                    if position > 0 {
+                        formatter.write_str("; ")?;
+                    }
+                    write!(formatter, "{reason}")?;
+                }
+                Ok(())
+            }
             Self::InvalidSparseOffsets => {
                 formatter.write_str("sparse column offsets are malformed")
             }

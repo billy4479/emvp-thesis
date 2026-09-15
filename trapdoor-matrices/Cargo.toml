@@ -8,6 +8,9 @@ bench = false
 
 [features]
 bench-quick = ["bench-common/quick"]
+# Deterministic fixed-weight fixtures for tests and benchmarks. Not part of
+# normal library builds and never for security-sensitive use.
+test-utils = []
 
 [lints]
 workspace = true
@@ -23,6 +26,11 @@ bench-common = { path = "../prime-field-layer/benches/common" }
 criterion = { workspace = true }
 proptest = { workspace = true }
 rand_chacha = { workspace = true }
+# Self dev-dependency: turns on the `test-utils` fixtures for this crate's
+# own tests, examples, and benches while keeping normal library builds free
+# of them. Downstream crates that need the fixtures must enable the feature
+# in their own manifests.
+trapdoor-matrices = { path = ".", features = ["test-utils"] }
 
 [[bench]]
 name = "tdm"
