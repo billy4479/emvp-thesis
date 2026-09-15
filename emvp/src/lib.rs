@@ -25,6 +25,7 @@
 
 pub mod code;
 pub mod dispatch;
+pub mod engine;
 #[cfg(feature = "gpu")]
 pub mod gpu;
 pub mod params;
@@ -32,9 +33,14 @@ pub mod prf;
 pub mod protocol;
 
 pub use code::{CodeError, CyclicCodeScratch, CyclicDualCode};
-pub use dispatch::{AnswerBackend, MIN_PARALLEL_MULTIPLICATIONS, select_answer_backend};
+pub use dispatch::{
+    AnswerBackend, MIN_PARALLEL_MULTIPLICATIONS, select_answer_backend, select_cpu_backend,
+};
 #[cfg(feature = "gpu")]
 pub use dispatch::{AnswerDispatchError, AnswerDispatcher, MIN_GPU_MULTIPLICATIONS};
+pub use engine::{
+    AnswerEngine, AnswerEngineError, AnswerEntryReport, AnswerJob, AnswerReport, PreparedMatrix,
+};
 #[cfg(feature = "gpu")]
 pub use gpu::{GpuAnswerer, GpuEncryptedMatrix, GpuError, PhaseTimings};
 pub use params::{
