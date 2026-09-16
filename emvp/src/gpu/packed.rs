@@ -498,19 +498,10 @@ impl GpuAnswerer {
                     segment.query_words,
                     queries,
                 )?;
-                let (workgroups_x, _) = dispatch_grid(segment.answer_words)?;
-                let uniform = dims_uniform_bytes(
-                    job.matrix.columns,
-                    job.matrix.params.block_size(),
-                    job.matrix.params.blocks()?,
-                    job.matrix.rows,
-                    segment.query_count,
-                    workgroups_x,
-                )?;
                 self.queue.write_buffer(
                     &buffers.uniforms,
                     segment_index as u64 * plan.uniform_alignment,
-                    &uniform,
+                    &segment.uniform,
                 );
             }
         }
@@ -704,6 +695,21 @@ fn reconstruct_flight<const MODULUS: u32>(
         drop(data);
         buffers.staging.unmap();
         result?;
+    }
+    for (job, answers) in flight.jobs.iter().zip(&values) {
+        let expected = job
+            .rows
+            .checked_mul(job.blocks)
+            .ok_or(GpuError::DimensionOverflow)?;
+        for answer in answers {
+            if answer.len() != expected {
+                return Err(GpuError::LengthMismatch {
+                    name: "packed answer",
+                    expected,
+                    actual: answer.len(),
+                });
+            }
+        }
     }
     Ok(flight
         .jobs
