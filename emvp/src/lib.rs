@@ -31,6 +31,7 @@ pub mod gpu;
 pub mod params;
 pub mod prf;
 pub mod protocol;
+pub mod view;
 
 pub use code::{CodeError, CyclicCodeScratch, CyclicDualCode};
 pub use dispatch::{
@@ -54,3 +55,6 @@ pub use protocol::{
     answer_into, decode_into, encrypt, query, query_batch, query_with_scratch,
 };
 pub use trapdoor_matrices::{RowStackMask, TdmMask};
+pub use view::{
+    AnswerRef, AnswerValues, EncryptedMatrixRef, EncryptedQueryRef, MatrixValues, QueryValues,
+};

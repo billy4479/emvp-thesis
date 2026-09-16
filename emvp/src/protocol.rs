@@ -57,6 +57,9 @@ use trapdoor_matrices::{DenseMatrix, Permutation, RowStackMask, TdmError, TdmMas
 use crate::code::{CodeError, CyclicCodeScratch, CyclicDualCode};
 use crate::params::{EmvpParams, ParamsError};
 use crate::prf::{Prf, PrfError, purpose};
+use crate::view::{
+    AnswerRef, AnswerValues, EncryptedMatrixRef, EncryptedQueryRef, MatrixValues, QueryValues,
+};
 
 /// Caller-chosen identifier of the mask suite and its configuration.
 ///
@@ -268,7 +271,7 @@ impl From<ParamsError> for ProtocolError {
     }
 }
 
-const fn check_len(
+pub(crate) const fn check_len(
     name: &'static str,
     expected: usize,
     actual: usize,
@@ -771,6 +774,20 @@ impl<const MODULUS: u32> EncryptedMatrix<MODULUS> {
         self.instance_id
     }
 
+    /// Returns a borrowed view over this encrypted matrix.
+    ///
+    /// The view borrows the ciphertext slice; it holds no storage of its
+    /// own and exposes the same shape and identifier accessors.
+    #[must_use]
+    pub fn as_ref(&self) -> EncryptedMatrixRef<'_, MODULUS> {
+        EncryptedMatrixRef::new_unchecked(
+            self.instance_id,
+            self.matrix.rows(),
+            self.matrix.columns(),
+            self.matrix.values(),
+        )
+    }
+
     /// Rebuilds an encrypted matrix from its parts.
     ///
     /// # Errors
@@ -814,6 +831,15 @@ impl<const MODULUS: u32> EncryptedQuery<MODULUS> {
     #[must_use]
     pub const fn query_id(&self) -> u64 {
         self.query_id
+    }
+
+    /// Returns a borrowed view over this encrypted query.
+    ///
+    /// The view borrows the coordinate slice; it holds no storage of its
+    /// own and exposes the same identifier accessors.
+    #[must_use]
+    pub fn as_ref(&self) -> EncryptedQueryRef<'_, MODULUS> {
+        EncryptedQueryRef::new_unchecked(self.instance_id, self.query_id, &self.values)
     }
 
     /// Rebuilds an encrypted query from its coordinates.
@@ -951,6 +977,21 @@ impl<const MODULUS: u32> AnswerMatrix<MODULUS> {
     #[must_use]
     pub const fn query_id(&self) -> u64 {
         self.query_id
+    }
+
+    /// Returns a borrowed view over this answer matrix.
+    ///
+    /// The view borrows the answer slice; it holds no storage of its own
+    /// and exposes the same shape and identifier accessors.
+    #[must_use]
+    pub fn as_ref(&self) -> AnswerRef<'_, MODULUS> {
+        AnswerRef::new_unchecked(
+            self.instance_id,
+            self.query_id,
+            self.rows,
+            self.blocks,
+            &self.values,
+        )
     }
 }
 
@@ -1339,13 +1380,17 @@ fn validate_answer<const MODULUS: u32>(
 /// Validates one encrypted matrix's shape against `params` and returns the
 /// codeword length `n = 2k`.
 ///
+/// Accepts any borrowed or owned matrix representation implementing
+/// [`MatrixValues`], so the server-side paths can validate wire workspaces
+/// without copying them into [`EncryptedMatrix`].
+///
 /// This is the shape half of the CPU answer-path validation
 /// ([`validate_answer`]) and the single validation entry point shared by the
 /// dispatcher's fast-fail construction and the GPU answerer's upload, so
 /// CPU, dispatch, and GPU reject the same matrix shapes before any work.
-pub(crate) fn validate_matrix_shape<const MODULUS: u32>(
+pub(crate) fn validate_matrix_shape<const MODULUS: u32, V: MatrixValues<MODULUS>>(
     params: &EmvpParams,
-    matrix: &EncryptedMatrix<MODULUS>,
+    matrix: &V,
 ) -> Result<usize, ProtocolError> {
     params.validate_dimensions()?;
     let n = params.n()?;
@@ -1368,20 +1413,23 @@ pub(crate) fn validate_matrix_shape<const MODULUS: u32>(
 /// Checks one query's length and instance identifier against the matrix
 /// instance.
 ///
+/// Accepts any borrowed or owned query representation implementing
+/// [`QueryValues`], mirroring [`validate_matrix_shape`].
+///
 /// Exposed next to [`validate_matrix_shape`] so the server-side dispatch and
 /// device paths can reuse the exact CPU validation; callers pass the
 /// instance identifier of the matrix they answer against.
-pub(crate) fn validate_query_against_matrix<const MODULUS: u32>(
+pub(crate) fn validate_query_against_matrix<const MODULUS: u32, Q: QueryValues<MODULUS>>(
     n: usize,
     matrix_instance_id: u128,
-    query: &EncryptedQuery<MODULUS>,
+    query: &Q,
 ) -> Result<(), ProtocolError> {
-    check_len("encrypted query", n, query.values.len())?;
-    if query.instance_id != matrix_instance_id {
+    check_len("encrypted query", n, query.values().len())?;
+    if query.instance_id() != matrix_instance_id {
         return Err(ProtocolError::InstanceMismatch {
             name: "encrypted query",
             expected: matrix_instance_id,
-            actual: query.instance_id,
+            actual: query.instance_id(),
         });
     }
     Ok(())
@@ -1510,12 +1558,18 @@ fn fill_answer_batch<const MODULUS: u32>(
 
 /// Decodes a matrix-vector product into caller-owned storage.
 ///
+/// Accepts any borrowed or owned answer representation implementing
+/// [`AnswerValues`], so a client can decode straight from a wire workspace
+/// without copying it into [`AnswerMatrix`]. The [`Sync`] bound lets large
+/// answers decode across rayon workers; every view and owned answer is a
+/// plain shared-slice or `Vec` aggregate, so the bound costs nothing.
+///
 /// # Errors
 ///
 /// Returns an error before output mutation if dimensions or public protocol
 /// identifiers do not match.
-pub fn decode_into<const MODULUS: u32>(
-    answer: &AnswerMatrix<MODULUS>,
+pub fn decode_into<const MODULUS: u32, A: AnswerValues<MODULUS> + Sync>(
+    answer: &A,
     key: &DecodingKey<MODULUS>,
     output: &mut [FieldElement<MODULUS>],
 ) -> Result<(), ProtocolError> {
@@ -1525,29 +1579,29 @@ pub fn decode_into<const MODULUS: u32>(
     Ok(())
 }
 
-fn validate_decode<const MODULUS: u32>(
-    answer: &AnswerMatrix<MODULUS>,
+fn validate_decode<const MODULUS: u32, A: AnswerValues<MODULUS>>(
+    answer: &A,
     key: &DecodingKey<MODULUS>,
 ) -> Result<(usize, usize), ProtocolError> {
-    let rows = answer.rows;
-    let s = answer.blocks;
+    let rows = answer.rows();
+    let s = answer.blocks();
     check_len("decoding p'", s, key.p_prime.len())?;
     check_len("decoding r'", rows, key.r_prime.len())?;
     let expected = rows
         .checked_mul(s)
         .ok_or(ProtocolError::DimensionOverflow)?;
-    check_len("answer matrix", expected, answer.values.len())?;
-    if key.instance_id != answer.instance_id {
+    check_len("answer matrix", expected, answer.values().len())?;
+    if key.instance_id != answer.instance_id() {
         return Err(ProtocolError::InstanceMismatch {
             name: "decoding key",
-            expected: answer.instance_id,
+            expected: answer.instance_id(),
             actual: key.instance_id,
         });
     }
-    if key.query_id != answer.query_id {
+    if key.query_id != answer.query_id() {
         return Err(ProtocolError::QueryMismatch {
             name: "decoding key",
-            expected: answer.query_id,
+            expected: answer.query_id(),
             actual: key.query_id,
         });
     }
@@ -1560,8 +1614,8 @@ fn validate_decode<const MODULUS: u32>(
 /// distribute them across rayon workers under the shared dispatch policy
 /// ([`crate::dispatch`]); the output is identical to the serial row loop.
 /// Smaller answers stay serial.
-fn fill_decoded<const MODULUS: u32>(
-    answer: &AnswerMatrix<MODULUS>,
+fn fill_decoded<const MODULUS: u32, A: AnswerValues<MODULUS> + Sync>(
+    answer: &A,
     key: &DecodingKey<MODULUS>,
     output: &mut [FieldElement<MODULUS>],
     s: usize,
@@ -1582,16 +1636,17 @@ fn fill_decoded<const MODULUS: u32>(
 }
 
 /// Evaluates one decoded product `M' p' - r'` for answer row `row`.
-fn decode_row<const MODULUS: u32>(
-    answer: &AnswerMatrix<MODULUS>,
+fn decode_row<const MODULUS: u32, A: AnswerValues<MODULUS>>(
+    answer: &A,
     key: &DecodingKey<MODULUS>,
     row: usize,
     s: usize,
 ) -> FieldElement<MODULUS> {
     let zero = PrimeField::<MODULUS>::new().element_u32(0);
     let mut accumulator = zero;
+    let answer_values = answer.values();
     for (block, &p) in key.p_prime.iter().enumerate() {
-        accumulator += answer.values[row * s + block] * p;
+        accumulator += answer_values[row * s + block] * p;
     }
     accumulator - key.r_prime[row]
 }
