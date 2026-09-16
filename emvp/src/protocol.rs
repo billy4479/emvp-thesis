@@ -57,9 +57,7 @@ use trapdoor_matrices::{DenseMatrix, Permutation, RowStackMask, TdmError, TdmMas
 use crate::code::{CodeError, CyclicCodeScratch, CyclicDualCode};
 use crate::params::{EmvpParams, ParamsError};
 use crate::prf::{Prf, PrfError, purpose};
-use crate::view::{
-    AnswerRef, AnswerValues, EncryptedMatrixRef, EncryptedQueryRef, MatrixValues, QueryValues,
-};
+use crate::view::{AnswerValues, EncryptedMatrixRef, EncryptedQueryRef, MatrixValues, QueryValues};
 
 /// Caller-chosen identifier of the mask suite and its configuration.
 ///
@@ -302,9 +300,9 @@ pub(crate) const fn check_len(
 /// The single-query answer row kernel: one row of `s` column-block dot
 /// products.
 ///
-/// Shared by every CPU answer path (the one-shot batch, the dispatcher's
-/// CPU tier, and the plan-reserve-execute arena path), so all of them
-/// produce bit-identical answer rows by construction.
+/// Shared by every CPU answer path (the single-query [`answer_into`] and
+/// the plan-reserve-execute arena paths), so all of them produce
+/// bit-identical answer rows by construction.
 pub(crate) fn fill_answer_row<const MODULUS: u32>(
     matrix_row: &[FieldElement<MODULUS>],
     query: &[FieldElement<MODULUS>],
@@ -938,81 +936,6 @@ impl<const MODULUS: u32> DecodingKey<MODULUS> {
     }
 }
 
-/// The server's answer `M' in F^(m x s)`.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct AnswerMatrix<const MODULUS: u32> {
-    values: Vec<FieldElement<MODULUS>>,
-    rows: usize,
-    blocks: usize,
-    instance_id: u128,
-    query_id: u64,
-}
-
-impl<const MODULUS: u32> AnswerMatrix<MODULUS> {
-    /// Rebuilds an answer matrix from its parts.
-    #[must_use]
-    pub const fn from_parts(
-        instance_id: u128,
-        query_id: u64,
-        values: Vec<FieldElement<MODULUS>>,
-        rows: usize,
-        blocks: usize,
-    ) -> Self {
-        Self {
-            values,
-            rows,
-            blocks,
-            instance_id,
-            query_id,
-        }
-    }
-
-    /// Returns the answer row count (`m`).
-    #[must_use]
-    pub const fn rows(&self) -> usize {
-        self.rows
-    }
-
-    /// Returns the answer column count (`s`).
-    #[must_use]
-    pub const fn blocks(&self) -> usize {
-        self.blocks
-    }
-
-    /// Returns the row-major answer entries.
-    #[must_use]
-    pub fn values(&self) -> &[FieldElement<MODULUS>] {
-        &self.values
-    }
-
-    /// Returns the public matrix-instance identifier.
-    #[must_use]
-    pub const fn instance_id(&self) -> u128 {
-        self.instance_id
-    }
-
-    /// Returns the public query identifier.
-    #[must_use]
-    pub const fn query_id(&self) -> u64 {
-        self.query_id
-    }
-
-    /// Returns a borrowed view over this answer matrix.
-    ///
-    /// The view borrows the answer slice; it holds no storage of its own
-    /// and exposes the same shape and identifier accessors.
-    #[must_use]
-    pub fn as_ref(&self) -> AnswerRef<'_, MODULUS> {
-        AnswerRef::new_unchecked(
-            self.instance_id,
-            self.query_id,
-            self.rows,
-            self.blocks,
-            &self.values,
-        )
-    }
-}
-
 /// Encrypts a row-major `rows x ell` matrix for the server.
 ///
 /// The mask is materialized into the `rows x n` ciphertext allocation and
@@ -1216,12 +1139,12 @@ pub fn query_with_scratch<const MODULUS: u32, M: TdmMask<MODULUS>>(
 ///
 /// # Errors
 ///
-/// Validation is all-or-nothing, matching [`answer_batch`]: every query
-/// vector must have length `ell` before any identifier is reserved, so a
-/// malformed batch consumes nothing. An empty batch is rejected with a
-/// `queries` length mismatch. A later code, mask, or field failure for one
-/// query leaves earlier identifiers reserved; persist
-/// [`DerivedState::next_query_index`] only after the batch succeeds.
+/// Validation is all-or-nothing: every query vector must have length `ell`
+/// before any identifier is reserved, so a malformed batch consumes
+/// nothing. An empty batch is rejected with a `queries` length mismatch. A
+/// later code, mask, or field failure for one query leaves earlier
+/// identifiers reserved; persist [`DerivedState::next_query_index`] only
+/// after the batch succeeds.
 pub fn query_batch<const MODULUS: u32, M: TdmMask<MODULUS>>(
     state: &mut DerivedState<MODULUS, M>,
     queries: &[&[FieldElement<MODULUS>]],
@@ -1478,106 +1401,13 @@ fn fill_answer<const MODULUS: u32>(
     }
 }
 
-/// Answers a batch of encrypted queries against one encrypted matrix.
-///
-/// Every query is answered exactly as [`answer_into`] answers it alone:
-/// the server performs `s` column-block matrix-vector products per row,
-/// for `queries.len() * m * n` field multiplications in total. The answers
-/// are written into one query-major arena whose flattened (query, row) grid
-/// runs across rayon workers when it clears the crate's parallel-work
-/// threshold; smaller batches stay on the serial row loop.
-///
-/// # Errors
-///
-/// Validation is all-or-nothing, matching [`answer_into`]: parameters are
-/// checked once, and every query must have length `n` and carry the
-/// matrix's instance identifier before any output is produced. An empty
-/// batch is rejected with a `queries` length mismatch, consistent with how
-/// the crate treats empty block lists and row counts elsewhere.
-pub fn answer_batch<const MODULUS: u32>(
-    params: &EmvpParams,
-    matrix: &EncryptedMatrix<MODULUS>,
-    queries: &[EncryptedQuery<MODULUS>],
-) -> Result<Vec<AnswerMatrix<MODULUS>>, ProtocolError> {
-    let Some(first) = queries.first() else {
-        return Err(ProtocolError::LengthMismatch {
-            name: "queries",
-            expected: 1,
-            actual: 0,
-        });
-    };
-    let (n, b, s, rows) = validate_answer(params, matrix, first)?;
-    for query in &queries[1..] {
-        validate_query_against_matrix(n, matrix.instance_id(), query)?;
-    }
-    let answer_len = rows
-        .checked_mul(s)
-        .ok_or(ProtocolError::DimensionOverflow)?;
-    let arena_len = queries
-        .len()
-        .checked_mul(answer_len)
-        .ok_or(ProtocolError::DimensionOverflow)?;
-    let zero = PrimeField::<MODULUS>::new().element_u32(0);
-    let mut arena = vec![zero; arena_len];
-    fill_answer_batch(matrix, queries, &mut arena, n, b, s, rows);
-    Ok(arena
-        .chunks_exact(answer_len)
-        .zip(queries.iter())
-        .map(|(values, query)| {
-            AnswerMatrix::from_parts(
-                matrix.instance_id(),
-                query.query_id(),
-                values.to_vec(),
-                rows,
-                s,
-            )
-        })
-        .collect())
-}
-
-/// Fills a query-major arena holding each batch answer back to back.
-///
-/// The arena splits into `queries.len() * rows` disjoint answer rows, so
-/// the flattened grid parallelizes without nested pools and every row
-/// reuses the single-query row kernel. The batch is generic over the query
-/// representation ([`QueryValues`], which must be [`Sync`] because the
-/// parallel tier reads it across rayon workers), so the owned and borrowed
-/// answer paths share one kernel. The parallel tier is selected by the
-/// shared dispatch policy ([`crate::dispatch`]); smaller batches stay on
-/// the serial row loop.
-fn fill_answer_batch<const MODULUS: u32, Q: QueryValues<MODULUS> + Sync>(
-    matrix: &EncryptedMatrix<MODULUS>,
-    queries: &[Q],
-    arena: &mut [FieldElement<MODULUS>],
-    n: usize,
-    b: usize,
-    s: usize,
-    rows: usize,
-) {
-    let threads = rayon::current_num_threads();
-    let grid = queries.len().saturating_mul(rows);
-    let work = grid.saturating_mul(n);
-    if crate::dispatch::is_parallel_work(work, grid, threads) {
-        arena
-            .par_chunks_mut(s)
-            .enumerate()
-            .for_each(|(flat_row, answer_row)| {
-                let query = &queries[flat_row / rows];
-                let matrix_row_index = flat_row % rows;
-                let matrix_row = &matrix.values()[matrix_row_index * n..(matrix_row_index + 1) * n];
-                fill_answer_row(matrix_row, query.values(), b, answer_row);
-            });
-    } else {
-        fill_answer_batch_serial(matrix, queries, arena, n, b, s, rows);
-    }
-}
-
 /// Fills a query-major arena on the serial row loop.
 ///
-/// The serial tier shared by [`fill_answer_batch`] and the plan-reserve-
-/// execute path ([`crate::answer::execute_answer_batch`]): every answer row
-/// is computed by the same row kernel in the same order, so both paths
-/// produce bit-identical arenas.
+/// The serial tier shared by the answer plan-execute path
+/// ([`crate::answer::execute_answer_batch`]) and the engine's execute step:
+/// every answer row is computed by the same row kernel
+/// ([`fill_answer_row`]) in the same order, so all arena paths produce
+/// bit-identical answers.
 pub(crate) fn fill_answer_batch_serial<const MODULUS: u32, Q: QueryValues<MODULUS>>(
     matrix: &EncryptedMatrix<MODULUS>,
     queries: &[Q],
@@ -1597,11 +1427,11 @@ pub(crate) fn fill_answer_batch_serial<const MODULUS: u32, Q: QueryValues<MODULU
 
 /// Decodes a matrix-vector product into caller-owned storage.
 ///
-/// Accepts any borrowed or owned answer representation implementing
-/// [`AnswerValues`], so a client can decode straight from a wire workspace
-/// without copying it into [`AnswerMatrix`]. The [`Sync`] bound lets large
-/// answers decode across rayon workers; every view and owned answer is a
-/// plain shared-slice or `Vec` aggregate, so the bound costs nothing.
+/// Accepts any answer representation implementing [`AnswerValues`], so a
+/// client can decode straight from a wire workspace view without copying.
+/// The [`Sync`] bound lets large answers decode across rayon workers;
+/// every view is a plain shared-slice aggregate, so the bound costs
+/// nothing.
 ///
 /// # Errors
 ///

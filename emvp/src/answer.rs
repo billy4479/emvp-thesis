@@ -1,12 +1,11 @@
 //! The plan → reserve → execute answer API over caller-owned arenas.
 //!
-//! The one-shot [`answer_batch`](crate::answer_batch) validates, allocates,
-//! fills, and splits an answer batch in a single call, so a server answering
-//! many batches against one encrypted matrix re-allocates the query-major
-//! arena every time. This module splits the same work into three steps with
-//! a fixed allocation profile, reusing the exact fill machinery of the
-//! one-shot path so both produce bit-identical answers for the same inputs
-//! and CPU tier:
+//! A server answering many batches against one encrypted matrix would
+//! otherwise re-allocate the query-major answer arena every time. This
+//! module splits the answer work into three steps with a fixed allocation
+//! profile, reusing the exact fill machinery of the single-query kernel so
+//! every path produces bit-identical answers for the same inputs and CPU
+//! tier:
 //!
 //! - [`AnswerPlan::plan`] validates the whole batch up front (parameters,
 //!   matrix shape and values, per-query width and instance identifier) and
@@ -18,9 +17,9 @@
 //!   uses.
 //! - [`execute_answer_batch`] writes exactly the planned arena words,
 //!   query-major, through the shared row kernel and the same dispatch grid
-//!   as [`answer_batch`](crate::answer_batch), without allocating; in
-//!   steady state the parallel tier also leases its per-row staging from
-//!   the workspace's scratch pool without allocating.
+//!   as [`crate::answer_into`], without allocating; in steady state the
+//!   parallel tier also leases its per-row staging from the workspace's
+//!   scratch pool without allocating.
 //!
 //! The returned [`Answers`] borrows the filled arena immutably and pairs
 //! contiguous arena slices with the batch's query identifiers, so clients
@@ -119,13 +118,13 @@ impl AnswerShape {
 
 /// A fully validated answer batch bound to its inputs by borrowing.
 ///
-/// [`Self::plan`] runs the validation the one-shot
-/// [`answer_batch`](crate::answer_batch) runs and additionally fixes the
-/// CPU tier from a snapshot of the current rayon pool, so executing the
-/// plan is infallible except for arena capacity. The plan holds the matrix
-/// and the queries only by reference, so executing it against other inputs
-/// is unrepresentable; a plan can be executed repeatedly and yields
-/// identical answers every time.
+/// [`Self::plan`] runs the batch validation — parameters, matrix shape
+/// and values, per-query width and instance identifier — and additionally
+/// fixes the CPU tier from a snapshot of the current rayon pool, so
+/// executing the plan is infallible except for arena capacity. The plan
+/// holds the matrix and the queries only by reference, so executing it
+/// against other inputs is unrepresentable; a plan can be executed
+/// repeatedly and yields identical answers every time.
 pub struct AnswerPlan<'a, const MODULUS: u32, Q: QueryValues<MODULUS>> {
     matrix: &'a EncryptedMatrix<MODULUS>,
     queries: &'a [Q],
@@ -141,8 +140,7 @@ impl<'a, const MODULUS: u32, Q: QueryValues<MODULUS>> AnswerPlan<'a, MODULUS, Q>
     /// Validates a full batch against `params` and `matrix` and plans its
     /// execution.
     ///
-    /// Validation is all-or-nothing, matching
-    /// [`answer_batch`](crate::answer_batch): the parameters and the matrix
+    /// Validation is all-or-nothing: the parameters and the matrix
     /// shape and values are checked once, and every query must have length
     /// `n` and carry the matrix's instance identifier. An empty batch is
     /// rejected with a `queries` length mismatch. The reported
@@ -356,33 +354,6 @@ impl<const MODULUS: u32> AnswerWorkspace<MODULUS> {
         self.arena.len()
     }
 
-    /// Grows the arena to hold `words` field elements, and never shrinks it.
-    ///
-    /// The word-count form of [`Self::reserve`]: same single growth point,
-    /// same never-shrinking contract, for plans whose shapes were validated
-    /// outside this module (the GPU answer path).
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ProtocolError::Capacity`] when the allocator refuses the
-    /// growth, naming the requirement and the workspace's usable words.
-    #[cfg(feature = "gpu")]
-    pub(crate) fn reserve_words(&mut self, words: usize) -> Result<(), ProtocolError> {
-        let available = self.arena.len();
-        if words <= available {
-            return Ok(());
-        }
-        self.arena
-            .try_reserve_exact(words - available)
-            .map_err(|_allocation_failure| ProtocolError::Capacity {
-                required: words,
-                available,
-            })?;
-        let zero = PrimeField::<MODULUS>::new().element_u32(0);
-        self.arena.resize(words, zero);
-        Ok(())
-    }
-
     /// Returns the arena for reading. Crate-internal view for consumers
     /// that assemble [`Answers`] outside this module.
     #[cfg(feature = "gpu")]
@@ -565,8 +536,8 @@ impl<'ws, const MODULUS: u32> Answers<'ws, MODULUS> {
 ///
 /// Writes exactly `plan.arena_words()` field elements into the workspace's
 /// arena, query-major, through the same row kernel and dispatch grid as
-/// [`answer_batch`](crate::answer_batch): the serial tier is the one-shot
-/// path's serial row loop, and the parallel tier distributes the same
+/// [`crate::answer_into`]: the serial tier is the single-query path's
+/// serial row loop, and the parallel tier distributes the same
 /// flattened (query, row) grid across rayon workers, leasing one staging
 /// row per row chunk from the workspace's scratch pool and returning it
 /// afterwards, so a warm pool serves the call without allocating. The tier
@@ -642,10 +613,11 @@ pub fn execute_answer_batch<'ws, const MODULUS: u32, Q: QueryValues<MODULUS> + S
 
 /// The parallel tier of the plan-reserve-execute path.
 ///
-/// The same flattened grid [`fill_answer_batch`](crate::protocol) runs,
-/// with each answer row staged through a scratch leased from `pool` and
-/// returned afterwards; the arena chunks, the row order, and the row kernel
-/// are identical, so the tier's output matches the one-shot path exactly.
+/// The same flattened (query, row) grid the serial tier walks, with each
+/// answer row staged through a scratch leased from `pool` and returned
+/// afterwards; the arena chunks, the row order, and the row kernel
+/// ([`fill_answer_row`](crate::protocol)) are identical, so the tier's
+/// output matches the serial tier exactly.
 #[expect(
     clippy::too_many_arguments,
     reason = "the kernel mirrors fill_answer_batch's argument layout and adds the scratch pool"

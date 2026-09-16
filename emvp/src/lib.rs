@@ -36,15 +36,15 @@ pub mod view;
 
 pub use answer::{AnswerPlan, AnswerShape, AnswerWorkspace, Answers, execute_answer_batch};
 pub use code::{CodeError, CyclicCodeScratch, CyclicDualCode};
+#[cfg(feature = "gpu")]
+pub use dispatch::MIN_GPU_MULTIPLICATIONS;
 pub use dispatch::{
     AnswerBackend, MIN_PARALLEL_MULTIPLICATIONS, select_answer_backend, select_cpu_backend,
 };
-#[cfg(feature = "gpu")]
-pub use dispatch::{AnswerDispatchError, AnswerDispatcher, MIN_GPU_MULTIPLICATIONS};
 pub use engine::{
-    AnswerEngine, AnswerEngineError, AnswerEntryReport, AnswerJob, AnswerReport, EngineAnswers,
-    EnginePlan, EngineReport, EngineWorkspace, EntryPlan, PrepareBatchError, PrepareEntry,
-    PrepareError, PrepareMatrixError, PreparePlan, PrepareWorkspace, PreparedMatrix, UploadRef,
+    AnswerEngine, AnswerEngineError, AnswerJob, EngineAnswers, EnginePlan, EngineReport,
+    EngineWorkspace, EntryPlan, PrepareBatchError, PrepareEntry, PrepareError, PrepareMatrixError,
+    PreparePlan, PrepareWorkspace, PreparedMatrix, UploadRef,
 };
 #[cfg(feature = "gpu")]
 pub use gpu::{GpuAnswerer, GpuEncryptedMatrix, GpuError, PhaseTimings};
@@ -53,9 +53,9 @@ pub use params::{
 };
 pub use prf::{Prf, PrfError, purpose};
 pub use protocol::{
-    AnswerMatrix, DecodingKey, DerivedState, EncryptedMatrix, EncryptedQuery, MaskContextId,
-    ProtocolError, QueryReservation, QueryReservations, QueryScratch, SecretKey, answer_batch,
-    answer_into, decode_into, encrypt, query, query_batch, query_with_scratch,
+    DecodingKey, DerivedState, EncryptedMatrix, EncryptedQuery, MaskContextId, ProtocolError,
+    QueryReservation, QueryReservations, QueryScratch, SecretKey, answer_into, decode_into,
+    encrypt, query, query_batch, query_with_scratch,
 };
 pub use trapdoor_matrices::{RowStackMask, TdmMask};
 pub use view::{

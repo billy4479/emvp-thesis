@@ -1,14 +1,15 @@
 //! Borrowed protocol views over wire workspaces.
 //!
-//! The protocol artifacts [`EncryptedMatrix`], [`EncryptedQuery`], and
-//! [`AnswerMatrix`] own their field-element storage. Servers and decoders
-//! that receive those artifacts over a transport, however, hold them as
-//! borrowed byte- or element-slices, and copying them into the owned types
-//! doubles peak memory for no benefit. This module defines Copy view
-//! structs over borrowed element slices plus the [`QueryValues`],
-//! [`MatrixValues`], and [`AnswerValues`] traits that abstract over both
-//! representations, so pure consumers such as
-//! [`crate::protocol::decode_into`] accept wire workspaces without copies.
+//! The protocol artifacts [`EncryptedMatrix`] and [`EncryptedQuery`] own
+//! their field-element storage. Servers and decoders that receive those
+//! artifacts over a transport, however, hold them as borrowed byte- or
+//! element-slices, and copying them into the owned types doubles peak
+//! memory for no benefit. This module defines Copy view structs over
+//! borrowed element slices plus the [`QueryValues`], [`MatrixValues`], and
+//! [`AnswerValues`] traits that abstract over both representations, so
+//! pure consumers such as [`crate::protocol::decode_into`] and
+//! [`crate::protocol::answer_into`]'s arena paths accept wire workspaces
+//! without copies.
 //!
 //! Views are constructed with the same checked invariants the owned
 //! constructors enforce: positive dimensions and a value count that exactly
@@ -18,7 +19,7 @@
 
 use prime_field_layer::FieldElement;
 
-use crate::protocol::{AnswerMatrix, EncryptedMatrix, EncryptedQuery, ProtocolError, check_len};
+use crate::protocol::{EncryptedMatrix, EncryptedQuery, ProtocolError, check_len};
 
 /// The encrypted query side of the protocol, viewed generically.
 ///
@@ -64,9 +65,9 @@ pub trait MatrixValues<const MODULUS: u32> {
 
 /// The server answer side of the protocol, viewed generically.
 ///
-/// Implemented by the owned [`AnswerMatrix`] and by the borrowed
-/// [`AnswerRef`], letting decoders such as
-/// [`crate::protocol::decode_into`] work over either representation.
+/// Implemented by the borrowed [`AnswerRef`], letting decoders such as
+/// [`crate::protocol::decode_into`] work over any answer representation
+/// without naming a concrete storage type.
 pub trait AnswerValues<const MODULUS: u32> {
     /// Returns the row-major answer entries.
     #[must_use]
@@ -204,8 +205,8 @@ impl<'a, const MODULUS: u32> EncryptedQueryRef<'a, MODULUS> {
     /// Like [`EncryptedQuery::from_parts`], this constructor imposes no
     /// structural invariant of its own: the coordinate count is a property
     /// of the protocol parameters (`n = 2k`), which a view cannot know, so
-    /// the length check happens where the parameters are available, in
-    /// [`crate::protocol::validate_query_against_matrix`]. The constructor
+    /// the length check happens where the parameters are available, in the
+    /// protocol crate's `validate_query_against_matrix`. The constructor
     /// therefore always succeeds; it returns a `Result` for uniformity with
     /// the other view constructors.
     ///
@@ -261,8 +262,8 @@ impl<'a, const MODULUS: u32> EncryptedQueryRef<'a, MODULUS> {
     }
 }
 
-/// A borrowed view of [`AnswerMatrix`]: shape, identifiers, and the
-/// row-major answer slice, with no owned storage.
+/// A borrowed view of a server answer `M' in F^(m x s)`: shape,
+/// identifiers, and the row-major answer slice, with no owned storage.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct AnswerRef<'a, const MODULUS: u32> {
     rows: usize,
@@ -351,9 +352,9 @@ impl<'a, const MODULUS: u32> AnswerRef<'a, MODULUS> {
 
     /// Builds a view directly from parts without validating.
     ///
-    /// Crate-internal fast path behind
-    /// [`AnswerMatrix::as_ref`](crate::protocol::AnswerMatrix::as_ref),
-    /// mirroring the owned type's unchecked `from_parts`; consumers such as
+    /// Crate-internal fast path behind the crate's already-validated arena
+    /// executors (the answer workspace and engine paths), mirroring the
+    /// owned types' unchecked `from_parts`; consumers such as
     /// [`crate::protocol::decode_into`] validate the shape themselves.
     #[must_use]
     pub(crate) const fn new_unchecked(
@@ -459,28 +460,6 @@ impl<const MODULUS: u32> MatrixValues<MODULUS> for EncryptedMatrix<MODULUS> {
     }
 }
 
-impl<const MODULUS: u32> AnswerValues<MODULUS> for AnswerMatrix<MODULUS> {
-    fn values(&self) -> &[FieldElement<MODULUS>] {
-        Self::values(self)
-    }
-
-    fn rows(&self) -> usize {
-        Self::rows(self)
-    }
-
-    fn blocks(&self) -> usize {
-        Self::blocks(self)
-    }
-
-    fn instance_id(&self) -> u128 {
-        Self::instance_id(self)
-    }
-
-    fn query_id(&self) -> u64 {
-        Self::query_id(self)
-    }
-}
-
 impl<'a, const MODULUS: u32> From<&'a EncryptedMatrix<MODULUS>>
     for EncryptedMatrixRef<'a, MODULUS>
 {
@@ -500,18 +479,6 @@ impl<'a, const MODULUS: u32> From<&'a EncryptedQuery<MODULUS>> for EncryptedQuer
             instance_id: query.instance_id(),
             query_id: query.query_id(),
             values: query.values(),
-        }
-    }
-}
-
-impl<'a, const MODULUS: u32> From<&'a AnswerMatrix<MODULUS>> for AnswerRef<'a, MODULUS> {
-    fn from(answer: &'a AnswerMatrix<MODULUS>) -> Self {
-        Self {
-            rows: answer.rows(),
-            blocks: answer.blocks(),
-            instance_id: answer.instance_id(),
-            query_id: answer.query_id(),
-            values: answer.values(),
         }
     }
 }

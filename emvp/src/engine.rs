@@ -1,16 +1,16 @@
 //! Backend-agnostic orchestration for answering several encrypted matrices.
 //!
-//! The engine offers two execution paths over the same validation. The
-//! allocating path ([`AnswerEngine::answer_many`]) validates, allocates,
-//! fills, and collects per-call. The plan → reserve → execute path
+//! The engine runs one plan → reserve → execute path
 //! ([`AnswerEngine::plan`], [`EngineWorkspace::reserve`],
-//! [`AnswerEngine::execute`]) splits the same work so a steady-state
-//! server cycle allocates nothing project-owned: the plan binds the exact
-//! inputs by borrowing (executing against different inputs is
-//! unrepresentable), the workspace grows only through `reserve` and never
-//! shrinks, and `execute` fills the caller's arena in place — CPU entries
-//! through the shared CPU row kernels, GPU entries through one packed
-//! device flight streaming into absolute arena offsets.
+//! [`AnswerEngine::execute`]) so a steady-state server cycle allocates
+//! nothing project-owned: the plan binds the exact inputs by borrowing
+//! (executing against different inputs is unrepresentable), the workspace
+//! grows only through `reserve` and never shrinks, and `execute` fills the
+//! caller's arena in place — CPU entries through the shared CPU row
+//! kernels, GPU entries through one packed device flight streaming into
+//! absolute arena offsets. Per-query answers stay available through the
+//! single-query protocol kernel ([`crate::answer_into`]), which every
+//! entry's arena range matches bit for bit.
 //!
 //! The upload side mirrors the discipline with its own plan → reserve →
 //! copy → commit path ([`AnswerEngine::plan_prepare`],
@@ -44,9 +44,7 @@ use crate::gpu::packed::{PackedJob, PackedPlan, PackedStats, PackedTimings};
 use crate::gpu::{GpuAnswerer, GpuEncryptedMatrix, GpuError};
 use crate::protocol::{fill_answer_batch_serial, fill_answer_row, validate_query_against_matrix};
 use crate::view::{EncryptedMatrixRef, MatrixValues, QueryValues};
-use crate::{
-    AnswerMatrix, EmvpParams, EncryptedMatrix, EncryptedQuery, ProtocolError, answer_batch,
-};
+use crate::{EmvpParams, EncryptedMatrix, EncryptedQuery, ProtocolError};
 
 static NEXT_ENGINE_ID: AtomicU64 = AtomicU64::new(1);
 static NEXT_MATRIX_ID: AtomicU64 = AtomicU64::new(1);
@@ -102,8 +100,8 @@ impl Drop for GpuReservation {
 /// Generic over the query representation `Q` (the owned
 /// [`EncryptedQuery`] by default, or the borrowed
 /// [`EncryptedQueryRef`](crate::view::EncryptedQueryRef) wire view), so
-/// both the allocating and the plan → reserve → execute paths answer
-/// batches without copying queries into owned storage.
+/// the plan → reserve → execute path answers batches without copying
+/// queries into owned storage.
 pub struct AnswerJob<'a, const MODULUS: u32, Q: QueryValues<MODULUS> = EncryptedQuery<MODULUS>> {
     /// The prepared matrix to evaluate.
     pub matrix: &'a PreparedMatrix<MODULUS>,
@@ -418,62 +416,6 @@ impl std::error::Error for AnswerEngineError {
     }
 }
 
-/// Execution statistics for one input entry.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct AnswerEntryReport {
-    /// The CPU tier selected for this entry.
-    pub backend: AnswerBackend,
-    /// Number of queries in the entry.
-    pub queries: usize,
-    /// Estimated field multiplications.
-    pub multiplications: usize,
-    /// Number of query field words.
-    pub query_words: usize,
-    /// Number of answer field words.
-    pub answer_words: usize,
-    /// Number of GPU segments; zero on a CPU engine.
-    pub gpu_segments: usize,
-}
-
-/// Wall-clock and shape statistics for one multi-matrix operation.
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub struct AnswerReport {
-    /// Reports in input order.
-    pub entries: Vec<AnswerEntryReport>,
-    /// Entries evaluated on the CPU.
-    pub cpu_entries: usize,
-    /// Entries evaluated on the GPU.
-    pub gpu_entries: usize,
-    /// Sum of all estimated field multiplications.
-    pub multiplications: usize,
-    /// Queries evaluated on the GPU.
-    pub gpu_queries: usize,
-    /// Bytes occupied by live query words in GPU packs, including alignment gaps.
-    pub gpu_query_bytes: u64,
-    /// Bytes occupied by live answer words in GPU packs, including alignment gaps.
-    pub gpu_answer_bytes: u64,
-    /// Number of packed GPU chunks.
-    pub gpu_chunks: usize,
-    /// Number of GPU dispatch segments across all chunks.
-    pub gpu_segments: usize,
-    /// Time spent validating and planning.
-    pub planning: Duration,
-    /// Time spent evaluating CPU entries.
-    pub cpu_compute: Duration,
-    /// Time leasing and growing packed device buffers.
-    pub gpu_prepare_buffers: Duration,
-    /// Time encoding packed query uploads.
-    pub gpu_upload: Duration,
-    /// Time recording and submitting the single GPU command buffer.
-    pub gpu_submit: Duration,
-    /// Time waiting for mapped GPU readback.
-    pub gpu_wait: Duration,
-    /// Time reconstructing GPU answers.
-    pub gpu_reconstruct: Duration,
-    /// End-to-end wall time.
-    pub total: Duration,
-}
-
 /// The validated execution facts of one entry in an [`EnginePlan`].
 ///
 /// The plan phase produces one per input entry and the entry stays bound
@@ -559,13 +501,12 @@ struct PackedGpuPlan<'a, const MODULUS: u32, Q: QueryValues<MODULUS>> {
 /// A fully validated multi-matrix answer plan bound to its inputs by
 /// borrowing.
 ///
-/// [`AnswerEngine::plan`] runs the same all-or-nothing validation as
-/// [`AnswerEngine::answer_many`] and additionally fixes, per entry, the
-/// answer shape, the backend under a snapshot of the current rayon pool,
-/// and the entry's arena offset. The plan holds every input only by
-/// reference, so executing it against other inputs is unrepresentable; a
-/// plan can be executed repeatedly and yields identical answers every
-/// time.
+/// [`AnswerEngine::plan`] validates every entry all-or-nothing and
+/// additionally fixes, per entry, the answer shape, the backend under a
+/// snapshot of the current rayon pool, and the entry's arena offset. The
+/// plan holds every input only by reference, so executing it against other
+/// inputs is unrepresentable; a plan can be executed repeatedly and yields
+/// identical answers every time.
 pub struct EnginePlan<'a, const MODULUS: u32, Q: QueryValues<MODULUS>> {
     entries: Vec<EntryPlan<'a, MODULUS, Q>>,
     total_words: usize,
@@ -1277,9 +1218,9 @@ impl<const MODULUS: u32> AnswerEngine<MODULUS> {
     /// Returns [`PrepareBatchError::Empty`] for an empty batch, the input
     /// index of the first malformed matrix as
     /// [`PrepareBatchError::Protocol`], the budget rejection of the whole
-    /// set as [`PrepareBatchError::Budget`], or the input index of the
-    /// first device upload failure as [`PrepareBatchError::Upload`]. A CPU
-    /// engine can only produce the validation failures.
+    /// set as the `Budget` variant, or the input index of the first device
+    /// upload failure as the `Upload` variant. A CPU engine can only
+    /// produce the validation failures.
     pub fn prepare_batch<I>(
         &self,
         batch: I,
@@ -1466,7 +1407,7 @@ impl<const MODULUS: u32> AnswerEngine<MODULUS> {
     /// cover the plan and [`PrepareError::Capacity`] when a slot is not
     /// sized for its entry; otherwise the same failures as
     /// [`Self::prepare_batch`], mapped onto [`PrepareError::Protocol`],
-    /// [`PrepareError::Budget`], and [`PrepareError::Upload`].
+    /// the `Budget` variant, and the `Upload` variant.
     pub fn prepare_committed(
         &self,
         plan: &PreparePlan,
@@ -1520,104 +1461,6 @@ impl<const MODULUS: u32> AnswerEngine<MODULUS> {
         false
     }
 
-    /// Answers all jobs and returns answer groups in input order.
-    ///
-    /// # Errors
-    ///
-    /// Returns an indexed validation or protocol failure without returning
-    /// partial results.
-    pub fn answer_many(
-        &self,
-        jobs: &[AnswerJob<'_, MODULUS>],
-    ) -> Result<Vec<Vec<AnswerMatrix<MODULUS>>>, AnswerEngineError> {
-        self.answer_many_with_report(jobs)
-            .map(|(answers, _)| answers)
-    }
-
-    /// Answers all jobs and returns answers plus execution statistics.
-    ///
-    /// # Errors
-    ///
-    /// Returns the same failures as [`Self::answer_many`].
-    pub fn answer_many_with_report(
-        &self,
-        jobs: &[AnswerJob<'_, MODULUS>],
-    ) -> Result<(Vec<Vec<AnswerMatrix<MODULUS>>>, AnswerReport), AnswerEngineError> {
-        let total_start = Instant::now();
-        let planning_start = Instant::now();
-        let threads = rayon::current_num_threads();
-        let entries = validate_jobs(self.id, jobs, threads)?;
-        #[cfg(feature = "gpu")]
-        let mut entries = entries;
-
-        #[cfg(feature = "gpu")]
-        let gpu_jobs = collect_gpu_jobs(jobs, &entries);
-        #[cfg(feature = "gpu")]
-        let packed_plan = if gpu_jobs.is_empty() {
-            None
-        } else {
-            let gpu = self.gpu_answerer()?;
-            Some(
-                gpu.answerer
-                    .plan_packed(&gpu_jobs)
-                    .map_err(AnswerEngineError::Gpu)?,
-            )
-        };
-        let planning = planning_start.elapsed();
-
-        #[cfg(feature = "gpu")]
-        let flight = if let Some(plan) = packed_plan {
-            let flight = self
-                .gpu_answerer()?
-                .answerer
-                .begin_packed(&gpu_jobs, plan)
-                .map_err(AnswerEngineError::Gpu)?;
-            for (entry, count) in flight.segment_counts() {
-                entries[entry].gpu_segments = count;
-            }
-            Some(flight)
-        } else {
-            None
-        };
-
-        let cpu_start = Instant::now();
-        let computed = compute_cpu_jobs(jobs, &entries);
-        let cpu_compute = cpu_start.elapsed();
-        let mut answers: Vec<Option<Vec<AnswerMatrix<MODULUS>>>> =
-            (0..jobs.len()).map(|_| None).collect();
-        for result in computed {
-            let (entry, entry_answers) = result?;
-            answers[entry] = Some(entry_answers);
-        }
-        #[cfg(feature = "gpu")]
-        let (gpu_stats, gpu_timings) = if let Some(flight) = flight {
-            let (gpu_answers, stats, timings) = self
-                .gpu_answerer()?
-                .answerer
-                .finish_packed(flight)
-                .map_err(AnswerEngineError::Gpu)?;
-            for (entry, entry_answers) in gpu_answers {
-                answers[entry] = Some(entry_answers);
-            }
-            (stats, timings)
-        } else {
-            (PackedStats::default(), PackedTimings::default())
-        };
-        let answers = collect_answers(answers)?;
-        #[cfg(feature = "gpu")]
-        let report = build_report(
-            entries,
-            planning,
-            cpu_compute,
-            gpu_stats,
-            gpu_timings,
-            total_start.elapsed(),
-        );
-        #[cfg(not(feature = "gpu"))]
-        let report = build_report(entries, planning, cpu_compute, total_start.elapsed());
-        Ok((answers, report))
-    }
-
     #[cfg(feature = "gpu")]
     fn gpu_answerer(&self) -> Result<&GpuEngine, AnswerEngineError> {
         self.gpu.as_deref().ok_or(AnswerEngineError::InternalState(
@@ -1629,25 +1472,25 @@ impl<const MODULUS: u32> AnswerEngine<MODULUS> {
     /// anything.
     ///
     /// This is the plan step of the plan → reserve → execute path. It runs
-    /// the same all-or-nothing validation as [`Self::answer_many`] — the
-    /// engine identifier of every matrix, no repeated matrix, nonempty job
-    /// list, and per-query width and instance identifier — and fixes, per
-    /// entry, the validated answer shape, the backend under a snapshot of
-    /// the current rayon pool, the entry's arena offset (the prefix sum of
-    /// the preceding entries' answer words), and for GPU-tier entries the
-    /// single packed device flight over the GPU subset in entry order. The
-    /// returned plan borrows the exact inputs, so executing it against
-    /// different inputs is unrepresentable, and it can be executed
-    /// repeatedly against one workspace.
+    /// the all-or-nothing validation — the engine identifier of every
+    /// matrix, no repeated matrix, nonempty job list, and per-query width
+    /// and instance identifier — and fixes, per entry, the validated answer
+    /// shape, the backend under a snapshot of the current rayon pool, the
+    /// entry's arena offset (the prefix sum of the preceding entries'
+    /// answer words), and for GPU-tier entries the single packed device
+    /// flight over the GPU subset in entry order. The returned plan borrows
+    /// the exact inputs, so executing it against different inputs is
+    /// unrepresentable, and it can be executed repeatedly against one
+    /// workspace.
     ///
     /// On a CPU engine every entry plans on a CPU tier even above the GPU
     /// threshold, because no matrix of a CPU engine is device-resident.
     ///
     /// # Errors
     ///
-    /// Returns the same indexed validation failures as
-    /// [`Self::answer_many`], plus device planning failures for the packed
-    /// GPU flight of a GPU engine.
+    /// Returns an indexed validation failure for the first rejected entry,
+    /// plus device planning failures for the packed GPU flight of a GPU
+    /// engine.
     pub fn plan<'a, Q: QueryValues<MODULUS> + Sync>(
         &self,
         jobs: &'a [AnswerJob<'a, MODULUS, Q>],
@@ -1717,12 +1560,11 @@ impl<const MODULUS: u32> AnswerEngine<MODULUS> {
     /// The execute step of the plan → reserve → execute path. It checks
     /// the workspace's capacity first (rejecting before any write), fills
     /// every CPU entry's disjoint arena range one entry at a time through
-    /// the same CPU row kernels the one-shot path runs — the plan's fixed
-    /// tier decides serial versus the rayon grid, whose per-row staging
-    /// leases from the workspace's scratch pool — and evaluates all
-    /// GPU-tier entries as one packed device flight streaming into the
-    /// entries' absolute arena offsets. Rayon parallelism lives inside each
-    /// CPU entry exactly as in [`Self::answer_many`]; the entries
+    /// the shared CPU row kernels — the plan's fixed tier decides serial
+    /// versus the rayon grid, whose per-row staging leases from the
+    /// workspace's scratch pool — and evaluates all GPU-tier entries as one
+    /// packed device flight streaming into the entries' absolute arena
+    /// offsets. Rayon parallelism lives inside each CPU entry; the entries
     /// themselves are filled sequentially in plan order.
     ///
     /// The returned [`EngineAnswers`] borrows the filled arena immutably;
@@ -1925,9 +1767,8 @@ fn reserve_budget(gpu: &GpuEngine, bytes: u64) -> Result<(), GpuError> {
 
 /// The validated, tier-selected execution facts of one answer entry.
 ///
-/// Everything [`Self::answer_many`]'s per-entry report and the plan phase
-/// need, computed once and shared by both paths so their validation and
-/// backend selection cannot drift apart.
+/// Everything the plan phase needs to size an entry's arena range and fix
+/// its backend.
 struct ValidatedEntry {
     rows: usize,
     blocks: usize,
@@ -1935,46 +1776,12 @@ struct ValidatedEntry {
     queries: usize,
     backend: AnswerBackend,
     multiplications: usize,
-    query_words: usize,
     answer_words: usize,
 }
 
-fn validate_jobs<'a, const MODULUS: u32, Q: QueryValues<MODULUS>>(
-    engine_id: u64,
-    jobs: &'a [AnswerJob<'a, MODULUS, Q>],
-    threads: usize,
-) -> Result<Vec<AnswerEntryReport>, AnswerEngineError> {
-    if jobs.is_empty() {
-        return Err(AnswerEngineError::EmptyJobs);
-    }
-    let mut seen = HashSet::with_capacity(jobs.len());
-    let mut entries = Vec::with_capacity(jobs.len());
-    for (entry, job) in jobs.iter().enumerate() {
-        if job.matrix.inner.engine_id != engine_id {
-            return Err(AnswerEngineError::ForeignMatrix { entry });
-        }
-        if !seen.insert(job.matrix.inner.id) {
-            return Err(AnswerEngineError::RepeatedMatrix { entry });
-        }
-        if job.queries.is_empty() {
-            return Err(AnswerEngineError::EmptyQueries { entry });
-        }
-        let validated = validate_entry(entry, job, threads)?;
-        entries.push(AnswerEntryReport {
-            backend: validated.backend,
-            queries: validated.queries,
-            multiplications: validated.multiplications,
-            query_words: validated.query_words,
-            answer_words: validated.answer_words,
-            gpu_segments: 0,
-        });
-    }
-    Ok(entries)
-}
-
-/// The plan phase's per-entry validation: the same checks and selections
-/// as [`validate_jobs`], kept as [`EntryPlan`]s with running arena
-/// offsets, plus the total arena word count.
+/// The plan phase's per-entry validation: the engine, repeat, and query
+/// checks kept as [`EntryPlan`]s with running arena offsets, plus the
+/// total arena word count.
 fn plan_jobs<'a, const MODULUS: u32, Q: QueryValues<MODULUS>>(
     engine_id: u64,
     jobs: &'a [AnswerJob<'a, MODULUS, Q>],
@@ -2063,7 +1870,6 @@ fn validate_entry<const MODULUS: u32, Q: QueryValues<MODULUS>>(
         queries: job.queries.len(),
         backend,
         multiplications,
-        query_words: job.queries.len().saturating_mul(n),
         answer_words,
     })
 }
@@ -2078,147 +1884,12 @@ fn validate_query<const MODULUS: u32, Q: QueryValues<MODULUS>>(
         .map_err(|source| AnswerEngineError::Protocol { entry, source })
 }
 
-#[cfg(feature = "gpu")]
-fn collect_gpu_jobs<'a, const MODULUS: u32, Q: QueryValues<MODULUS>>(
-    jobs: &'a [AnswerJob<'a, MODULUS, Q>],
-    entries: &[AnswerEntryReport],
-) -> Vec<PackedJob<'a, MODULUS, Q>> {
-    jobs.iter()
-        .enumerate()
-        .filter_map(|(entry, job)| {
-            if entries[entry].backend != AnswerBackend::Gpu {
-                return None;
-            }
-            job.matrix
-                .inner
-                .gpu_matrix
-                .as_ref()
-                .map(|matrix| PackedJob {
-                    entry,
-                    matrix,
-                    queries: job.queries,
-                })
-        })
-        .collect()
-}
-
-#[cfg(feature = "gpu")]
-fn compute_cpu_jobs<const MODULUS: u32>(
-    jobs: &[AnswerJob<'_, MODULUS>],
-    entries: &[AnswerEntryReport],
-) -> Vec<Result<(usize, Vec<AnswerMatrix<MODULUS>>), AnswerEngineError>> {
-    jobs.par_iter()
-        .enumerate()
-        .filter(|(entry, _)| entries[*entry].backend != AnswerBackend::Gpu)
-        .map(|(entry, job)| {
-            let inner = &job.matrix.inner;
-            answer_batch(&inner.params, &inner.matrix, job.queries)
-                .map(|answers| (entry, answers))
-                .map_err(|source| AnswerEngineError::Protocol { entry, source })
-        })
-        .collect()
-}
-
-#[cfg(not(feature = "gpu"))]
-fn compute_cpu_jobs<const MODULUS: u32>(
-    jobs: &[AnswerJob<'_, MODULUS>],
-    _entries: &[AnswerEntryReport],
-) -> Vec<Result<(usize, Vec<AnswerMatrix<MODULUS>>), AnswerEngineError>> {
-    jobs.par_iter()
-        .enumerate()
-        .map(|(entry, job)| {
-            let inner = &job.matrix.inner;
-            answer_batch(&inner.params, &inner.matrix, job.queries)
-                .map(|answers| (entry, answers))
-                .map_err(|source| AnswerEngineError::Protocol { entry, source })
-        })
-        .collect()
-}
-
-fn collect_answers<const MODULUS: u32>(
-    answers: Vec<Option<Vec<AnswerMatrix<MODULUS>>>>,
-) -> Result<Vec<Vec<AnswerMatrix<MODULUS>>>, AnswerEngineError> {
-    answers
-        .into_iter()
-        .map(|answer| {
-            answer.ok_or(AnswerEngineError::InternalState(
-                "a planned job produced no answer",
-            ))
-        })
-        .collect()
-}
-
-#[cfg(feature = "gpu")]
-fn build_report(
-    entries: Vec<AnswerEntryReport>,
-    planning: Duration,
-    cpu_compute: Duration,
-    gpu_stats: PackedStats,
-    gpu_timings: PackedTimings,
-    total: Duration,
-) -> AnswerReport {
-    let cpu_entries = entries
-        .iter()
-        .filter(|entry| entry.backend != AnswerBackend::Gpu)
-        .count();
-    let gpu_entries = entries.len() - cpu_entries;
-    let gpu_queries = entries
-        .iter()
-        .filter(|entry| entry.backend == AnswerBackend::Gpu)
-        .map(|entry| entry.queries)
-        .sum();
-    AnswerReport {
-        multiplications: total_multiplications(&entries),
-        entries,
-        cpu_entries,
-        gpu_entries,
-        gpu_queries,
-        gpu_query_bytes: gpu_stats.query_bytes,
-        gpu_answer_bytes: gpu_stats.answer_bytes,
-        gpu_chunks: gpu_stats.chunks,
-        gpu_segments: gpu_stats.segments,
-        planning,
-        cpu_compute,
-        gpu_prepare_buffers: gpu_timings.prepare_buffers,
-        gpu_upload: gpu_timings.encode_upload_queries,
-        gpu_submit: gpu_timings.dispatch_submit,
-        gpu_wait: gpu_timings.wait_readback,
-        gpu_reconstruct: gpu_timings.reconstruct,
-        total,
-    }
-}
-
-#[cfg(not(feature = "gpu"))]
-fn build_report(
-    entries: Vec<AnswerEntryReport>,
-    planning: Duration,
-    cpu_compute: Duration,
-    total: Duration,
-) -> AnswerReport {
-    AnswerReport {
-        multiplications: total_multiplications(&entries),
-        cpu_entries: entries.len(),
-        entries,
-        planning,
-        cpu_compute,
-        total,
-        ..AnswerReport::default()
-    }
-}
-
-fn total_multiplications(entries: &[AnswerEntryReport]) -> usize {
-    entries.iter().fold(0, |total, entry| {
-        total.saturating_add(entry.multiplications)
-    })
-}
-
 /// Fills every CPU-tier entry's disjoint arena range of a plan, in plan
 /// order.
 ///
 /// The plan's fixed per-entry tier decides serial versus the rayon grid;
-/// rayon parallelism lives inside each entry exactly as in
-/// [`AnswerEngine::answer_many`]. GPU-tier entries are skipped — execute
-/// handles them as one packed flight.
+/// rayon parallelism lives inside each entry. GPU-tier entries are
+/// skipped — execute handles them as one packed flight.
 ///
 /// # Errors
 ///
@@ -2274,11 +1945,12 @@ fn fill_cpu_entries<const MODULUS: u32, Q: QueryValues<MODULUS> + Sync>(
 
 /// The parallel tier of the engine's execute path.
 ///
-/// The same flattened (query, row) grid the one-shot batch and the
-/// workspace answer path run, with each answer row staged through a
-/// scratch leased from `pool` and returned afterwards; the arena chunks,
-/// the row order, and the row kernel ([`fill_answer_row`]) are identical,
-/// so the tier's output matches [`Self::answer_many`] exactly.
+/// The same flattened (query, row) grid the workspace answer path
+/// ([`crate::answer::execute_answer_batch`]) runs, with each answer row
+/// staged through a scratch leased from `pool` and returned afterwards;
+/// the arena chunks, the row order, and the row kernel
+/// ([`fill_answer_row`]) are identical, so the tier's output matches the
+/// serial tier exactly.
 #[expect(
     clippy::too_many_arguments,
     reason = "the kernel mirrors fill_answer_batch_serial's argument layout and adds the scratch pool"
@@ -2347,29 +2019,49 @@ mod tests {
         EncryptedQuery::from_parts(instance_id, query_id, vec![one; 16])
     }
 
+    /// The reference oracle: the kept single-query kernel, one fresh
+    /// vector per query. Every arena path must match it answer by answer.
+    fn reference_answers(
+        params: &EmvpParams,
+        matrix: &EncryptedMatrix<MODULUS>,
+        queries: &[EncryptedQuery<MODULUS>],
+    ) -> Vec<Vec<FieldElement<MODULUS>>> {
+        let zero = PrimeField::<MODULUS>::new().element_u32(0);
+        let blocks = params.blocks().unwrap();
+        queries
+            .iter()
+            .map(|query| {
+                let mut values = vec![zero; matrix.rows() * blocks];
+                crate::answer_into(params, matrix, query, &mut values).unwrap();
+                values
+            })
+            .collect()
+    }
+
     /// Asserts an executed [`Answers`] view pairs exactly the reference
     /// answers: values, identifiers, and shape, answer by answer.
     fn assert_view_matches<Q: QueryValues<MODULUS>>(
         view: &Answers<'_, MODULUS>,
         queries: &[Q],
-        expected: &[AnswerMatrix<MODULUS>],
+        expected: &[Vec<FieldElement<MODULUS>>],
     ) {
         assert_eq!(view.shape().queries(), expected.len());
-        for (index, expected_answer) in expected.iter().enumerate() {
+        for (index, expected_values) in expected.iter().enumerate() {
             let answer = view.answer(queries, index).unwrap();
-            assert_eq!(answer.values(), expected_answer.values());
-            assert_eq!(answer.query_id(), expected_answer.query_id());
-            assert_eq!(answer.instance_id(), expected_answer.instance_id());
-            assert_eq!(answer.rows(), expected_answer.rows());
-            assert_eq!(answer.blocks(), expected_answer.blocks());
+            assert_eq!(answer.values(), expected_values.as_slice());
+            assert_eq!(answer.query_id(), queries[index].query_id());
+            assert_eq!(answer.instance_id(), view.shape().instance_id());
+            assert_eq!(answer.rows() * answer.blocks(), expected_values.len());
         }
     }
 
     #[test]
     fn cpu_engine_preserves_entry_and_query_order() {
         let engine = AnswerEngine::cpu();
-        let first = engine.prepare(PARAMS, matrix(11, 2)).unwrap();
-        let second = engine.prepare(PARAMS, matrix(22, 3)).unwrap();
+        let first_host = matrix(11, 2);
+        let second_host = matrix(22, 3);
+        let first = engine.prepare(PARAMS, first_host.clone()).unwrap();
+        let second = engine.prepare(PARAMS, second_host.clone()).unwrap();
         let first_queries = [query(11, 7), query(11, 8)];
         let second_queries = [query(22, 9)];
         let jobs = [
@@ -2382,20 +2074,49 @@ mod tests {
                 queries: &second_queries,
             },
         ];
-        let (answers, report) = engine.answer_many_with_report(&jobs).unwrap();
+        let plan = engine.plan(&jobs).unwrap();
+        let mut workspace = EngineWorkspace::new();
+        workspace.reserve(&plan).unwrap();
+        let (answers, report) = engine.execute(&plan, &mut workspace).unwrap();
         assert_eq!(answers.len(), 2);
+        let first_ids: Vec<_> = (0..first_queries.len())
+            .map(|index| {
+                answers
+                    .entry_answers(0)
+                    .unwrap()
+                    .answer(&first_queries, index)
+                    .unwrap()
+                    .query_id()
+            })
+            .collect();
+        assert_eq!(first_ids, [7, 8]);
         assert_eq!(
-            answers[0]
-                .iter()
-                .map(AnswerMatrix::query_id)
-                .collect::<Vec<_>>(),
-            [7, 8]
+            answers
+                .entry_answers(1)
+                .unwrap()
+                .answer(&second_queries, 0)
+                .unwrap()
+                .query_id(),
+            9
         );
-        assert_eq!(answers[1][0].query_id(), 9);
-        assert_eq!(answers[0][0].rows(), 2);
-        assert_eq!(answers[1][0].rows(), 3);
+        assert_eq!(answers.shape_of(0).unwrap().rows(), 2);
+        assert_eq!(answers.shape_of(1).unwrap().rows(), 3);
         assert_eq!(report.cpu_entries, 2);
-        assert_eq!(report.entries.len(), 2);
+        assert_eq!(plan.len(), 2);
+        // The executed answers match the per-query reference for both
+        // entries.
+        let expected_first = reference_answers(&PARAMS, &first_host, &first_queries);
+        let expected_second = reference_answers(&PARAMS, &second_host, &second_queries);
+        assert_view_matches(
+            &answers.entry_answers(0).unwrap(),
+            &first_queries,
+            &expected_first,
+        );
+        assert_view_matches(
+            &answers.entry_answers(1).unwrap(),
+            &second_queries,
+            &expected_second,
+        );
     }
 
     #[test]
@@ -2407,19 +2128,20 @@ mod tests {
         let queries = [query(11, 1)];
         let foreign_queries = [query(22, 1)];
 
+        let empty: [AnswerJob<'_, MODULUS>; 0] = [];
         assert!(matches!(
-            engine.answer_many(&[]),
+            engine.plan(&empty),
             Err(AnswerEngineError::EmptyJobs)
         ));
         assert!(matches!(
-            engine.answer_many(&[AnswerJob {
+            engine.plan(&[AnswerJob {
                 matrix: &prepared,
-                queries: &[]
+                queries: &[] as &[EncryptedQuery<MODULUS>]
             }]),
             Err(AnswerEngineError::EmptyQueries { entry: 0 })
         ));
         assert!(matches!(
-            engine.answer_many(&[
+            engine.plan(&[
                 AnswerJob {
                     matrix: &prepared,
                     queries: &queries
@@ -2432,7 +2154,7 @@ mod tests {
             Err(AnswerEngineError::RepeatedMatrix { entry: 1 })
         ));
         assert!(matches!(
-            engine.answer_many(&[AnswerJob {
+            engine.plan(&[AnswerJob {
                 matrix: &foreign,
                 queries: &foreign_queries
             }]),
@@ -2464,10 +2186,17 @@ mod tests {
                 queries: queries.as_slice(),
             })
             .collect();
-        let answers = engine.answer_many(&jobs).unwrap();
-        let answer_rows: Vec<usize> = answers
-            .iter()
-            .map(|group| group.iter().map(AnswerMatrix::rows).sum())
+        let plan = engine.plan(&jobs).unwrap();
+        let mut workspace = EngineWorkspace::new();
+        workspace.reserve(&plan).unwrap();
+        let (answers, _) = engine.execute(&plan, &mut workspace).unwrap();
+        // Per entry, the summed answer rows over the entry's queries keep
+        // the batch's input order and per-entry query counts.
+        let answer_rows: Vec<usize> = (0..answers.len())
+            .map(|index| {
+                let shape = answers.shape_of(index).unwrap();
+                shape.rows() * shape.queries()
+            })
             .collect();
         assert_eq!(answer_rows, [2, 6, 5]);
     }
@@ -2520,22 +2249,23 @@ mod tests {
         let host = EncryptedMatrix::from_parts(91, rows, 2, values).unwrap();
         let expected_query =
             EncryptedQuery::from_parts(91, 7, vec![field.element_u32(3), field.element_u32(5)]);
-        let expected =
-            answer_batch(&GPU_PARAMS, &host, std::slice::from_ref(&expected_query)).unwrap();
+        let expected = reference_answers(&GPU_PARAMS, &host, std::slice::from_ref(&expected_query));
         let prepared = engine.prepare(GPU_PARAMS, host).unwrap();
         let queries = [expected_query];
-        let (actual, report) = engine
-            .answer_many_with_report(&[AnswerJob {
-                matrix: &prepared,
-                queries: &queries,
-            }])
-            .unwrap();
-        assert_eq!(actual[0], expected);
+        let jobs = [AnswerJob {
+            matrix: &prepared,
+            queries: &queries,
+        }];
+        let plan = engine.plan(&jobs).unwrap();
+        assert_eq!(plan.entry(0).unwrap().gpu_segments(), 1);
+        let mut workspace = EngineWorkspace::new();
+        workspace.reserve(&plan).unwrap();
+        let (answers, report) = engine.execute(&plan, &mut workspace).unwrap();
+        assert_view_matches(&answers.entry_answers(0).unwrap(), &queries, &expected);
         assert_eq!(report.gpu_entries, 1);
         assert_eq!(report.gpu_queries, 1);
         assert_eq!(report.gpu_chunks, 1);
         assert_eq!(report.gpu_segments, 1);
-        assert_eq!(report.entries[0].gpu_segments, 1);
     }
 
     #[cfg(feature = "gpu")]
@@ -2688,10 +2418,10 @@ mod tests {
     }
 
     /// The engine plan binds exact inputs by borrowing, so plan → reserve →
-    /// execute must reproduce the allocating path's answers entry by entry,
-    /// across entries whose shapes and CPU tiers differ.
+    /// execute must reproduce the per-query reference answers entry by
+    /// entry, across entries whose shapes and CPU tiers differ.
     #[test]
-    fn plan_execute_matches_answer_many_across_mixed_tiers() {
+    fn plan_execute_matches_the_reference_across_mixed_tiers() {
         let engine = AnswerEngine::cpu();
         let first = engine.prepare(PARAMS, matrix(11, 512)).unwrap();
         let second = engine.prepare(PARAMS, matrix(22, 2)).unwrap();
@@ -2713,7 +2443,13 @@ mod tests {
                 queries: &third_queries,
             },
         ];
-        let expected = engine.answer_many(&jobs).unwrap();
+        let expected: Vec<Vec<_>> = [
+            reference_answers(&PARAMS, &first.inner.matrix, &first_queries),
+            reference_answers(&PARAMS, &second.inner.matrix, &second_queries),
+            reference_answers(&PARAMS, &third.inner.matrix, &third_queries),
+        ]
+        .into_iter()
+        .collect();
         let plan = engine.plan(&jobs).unwrap();
         assert_eq!(plan.len(), 3);
         assert!(!plan.is_empty());
@@ -2793,17 +2529,17 @@ mod tests {
             assert_eq!(view0.len(), first_words);
             assert_eq!(view1.len(), second_words);
             assert_eq!(answers.total_words(), first_words + second_words);
-            // Each entry matches the one-shot path's answers for the same
-            // inputs.
+            // Each entry matches the per-query reference answers for the
+            // same inputs.
             assert_view_matches(
                 &view0,
                 &first_queries,
-                &answer_batch(&PARAMS, &first_host, &first_queries).unwrap(),
+                &reference_answers(&PARAMS, &first_host, &first_queries),
             );
             assert_view_matches(
                 &view1,
                 &second_queries,
-                &answer_batch(&PARAMS, &second_host, &second_queries).unwrap(),
+                &reference_answers(&PARAMS, &second_host, &second_queries),
             );
             (view0.arena().to_vec(), view1.arena().to_vec())
         };
@@ -2933,13 +2669,12 @@ mod tests {
         workspace.reserve(&plan).unwrap();
         let _ = engine.execute(&plan, &mut workspace).unwrap();
         let first_run = workspace.arena.clone();
-        let (total, view_values, view_ids) = {
+        let (total, view_values) = {
             let (answers, _) = engine.execute(&plan, &mut workspace).unwrap();
             let view = answers.entry_answers(1).unwrap();
             // The re-executed views still pair with the planned queries.
-            let reference = answer_batch(&PARAMS, &second.inner.matrix, &second_queries).unwrap();
             let values: Vec<_> = view.answer(&second_queries, 0).unwrap().values().to_vec();
-            (answers.total_words(), values, reference[0].query_id())
+            (answers.total_words(), values)
         };
         assert_eq!(total, plan.total_words());
         assert_eq!(&workspace.arena[..total], &first_run[..]);
@@ -2948,7 +2683,9 @@ mod tests {
                 ..plan.entry(1).unwrap().offset_words() + view_values.len()],
             view_values[..]
         );
-        assert_eq!(view_ids, 9);
+        // The re-executed answers match the per-query reference.
+        let reference = reference_answers(&PARAMS, &second.inner.matrix, &second_queries);
+        assert_eq!(view_values, reference[0].as_slice());
     }
 
     /// The plan and execute paths must accept the borrowed wire view as
@@ -2965,18 +2702,13 @@ mod tests {
         let borrowed_first: Vec<EncryptedQueryRef<'_, MODULUS>> =
             owned_first.iter().map(|query| query.as_ref()).collect();
         let borrowed_second: Vec<_> = owned_second.iter().map(|query| query.as_ref()).collect();
-        // The old owned path pins the reference answers.
-        let owned_jobs = [
-            AnswerJob {
-                matrix: &first,
-                queries: &owned_first,
-            },
-            AnswerJob {
-                matrix: &second,
-                queries: &owned_second,
-            },
-        ];
-        let expected = engine.answer_many(&owned_jobs).unwrap();
+        // The per-query reference answers pin the expected values.
+        let expected: Vec<Vec<_>> = [
+            reference_answers(&PARAMS, &first.inner.matrix, &owned_first),
+            reference_answers(&PARAMS, &second.inner.matrix, &owned_second),
+        ]
+        .into_iter()
+        .collect();
         // The borrowed-view path plans and executes the same answers.
         let jobs = [
             AnswerJob {
@@ -3035,7 +2767,7 @@ mod tests {
         assert_view_matches(
             &answers.entry_answers(0).unwrap(),
             &queries,
-            &answer_batch(&PARAMS, &host, &queries).unwrap(),
+            &reference_answers(&PARAMS, &host, &queries),
         );
     }
 
@@ -3074,8 +2806,8 @@ mod tests {
                 queries: &cpu_queries,
             },
         ];
-        let device_reference = answer_batch(&GPU_PARAMS, &gpu_host, &gpu_queries).unwrap();
-        let core_reference = answer_batch(&PARAMS, &cpu_host, &cpu_queries).unwrap();
+        let device_reference = reference_answers(&GPU_PARAMS, &gpu_host, &gpu_queries);
+        let core_reference = reference_answers(&PARAMS, &cpu_host, &cpu_queries);
 
         let plan = engine.plan(&jobs).unwrap();
         assert_eq!(plan.entry(0).unwrap().backend(), AnswerBackend::Gpu);
@@ -3336,10 +3068,6 @@ mod tests {
             upload_ref(&first_host, PARAMS),
             upload_ref(&second_host, PARAMS),
         ];
-        // The old owned path pins the reference handles and answers.
-        let expected = engine
-            .prepare_batch([(PARAMS, first_host.clone()), (PARAMS, second_host.clone())])
-            .unwrap();
         let plan = engine.plan_prepare(&uploads).unwrap();
         let mut workspace = PrepareWorkspace::new();
         workspace.reserve(&plan).unwrap();
@@ -3351,7 +3079,7 @@ mod tests {
         assert_eq!(committed[0].inner.matrix.instance_id(), 11);
         assert_eq!(committed[1].inner.matrix.instance_id(), 22);
         // Answers through plan → reserve → execute on the committed
-        // handles must equal the old path's answers for the same queries.
+        // handles must equal the per-query reference answers.
         let first_queries: Vec<_> = (0..3_u64).map(|index| query(11, 40 + index)).collect();
         let second_queries = [query(22, 50)];
         let committed_jobs = [
@@ -3364,17 +3092,12 @@ mod tests {
                 queries: &second_queries,
             },
         ];
-        let old_jobs = [
-            AnswerJob {
-                matrix: &expected[0],
-                queries: &first_queries,
-            },
-            AnswerJob {
-                matrix: &expected[1],
-                queries: &second_queries,
-            },
-        ];
-        let expected_answers = engine.answer_many(&old_jobs).unwrap();
+        let expected_answers: Vec<Vec<_>> = [
+            reference_answers(&PARAMS, &first_host, &first_queries),
+            reference_answers(&PARAMS, &second_host, &second_queries),
+        ]
+        .into_iter()
+        .collect();
         let answer_plan = engine.plan(&committed_jobs).unwrap();
         let mut answer_workspace = EngineWorkspace::new();
         answer_workspace.reserve(&answer_plan).unwrap();
@@ -3422,13 +3145,12 @@ mod tests {
     }
 
     /// The committed upload path on a real device: the whole-set budget
-    /// reservation, the per-handle release, and the answers match the old
-    /// [`AnswerEngine::prepare_batch`] pipeline. Requires a compute
-    /// adapter.
+    /// reservation, the per-handle release, and the answers match the
+    /// per-query reference. Requires a compute adapter.
     #[cfg(feature = "gpu")]
     #[ignore = "requires a compute adapter"]
     #[test]
-    fn committed_upload_matches_prepare_batch_on_device() {
+    fn committed_upload_matches_the_cpu_reference_on_device() {
         let one = (2 * PARAMS.n().unwrap() * 4) as u64;
         let engine = AnswerEngine::new(3 * one).unwrap();
         if engine.gpu.is_none() {
@@ -3495,10 +3217,17 @@ mod tests {
                 queries: queries.as_slice(),
             })
             .collect();
-        let answers = engine.answer_many(&jobs).unwrap();
+        let answer_plan = engine.plan(&jobs).unwrap();
+        let mut answer_workspace = EngineWorkspace::new();
+        answer_workspace.reserve(&answer_plan).unwrap();
+        let (answers, _) = engine.execute(&answer_plan, &mut answer_workspace).unwrap();
         for (index, host) in hosts.iter().enumerate() {
-            let expected = answer_batch(&PARAMS, host, &query_sets[index]).unwrap();
-            assert_eq!(answers[index], expected);
+            let expected = reference_answers(&PARAMS, host, &query_sets[index]);
+            assert_view_matches(
+                &answers.entry_answers(index).unwrap(),
+                jobs[index].queries,
+                &expected,
+            );
         }
     }
 

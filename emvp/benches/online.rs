@@ -38,8 +38,8 @@ use criterion::{
     BenchmarkGroup, BenchmarkId, Criterion, criterion_group, criterion_main, measurement::WallTime,
 };
 use emvp::{
-    AnswerMatrix, DerivedState, EmvpParams, EncryptedMatrix, answer_into, decode_into, encrypt,
-    query, search,
+    AnswerRef, DerivedState, EmvpParams, EncryptedMatrix, answer_into, decode_into, encrypt, query,
+    search,
 };
 use prime_field_layer::arithmetic_kernels::dot_product;
 use prime_field_layer::{FieldElement, PrimeField};
@@ -151,13 +151,14 @@ fn bench_total_case<M: TdmMask<MODULUS>>(
                         black_box(&mut answer),
                     )
                     .unwrap();
-                    let answer = AnswerMatrix::from_parts(
+                    let answer = AnswerRef::new(
                         encrypted.instance_id(),
                         encrypted_query.query_id(),
-                        answer,
+                        &answer,
                         rows,
                         blocks,
-                    );
+                    )
+                    .unwrap();
                     decode_into(
                         black_box(&answer),
                         black_box(&decoding_key),
@@ -217,13 +218,14 @@ fn bench_decode_case(
     let blocks = params.blocks().unwrap();
     let mut answer_values = vec![zero; rows * blocks];
     answer_into(&params, &encrypted, &encrypted_query, &mut answer_values).unwrap();
-    let answer_matrix = AnswerMatrix::from_parts(
+    let answer_ref = AnswerRef::new(
         encrypted.instance_id(),
         encrypted_query.query_id(),
-        answer_values,
+        &answer_values,
         rows,
         blocks,
-    );
+    )
+    .unwrap();
     let mut output = vec![zero; rows];
     group.throughput(elements(rows * params.ell));
     group.bench_function(
@@ -232,7 +234,7 @@ fn bench_decode_case(
             b.iter(|| {
                 pool.install(|| {
                     decode_into(
-                        black_box(&answer_matrix),
+                        black_box(&answer_ref),
                         black_box(&decoding_key),
                         black_box(&mut output),
                     )

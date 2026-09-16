@@ -10,7 +10,7 @@ use criterion::{
     measurement::WallTime,
 };
 use emvp::{
-    AnswerMatrix, AnswerPlan, AnswerWorkspace, EmvpParams, SecretKey, answer_into, decode_into,
+    AnswerPlan, AnswerRef, AnswerWorkspace, EmvpParams, SecretKey, answer_into, decode_into,
     encrypt, execute_answer_batch, query, query_batch, search,
 };
 use prime_field_layer::{FieldElement, PrimeField};
@@ -276,13 +276,14 @@ fn bench_decode(
     let blocks = params.blocks().unwrap();
     let mut answer_values = vec![zero; rows * blocks];
     answer_into(&params, &encrypted, &encrypted_query, &mut answer_values).unwrap();
-    let answer_matrix = AnswerMatrix::from_parts(
+    let answer_ref = AnswerRef::new(
         encrypted.instance_id(),
         encrypted_query.query_id(),
-        answer_values,
+        &answer_values,
         rows,
         blocks,
-    );
+    )
+    .unwrap();
     let mut output = vec![zero; rows];
     group.throughput(elements(rows * blocks));
     group.bench_function(
@@ -292,7 +293,7 @@ fn bench_decode(
                 benchmark_pool()
                     .install(|| {
                         decode_into(
-                            black_box(&answer_matrix),
+                            black_box(&answer_ref),
                             black_box(&decoding_key),
                             black_box(&mut output),
                         )

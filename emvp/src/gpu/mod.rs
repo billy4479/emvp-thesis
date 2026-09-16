@@ -9,20 +9,19 @@
 //! protocol data, no secret key material ever reaches the device, and
 //! constant-time discipline is unnecessary on this path. The workload
 //! threshold that decides between this path and the CPU path lives in
-//! [`crate::dispatch`], whose [`AnswerDispatcher`](crate::dispatch::AnswerDispatcher)
-//! runner owns the hand-off.
+//! [`crate::dispatch`]; the engine plans and reserves the device hand-off.
 //!
 //! # Montgomery-native interchange
 //!
 //! [`prime_field_layer::FieldElement`] stores each value as its canonical
-//! Montgomery residue `a * 2^32 mod p`. The WGSL kernel in
-//! [`ANSWER_WGSL`] reproduces the crate's Montgomery multiplication (REDC)
+//! Montgomery residue `a * 2^32 mod p`. The WGSL kernel in `ANSWER_WGSL`
+//! reproduces the crate's Montgomery multiplication (REDC)
 //! on those raw words, so uploads and readbacks move the words as-is:
 //! [`GpuAnswerer::upload_matrix`] streams the raw words into the device
-//! buffer, and [`GpuAnswerer::answer_batch`] wraps the returned words with
-//! the checked [`prime_field_layer::FieldElement::try_from_raw`]. The
-//! results are bit-identical to the CPU [`answer_batch`](crate::answer_batch),
-//! which remains the reference implementation; the parity tests in
+//! buffer, and [`GpuAnswerer::execute_answer_batch_into`] wraps the returned
+//! words with the checked [`prime_field_layer::FieldElement::try_from_raw`].
+//! The results are bit-identical to the CPU [`crate::answer_into`], which
+//! remains the reference implementation; the parity tests in
 //! `emvp/tests/gpu.rs` pin this property empirically. Because the kernel's
 //! final fold returns a canonical word, equality on raw words matches
 //! equality on elements and no normalization pass is needed; a device word
@@ -44,11 +43,12 @@
 //!
 //! # Data flow and resource ownership
 //!
-//! [`upload_matrix`] is the explicit upload-once step: it copies the
-//! row-major encrypted matrix into a device-side storage buffer held by the
-//! returned [`GpuEncryptedMatrix`]. [`answer_batch`] then uploads the
-//! query batch, dispatches one thread per output element, and reads the
-//! answers back through a staging buffer.
+//! [`GpuAnswerer::upload_matrix`] is the explicit upload-once step: it
+//! copies the row-major encrypted matrix into a device-side storage buffer
+//! held by the returned [`GpuEncryptedMatrix`].
+//! [`GpuAnswerer::execute_answer_batch_into`] then uploads the query
+//! batch, dispatches one thread per output element, and reads the answers
+//! back through a staging buffer.
 //!
 //! The per-batch device buffers (queries, uniform, output, staging
 //! readback) are not created per call: each batch pops a scratch set from
@@ -65,9 +65,7 @@
 //! workspace denies `unsafe`). Readbacks map only the live slice of the
 //! staging buffer and stream the answer words straight into a caller-owned
 //! arena in one pass over the mapped bytes
-//! ([`GpuAnswerer::execute_answer_batch_into`]); the legacy
-//! [`GpuAnswerer::answer_batch`] adapters run that same into-write and
-//! convert the arena into per-query [`AnswerMatrix`]s on top.
+//! ([`GpuAnswerer::execute_answer_batch_into`]).
 //!
 //! # Blocking behavior
 //!
@@ -81,7 +79,7 @@
 //!
 //! # Phase timings
 //!
-//! [`GpuAnswerer::answer_batch_with_timings`] reports the host-side
+//! [`GpuAnswerer::execute_answer_batch_into`] reports the host-side
 //! wall-clock breakdown of a batch in [`PhaseTimings`]. The GPU benchmark
 //! prints a fixed set of diagnostic calls collected outside Criterion timing.
 //!
@@ -92,10 +90,9 @@
 //! [`GpuAnswerer`] directly, and folding it into the protocol error type
 //! would couple client-side decoding to the server's hardware. Shape
 //! validation reuses the protocol crate's server-side checks
-//! ([`crate::protocol::validate_matrix_shape`] and the per-query validator
-//! next to it) so CPU, dispatcher, and GPU reject the same shapes before
-//! any work; those failures are mapped onto their [`GpuError`]
-//! equivalents.
+//! (`validate_matrix_shape` and the per-query validator next to it) so CPU
+//! and GPU reject the same shapes before any work; those failures are
+//! mapped onto their [`GpuError`] equivalents.
 //!
 //! # Experimental
 //!
@@ -116,7 +113,7 @@ use prime_field_layer::{FieldElement, PrimeField};
 use crate::answer::{AnswerWorkspace, Answers};
 use crate::params::EmvpParams;
 use crate::protocol::{
-    AnswerMatrix, EncryptedMatrix, EncryptedQuery, ProtocolError, validate_matrix_shape,
+    EncryptedMatrix, EncryptedQuery, ProtocolError, validate_matrix_shape,
     validate_query_against_matrix,
 };
 
@@ -375,7 +372,7 @@ impl From<ProtocolError> for GpuError {
 }
 
 /// Wall-clock host-side breakdown of one
-/// [`GpuAnswerer::answer_batch_with_timings`] call.
+/// [`GpuAnswerer::execute_answer_batch_into`] call.
 ///
 /// Every field is the elapsed [`Instant`] delta measured on the calling
 /// thread while executing that phase, and the phases run sequentially, so
@@ -408,10 +405,9 @@ pub struct PhaseTimings {
     /// dispatch, and the device-to-host copy, and the mapping callback has
     /// run. This is the phase that waits on GPU execution.
     pub wait_readback: Duration,
-    /// Reconstructing the per-query answer vectors from the mapped staging
-    /// bytes: the checked `FieldElement::try_from_raw` word pass and the
-    /// split into [`AnswerMatrix`]s. Pure host work with no device
-    /// dependency.
+    /// Reconstructing the caller's arena from the mapped staging bytes:
+    /// the checked `FieldElement::try_from_raw` word pass streaming into
+    /// the arena. Pure host work with no device dependency.
     pub reconstruct: Duration,
 }
 
@@ -431,10 +427,11 @@ impl PhaseTimings {
 /// An encrypted matrix uploaded to the device as raw Montgomery words.
 ///
 /// The handle owns the device buffer, so the host copy of the ciphertext can
-/// be dropped after upload; [`GpuAnswerer::answer_batch`] reuses the buffer
-/// for every query batch. It also carries the protocol parameters the
-/// matrix was encrypted under, which fix the block structure `b` and `s`
-/// the kernel answers with. Drop the handle to release the device memory.
+/// be dropped after upload; [`GpuAnswerer::execute_answer_batch_into`]
+/// reuses the buffer for every query batch. It also carries the protocol
+/// parameters the matrix was encrypted under, which fix the block structure
+/// `b` and `s` the kernel answers with. Drop the handle to release the
+/// device memory.
 pub struct GpuEncryptedMatrix<const MODULUS: u32> {
     buffer: wgpu::Buffer,
     params: EmvpParams,
@@ -483,10 +480,10 @@ impl<const MODULUS: u32> fmt::Debug for GpuEncryptedMatrix<MODULUS> {
 /// The GPU answer server: a logical device, a command queue, and the
 /// per-modulus pipeline and buffer caches.
 ///
-/// Batches lease reusable buffer sets from [`Self::scratch_pool`], so a
+/// Batches lease reusable buffer sets from the internal scratch pool, so a
 /// steady workload allocates device memory once per concurrent caller
-/// rather than once per call. See [`AnswerScratch`] for the growth
-/// contract.
+/// rather than once per call. See the internal `AnswerScratch` for the
+/// growth contract.
 pub struct GpuAnswerer {
     pub(crate) device: wgpu::Device,
     pub(crate) queue: wgpu::Queue,
@@ -568,8 +565,8 @@ impl GpuAnswerer {
     ///
     /// This is the one-time transfer per matrix: the returned
     /// [`GpuEncryptedMatrix`] owns the device buffer and every later
-    /// [`Self::answer_batch`] against it reuses the words in place. The
-    /// upload streams the raw words straight into a
+    /// [`Self::execute_answer_batch_into`] against it reuses the words in
+    /// place. The upload streams the raw words straight into a
     /// `Queue::write_buffer_with` staging view and flushes the transfer
     /// with an immediate empty submission, so the copy overlaps whatever
     /// the host does next instead of hiding behind the first answer
@@ -577,10 +574,9 @@ impl GpuAnswerer {
     /// parameters of `matrix`; they fix the block structure the kernel
     /// answers with.
     ///
-    /// Shape validation reuses
-    /// [`crate::protocol::validate_matrix_shape`], the same check the CPU
-    /// answer path and the [`AnswerDispatcher`](crate::dispatch::AnswerDispatcher)
-    /// run, so all server paths reject the same malformed shapes.
+    /// Shape validation reuses the protocol crate's
+    /// `validate_matrix_shape`, the same check the CPU answer path runs,
+    /// so all server paths reject the same malformed shapes.
     ///
     /// # Errors
     ///
@@ -634,92 +630,12 @@ impl GpuAnswerer {
         })
     }
 
-    /// Answers a batch of encrypted queries against one uploaded matrix on
-    /// the device.
-    ///
-    /// Every query is answered exactly as the CPU
-    /// [`answer_batch`](crate::answer_batch) answers it alone: for each
-    /// output `(query, row, block)` the kernel accumulates the `b` raw word
-    /// products into a 96-bit integer accumulator and reduces it once with
-    /// a two-step Montgomery fold plus an `R2` correction, writing one
-    /// canonical word per element of the query-major answer arena.
-    /// Validation is all-or-nothing and
-    /// mirrors the CPU path; results are bit-identical to it. This is the
-    /// temporary allocating adapter over the plan-reserve-execute path
-    /// ([`Self::answer_batch_plan`] and [`Self::execute_answer_batch_into`]);
-    /// it pays one arena allocation plus one per-query [`AnswerMatrix`]
-    /// conversion the into-API avoids.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error before any device work if the parameters are
-    /// malformed, the batch is empty, any query has the wrong length or a
-    /// foreign instance identifier, an index or size would overflow, the
-    /// query/output buffers exceed the device's capacity, or the driver
-    /// refuses a buffer allocation.
-    pub fn answer_batch<const MODULUS: u32>(
-        &self,
-        matrix: &GpuEncryptedMatrix<MODULUS>,
-        queries: &[EncryptedQuery<MODULUS>],
-    ) -> Result<Vec<AnswerMatrix<MODULUS>>, GpuError> {
-        self.answer_batch_with_timings(matrix, queries)
-            .map(|(answers, _timings)| answers)
-    }
-
-    /// [`Self::answer_batch`] with the host-side phase breakdown of
-    /// [`PhaseTimings`] attached.
-    ///
-    /// The timings make the host-versus-device split of one batch
-    /// observable: how long the host spends preparing and submitting device
-    /// work ([`PhaseTimings::prepare_buffers`],
-    /// [`PhaseTimings::encode_upload_queries`],
-    /// [`PhaseTimings::dispatch_submit`]), how long the calling thread
-    /// blocks on the device ([`PhaseTimings::wait_readback`]), and how long
-    /// the host spends reconstructing the answers afterwards
-    /// ([`PhaseTimings::reconstruct`], which on this adapter covers the
-    /// into-arena write and the per-query [`AnswerMatrix`] conversion).
-    ///
-    /// # Errors
-    ///
-    /// Returns the same errors as [`Self::answer_batch`].
-    pub fn answer_batch_with_timings<const MODULUS: u32>(
-        &self,
-        matrix: &GpuEncryptedMatrix<MODULUS>,
-        queries: &[EncryptedQuery<MODULUS>],
-    ) -> Result<(Vec<AnswerMatrix<MODULUS>>, PhaseTimings), GpuError> {
-        check_modulus::<MODULUS>()?;
-        let shape = self.answer_shape(matrix, queries)?;
-        let mut workspace = AnswerWorkspace::<MODULUS>::new();
-        workspace
-            .reserve_words(shape.answer_words)
-            .map_err(map_capacity_error)?;
-        let host_shape =
-            crate::answer::AnswerShape::new(shape.rows, shape.s, shape.batch, matrix.instance_id());
-        let mut timings = {
-            let arena = workspace.arena_mut();
-            self.execute_validated_batch_into(
-                matrix,
-                queries,
-                &shape,
-                &mut arena[..shape.answer_words],
-            )?
-        };
-        let conversion_start = Instant::now();
-        let answers = owned_answers(
-            &workspace.arena()[..shape.answer_words],
-            queries,
-            &host_shape,
-        )?;
-        timings.reconstruct += conversion_start.elapsed();
-        Ok((answers, timings))
-    }
-
     /// Plans a single-batch GPU answer without device-side side effects on
     /// the batch itself.
     ///
     /// This is the plan step of the GPU plan-reserve-execute path: it runs
     /// the same all-or-nothing validation as
-    /// [`Self::answer_batch_with_timings`] and derives and validates the
+    /// [`Self::execute_answer_batch_into`] and derives and validates the
     /// dispatch grid and uniform bytes, so a plan that returns here is
     /// executable except for caller-side arena capacity. It also warms the
     /// per-modulus pipeline cache, moving one-time shader compilation out
@@ -758,11 +674,11 @@ impl GpuAnswerer {
     ///
     /// The execute step of the GPU plan-reserve-execute path: it re-runs
     /// the plan's validation, checks the workspace's capacity first, and
-    /// then runs the same pipeline as [`Self::answer_batch_with_timings`]
-    /// — scratch lease from the pool, query upload, dispatch, staged
-    /// readback — but streams the readback words straight into the
-    /// workspace's arena subslice `[0, shape.arena_words())` in the CPU
-    /// path's query-major layout: query `q` of the batch occupies
+    /// then runs the device pipeline — scratch lease from the pool, query
+    /// upload, dispatch, staged readback — streaming the readback words
+    /// straight into the workspace's arena subslice
+    /// `[0, shape.arena_words())` in the CPU path's query-major layout:
+    /// query `q` of the batch occupies
     /// `[q * rows * s, (q + 1) * rows * s)`. A warm scratch pool serves the
     /// whole call without allocating; the scratch set returns to the pool
     /// on success and is dropped on any error path, as before.
@@ -774,8 +690,8 @@ impl GpuAnswerer {
     ///
     /// Returns [`GpuError::Capacity`] before any device work or arena
     /// mutation when `workspace.capacity_words()` is below
-    /// `shape.arena_words()`; returns the plan's validation errors and the
-    /// device errors of [`Self::answer_batch`] otherwise. On an error the
+    /// `shape.arena_words()`; returns the batch validation errors and the
+    /// device pipeline's errors otherwise. On an error the
     /// arena's contents are unspecified: callers must treat it as
     /// unwritten.
     pub fn execute_answer_batch_into<'ws, const MODULUS: u32>(
@@ -806,9 +722,8 @@ impl GpuAnswerer {
     }
 
     /// The shared validated pipeline behind
-    /// [`Self::execute_answer_batch_into`] and the legacy allocating
-    /// adapters: lease scratch, prepare, encode and upload, submit, wait,
-    /// and stream the staged answers into `dest`.
+    /// [`Self::execute_answer_batch_into`]: lease scratch, prepare, encode
+    /// and upload, submit, wait, and stream the staged answers into `dest`.
     ///
     /// `dest` must hold at least `shape.answer_words` words; exactly that
     /// prefix is written, query-major. On every success path the leased
@@ -1028,7 +943,7 @@ impl GpuAnswerer {
     ///
     /// The per-query checks reuse
     /// [`crate::protocol::validate_query_against_matrix`], the same
-    /// validation the CPU `answer_batch` runs, so CPU, dispatcher, and GPU
+    /// validation the CPU answer path runs, so CPU and GPU
     /// reject the same malformed batches. The matrix shape itself was
     /// validated at upload time (the stored parameters and dimensions are
     /// pinned by [`GpuEncryptedMatrix`]); the batch-specific work here is
@@ -1546,63 +1461,6 @@ const fn check_arena_capacity(dest_words: usize, required: usize) -> Result<(), 
     }
 }
 
-/// Maps the workspace-growth failure onto its GPU equivalent. Only
-/// [`ProtocolError::Capacity`] is reachable from [`AnswerWorkspace::reserve_words`],
-/// and it maps losslessly; the catch-all arm keeps the conversion total
-/// and fail-closed.
-fn map_capacity_error(error: ProtocolError) -> GpuError {
-    match error {
-        ProtocolError::Capacity {
-            required,
-            available,
-        } => GpuError::Capacity {
-            required,
-            available,
-        },
-        other => GpuError::from(other),
-    }
-}
-
-/// Splits a filled query-major arena prefix into one owned
-/// [`AnswerMatrix`] per query — the temporary conversion the legacy
-/// allocating adapters run over the into-API's output.
-///
-/// `shape` must be the shape the arena was validated and filled with, so
-/// the arena length is checked against it only fail-closed. The split
-/// allocates one `Vec` per query, which is exactly the allocation profile
-/// the old pre-arena path had.
-fn owned_answers<const MODULUS: u32>(
-    arena: &[FieldElement<MODULUS>],
-    queries: &[EncryptedQuery<MODULUS>],
-    shape: &crate::answer::AnswerShape,
-) -> Result<Vec<AnswerMatrix<MODULUS>>, GpuError> {
-    let answer_words = shape.answer_words().ok_or(GpuError::DimensionOverflow)?;
-    let expected = queries
-        .len()
-        .checked_mul(answer_words)
-        .ok_or(GpuError::DimensionOverflow)?;
-    if arena.len() != expected {
-        return Err(GpuError::LengthMismatch {
-            name: "answer arena",
-            expected,
-            actual: arena.len(),
-        });
-    }
-    queries
-        .iter()
-        .zip(arena.chunks_exact(answer_words))
-        .map(|(query, values)| {
-            Ok(AnswerMatrix::from_parts(
-                shape.instance_id(),
-                query.query_id(),
-                values.to_vec(),
-                shape.rows(),
-                shape.blocks(),
-            ))
-        })
-        .collect()
-}
-
 /// Wraps one little-endian staged answer word as a canonical field
 /// element, rejecting a corrupt word precisely.
 pub(crate) fn staged_answer_word<const MODULUS: u32>(
@@ -1681,7 +1539,7 @@ pub(crate) fn byte_len_of_words(words: u32) -> wgpu::BufferAddress {
 mod tests {
     use super::{
         ANSWER_WGSL, MAX_ANSWER_WORDS, MAX_WORKGROUPS_PER_DIMENSION, WORKGROUP_SIZE_USIZE,
-        check_arena_capacity, dispatch_grid, owned_answers, reconstruct_bytes_into,
+        check_arena_capacity, dispatch_grid, reconstruct_bytes_into,
     };
     use crate::answer::AnswerShape;
     use crate::params::EmvpParams;
@@ -1763,24 +1621,27 @@ mod tests {
         for (slot, expected_element) in dest.iter().zip(expected) {
             assert_eq!(slot, &expected_element);
         }
-        // The owned split the legacy adapter performs over the filled arena
-        // pairs the same elements with the batch's public identifiers.
+        // The filled arena pairs with the batch's public identifiers
+        // through the shared answers view, exactly as the execute API
+        // returns it.
         let queries = host_queries();
-        let answers =
-            owned_answers(&dest, &queries, &host_shape()).expect("the fixture shape fits");
-        assert_eq!(answers.len(), 2);
+        let shape = host_shape();
+        let answers = super::Answers::from_arena(&dest, shape);
+        assert_eq!(answers.len(), dest.len());
         let expected_per_query: Vec<Vec<FieldElement<MODULUS>>> = [[17_u32, 39], [23, 53]]
             .iter()
             .map(|sums| sums.iter().map(|&sum| field.element_u32(sum)).collect())
             .collect();
-        for (answer, expected_values) in answers.iter().zip(&expected_per_query) {
-            assert_eq!(answer.values(), expected_values.as_slice());
+        for index in 0..queries.len() {
+            let answer = answers
+                .answer(&queries, index)
+                .expect("the fixture shape fits");
+            assert_eq!(answer.values(), expected_per_query[index].as_slice());
             assert_eq!(answer.rows(), 2);
             assert_eq!(answer.blocks(), 1);
             assert_eq!(answer.instance_id(), 7);
+            assert_eq!(answer.query_id(), queries[index].query_id());
         }
-        assert_eq!(answers[0].query_id(), 10);
-        assert_eq!(answers[1].query_id(), 11);
     }
 
     /// A device word at or above the modulus is not a canonical Montgomery
