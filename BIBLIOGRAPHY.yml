@@ -977,3 +977,36 @@ emvp-code:
   serial-number: "commit 856762f5925fe873bb5cbc0401ceb5a44568efa9"
   note: "Official companion code of the EMVP paper (`emvp2025`) and of the secret-key PIR paper (ePrint 2025/646), MIT-licensed, Go benchmarks driving native C++ libraries (NTT, Reed-Solomon, MVP). HEAD of `main` as of the access date; also used as a bibliographic comparison point."
 
+
+glibcmalloc:
+  type: Misc
+  title: "The GNU C Library Reference Manual: Malloc Tunable Parameters"
+  author: "Free Software Foundation"
+  organization: glibc
+  date: 2024
+  url: https://www.gnu.org/software/libc/manual/html_node/Malloc-Tunable-Parameters.html
+  note: "Documents the dynamic `mmap` threshold and trim threshold behavior behind the reconstruction page-fault churn diagnosed in the throughput dip: per-call 512 KiB answer vectors below the rising threshold are served by fresh `mmap`/`munmap` and faulted per 4 KiB page under `madvise` huge pages. The `MALLOC_MMAP_THRESHOLD_` and `MALLOC_TRIM_THRESHOLD_` environment variables pinning that behavior define the tuned-allocator baseline the workspace APIs are measured against; the plan-reserve-execute workspaces make the pinning unnecessary by keeping answer storage heap-resident."
+
+wgpu:
+  type: Misc
+  title: "wgpu: A cross-platform, safe, Rust graphics WebGPU implementation"
+  author: "The wgpu contributors"
+  organization: gfx-rs
+  date: 2026
+  url:
+    value: https://github.com/gfx-rs/wgpu
+    date: 2026-09-17
+  serial-number: "v30.0.1"
+  note: "Device abstraction backing `emvp`'s `gpu` feature (answer kernel dispatch, staging readback, packed multi-job flights). Its per-submit allocations (command encoders, bind groups, boxed map callbacks) and driver-side memory are outside the project's zero-allocation-after-reserve contract and are recorded separately by shape in the allocation measurements."
+
+allocationcounter:
+  type: Misc
+  title: "allocation-counter: count and measure allocations in Rust tests"
+  author: "Folkert de Vries"
+  organization: fork-bombe
+  date: 2026
+  url:
+    value: https://docs.rs/allocation-counter
+    date: 2026-09-17
+  serial-number: "v0.8.1"
+  note: "Thread-local counting global allocator used to pin the zero-project-allocation guarantees: CPU batch execute, engine execute, codec decode/encode cycles, and the client verification kernel assert `count_total == 0` on warmed, reserved workspaces, and the GPU benches print per-case allocation spot checks. Counting is thread-local, so measured sections pin the calling thread (serial tiers) and rayon worker, wgpu-internal, and driver allocations are reported as unmeasured."
