@@ -58,3 +58,8 @@ required-features = ["gpu"]
 name = "dispatch"
 harness = false
 required-features = ["gpu"]
+
+[[bench]]
+name = "multi_matrix"
+harness = false
+required-features = ["gpu"]
