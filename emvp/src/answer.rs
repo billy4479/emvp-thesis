@@ -620,7 +620,7 @@ pub fn execute_answer_batch<'ws, const MODULUS: u32, Q: QueryValues<MODULUS> + S
 /// output matches the serial tier exactly.
 #[expect(
     clippy::too_many_arguments,
-    reason = "the kernel mirrors fill_answer_batch's argument layout and adds the scratch pool"
+    reason = "the kernel mirrors fill_answer_batch_serial's argument layout and adds the scratch pool"
 )]
 fn fill_answer_batch_pooled<const MODULUS: u32, Q: QueryValues<MODULUS> + Sync>(
     matrix: &EncryptedMatrix<MODULUS>,

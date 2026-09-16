@@ -24,9 +24,9 @@
 //! # Answer production: plan → reserve → execute
 //!
 //! Every answer path — the CPU batch kernels, the GPU single-batch and
-//! packed flights, and the mixed [`engine`](answer_engine) surface —
-//! follows the same three-step contract instead of returning freshly
-//! allocated answers:
+//! packed flights, and the mixed [`AnswerEngine`] surface —
+//! follows the same three-step contract instead of returning
+//! freshly allocated answers:
 //!
 //! 1. **Plan**: validates the whole job set all-or-nothing and binds the
 //!    exact inputs by borrowing, so executing a plan against different
