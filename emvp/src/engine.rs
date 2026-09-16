@@ -11,6 +11,18 @@
 //! shrinks, and `execute` fills the caller's arena in place — CPU entries
 //! through the shared CPU row kernels, GPU entries through one packed
 //! device flight streaming into absolute arena offsets.
+//!
+//! The upload side mirrors the discipline with its own plan → reserve →
+//! copy → commit path ([`AnswerEngine::plan_prepare`],
+//! [`PrepareWorkspace::reserve`], [`PrepareWorkspace::copy`],
+//! [`AnswerEngine::prepare_committed`]): uploads enter as borrowed decoded
+//! views, the plan validates the whole set with no side effects, the
+//! staging workspace grows only through `reserve` and never shrinks,
+//! `copy` moves each matrix exactly once from the codec's workspace
+//! storage into an engine-owned slot, and `commit` runs the exact
+//! [`AnswerEngine::prepare_batch`] pipeline — one atomic budget
+//! reservation, the device uploads, the retained handles — over the moved
+//! slots.
 
 use std::collections::HashSet;
 use std::fmt;
@@ -31,7 +43,7 @@ use crate::gpu::packed::{PackedJob, PackedPlan, PackedStats, PackedTimings};
 #[cfg(feature = "gpu")]
 use crate::gpu::{GpuAnswerer, GpuEncryptedMatrix, GpuError};
 use crate::protocol::{fill_answer_batch_serial, fill_answer_row, validate_query_against_matrix};
-use crate::view::QueryValues;
+use crate::view::{EncryptedMatrixRef, MatrixValues, QueryValues};
 use crate::{
     AnswerMatrix, EmvpParams, EncryptedMatrix, EncryptedQuery, ProtocolError, answer_batch,
 };
@@ -253,6 +265,115 @@ impl From<PrepareBatchError> for PrepareMatrixError {
             PrepareBatchError::Empty => {
                 Self::InternalState("an empty batch reached the single-matrix preparation path")
             }
+            PrepareBatchError::InternalState(reason) => Self::InternalState(reason),
+        }
+    }
+}
+
+/// A failure in the plan → reserve → copy → commit upload path
+/// ([`AnswerEngine::plan_prepare`], [`PrepareWorkspace::reserve`],
+/// [`PrepareWorkspace::copy`], [`AnswerEngine::prepare_committed`]).
+///
+/// Every failure is all-or-nothing: planning has no side effects at all,
+/// copy validates every entry before writing any slot, and a failed
+/// commit returns no handle and leaves no residency reserved.
+#[derive(Debug)]
+#[non_exhaustive]
+pub enum PrepareError {
+    /// The upload set contained no matrices.
+    Empty,
+    /// The upload at `index`, or its protocol parameters, are malformed.
+    /// Nothing was reserved, copied, or uploaded.
+    Protocol {
+        /// The input position of the rejected upload.
+        index: usize,
+        /// The validation failure.
+        source: ProtocolError,
+    },
+    /// An input disagreed with the [`PreparePlan`] it was paired with, so
+    /// the plan no longer describes the inputs: the entry count, or the
+    /// parameters, instance identifier, shape, or value count of the
+    /// entry at `index` differ. Reported before any slot is written.
+    PlanMismatch {
+        /// The input position where the pairing stopped matching; for a
+        /// count mismatch, the first position the two collections fail to
+        /// pair.
+        index: usize,
+    },
+    /// A workspace slot could not hold its plan entry's words: the
+    /// allocator refused the slot's growth in
+    /// [`PrepareWorkspace::reserve`], or a copy or commit found a slot
+    /// sized for a different plan. Reported before any slot is written.
+    Capacity {
+        /// The required slot word count.
+        required: usize,
+        /// The available slot word count.
+        available: usize,
+    },
+    /// The whole set does not fit the engine's device residency budget.
+    /// Nothing was uploaded.
+    #[cfg(feature = "gpu")]
+    Budget(GpuError),
+    /// The upload at `index` failed its device upload. The handles already
+    /// prepared for earlier entries were discarded together with the whole
+    /// set's reservation.
+    #[cfg(feature = "gpu")]
+    Upload {
+        /// The input position of the failed upload.
+        index: usize,
+        /// The device failure.
+        source: GpuError,
+    },
+    /// An internal execution invariant was violated without producing
+    /// partial output.
+    InternalState(&'static str),
+}
+
+impl fmt::Display for PrepareError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Empty => formatter.write_str("matrix upload set is empty"),
+            Self::Protocol { index, source } => write!(formatter, "upload {index}: {source}"),
+            Self::PlanMismatch { index } => write!(
+                formatter,
+                "upload {index} disagrees with the prepare plan it was paired with"
+            ),
+            Self::Capacity {
+                required,
+                available,
+            } => write!(
+                formatter,
+                "prepare workspace slot holds {available} words but the plan needs {required}"
+            ),
+            #[cfg(feature = "gpu")]
+            Self::Budget(error) => error.fmt(formatter),
+            #[cfg(feature = "gpu")]
+            Self::Upload { index, source } => write!(formatter, "upload {index}: {source}"),
+            Self::InternalState(reason) => write!(formatter, "answer engine state error: {reason}"),
+        }
+    }
+}
+
+impl std::error::Error for PrepareError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Protocol { source, .. } => Some(source),
+            #[cfg(feature = "gpu")]
+            Self::Budget(error) | Self::Upload { source: error, .. } => Some(error),
+            _ => None,
+        }
+    }
+}
+
+impl From<PrepareBatchError> for PrepareError {
+    fn from(error: PrepareBatchError) -> Self {
+        match error {
+            PrepareBatchError::Empty => Self::Empty,
+            PrepareBatchError::Protocol { index, source } => Self::Protocol { index, source },
+            #[cfg(feature = "gpu")]
+            PrepareBatchError::Budget(source) => Self::Budget(source),
+            #[cfg(feature = "gpu")]
+            PrepareBatchError::Upload { index, source } => Self::Upload { index, source },
             PrepareBatchError::InternalState(reason) => Self::InternalState(reason),
         }
     }
@@ -771,6 +892,315 @@ impl<'ws, const MODULUS: u32, Q: QueryValues<MODULUS>> EngineAnswers<'ws, '_, MO
     }
 }
 
+/// A borrowed upload candidate for the plan → reserve → copy → commit
+/// upload path: the protocol parameters plus a borrowed encrypted matrix
+/// view.
+///
+/// Like [`AnswerJob`] on the answer side, this type lets the engine read
+/// straight from the codec's decoded workspace storage: planning
+/// validates the view, copying moves its values exactly once into
+/// engine-owned storage, and no owned [`EncryptedMatrix`] is ever built
+/// just to stage an upload.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct UploadRef<'a, const MODULUS: u32> {
+    /// The protocol parameters the matrix was encoded under.
+    pub params: EmvpParams,
+    /// The borrowed encrypted matrix.
+    pub matrix: EncryptedMatrixRef<'a, MODULUS>,
+}
+
+impl<'a, const MODULUS: u32> UploadRef<'a, MODULUS> {
+    /// Bundles parameters and a borrowed matrix view into one upload
+    /// candidate.
+    #[must_use]
+    pub const fn new(params: EmvpParams, matrix: EncryptedMatrixRef<'a, MODULUS>) -> Self {
+        Self { params, matrix }
+    }
+}
+
+/// The validated facts of one entry in a [`PreparePlan`].
+///
+/// Everything [`AnswerEngine::prepare_committed`] needs to rebuild the
+/// owned matrix from its workspace slot and retain it under the right
+/// parameters, recorded once at plan time.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PrepareEntry {
+    params: EmvpParams,
+    instance_id: u128,
+    rows: usize,
+    columns: usize,
+    words: usize,
+}
+
+impl PrepareEntry {
+    /// The validated protocol parameters of the entry.
+    #[must_use]
+    pub const fn params(&self) -> EmvpParams {
+        self.params
+    }
+
+    /// The public matrix-instance identifier of the entry.
+    #[must_use]
+    pub const fn instance_id(&self) -> u128 {
+        self.instance_id
+    }
+
+    /// The validated row count of the entry.
+    #[must_use]
+    pub const fn rows(&self) -> usize {
+        self.rows
+    }
+
+    /// The validated column count of the entry (`n = 2k`).
+    #[must_use]
+    pub const fn columns(&self) -> usize {
+        self.columns
+    }
+
+    /// The entry's field-element word count `rows * n`: the exact slot
+    /// size [`PrepareWorkspace::reserve`] provisions and
+    /// [`PrepareWorkspace::copy`] fills.
+    #[must_use]
+    pub const fn words(&self) -> usize {
+        self.words
+    }
+}
+
+/// A fully validated upload plan for the plan → reserve → copy → commit
+/// upload path.
+///
+/// [`AnswerEngine::plan_prepare`] runs the exact shape validation
+/// [`AnswerEngine::prepare_batch`] applies over borrowed views and
+/// records, per entry, the facts commit needs — with no device or memory
+/// side effects. The plan holds only validated facts and no borrows, so
+/// it can be reserved, copied against, and committed later, including
+/// from another task, provided the copy step is given the same uploads:
+/// copy re-checks every entry against the plan, so a copied workspace
+/// always commits. The plan keeps the input order.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PreparePlan {
+    entries: Vec<PrepareEntry>,
+    total_words: usize,
+}
+
+impl PreparePlan {
+    /// The number of planned entries.
+    #[must_use]
+    pub const fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// Whether the plan has no entries; [`AnswerEngine::plan_prepare`]
+    /// rejects empty upload sets, so a committed plan is never empty.
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    /// The exact field-element word count of the whole set: the sum of
+    /// every entry's `rows * n`.
+    #[must_use]
+    pub const fn total_words(&self) -> usize {
+        self.total_words
+    }
+
+    /// The device residency the set occupies: four bytes per field word,
+    /// `None` when that overflows `u64`.
+    #[must_use]
+    pub fn bytes(&self) -> Option<u64> {
+        residency_bytes(self.total_words)
+    }
+
+    /// The `index`th planned entry, or `None` when out of range.
+    #[must_use]
+    pub fn entry(&self, index: usize) -> Option<&PrepareEntry> {
+        self.entries.get(index)
+    }
+
+    /// Iterates the planned entries in input order.
+    pub fn iter(&self) -> std::slice::Iter<'_, PrepareEntry> {
+        self.entries.iter()
+    }
+}
+
+impl<'a> IntoIterator for &'a PreparePlan {
+    type Item = &'a PrepareEntry;
+    type IntoIter = std::slice::Iter<'a, PrepareEntry>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.entries.iter()
+    }
+}
+
+/// Engine-owned staging slots for the plan → reserve → copy → commit
+/// upload path.
+///
+/// The workspace holds one slot per planned matrix. [`Self::reserve`] is
+/// its only growth point: each slot is grown to exactly its plan entry's
+/// word count with [`Vec::try_reserve_exact`] so allocation failure is an
+/// error instead of an abort, and a slot whose capacity already fits its
+/// entry is reused untouched in storage — capacity never shrinks, so the
+/// workspace keeps the peak words a server actually stages. [`Self::copy`]
+/// then overwrites each slot in place with exactly one slice copy from
+/// the upload's borrowed view, with zero allocation, and
+/// [`AnswerEngine::prepare_committed`] consumes the workspace, moving each
+/// slot into its engine-owned [`EncryptedMatrix`] without touching the
+/// values again.
+#[derive(Debug)]
+pub struct PrepareWorkspace<const MODULUS: u32> {
+    slots: Vec<Vec<FieldElement<MODULUS>>>,
+}
+
+impl<const MODULUS: u32> Default for PrepareWorkspace<MODULUS> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<const MODULUS: u32> PrepareWorkspace<MODULUS> {
+    /// Creates an empty workspace.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self { slots: Vec::new() }
+    }
+
+    /// Grows the workspace so every entry of `plan` has a slot of exactly
+    /// the entry's word count, and never shrinks a slot's capacity.
+    ///
+    /// This is the only growth point of the workspace: each slot's growth
+    /// is requested with [`Vec::try_reserve_exact`] so allocation failure
+    /// is an error instead of an abort, and the slot is then resized to
+    /// the entry's words with zero elements so the copy step can overwrite
+    /// it in place. A slot whose capacity already fits its entry is reused
+    /// with its storage, pointer, and capacity untouched — only its length
+    /// is re-pinned to the entry's words — so re-reserving a smaller plan
+    /// keeps the high-water capacity of the larger one, and a later
+    /// larger plan may still grow individual slots or add new ones.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PrepareError::Capacity`] when the allocator refuses a
+    /// slot's growth or a new slot's allocation, naming the entry's
+    /// requirement and the words the workspace held when refused.
+    pub fn reserve(&mut self, plan: &PreparePlan) -> Result<(), PrepareError> {
+        let zero = PrimeField::<MODULUS>::new().element_u32(0);
+        for (index, entry) in plan.entries.iter().enumerate() {
+            let words = entry.words;
+            if index >= self.slots.len() {
+                let available = self.capacity_words();
+                let deficit = index + 1 - self.slots.len();
+                self.slots
+                    .try_reserve_exact(deficit)
+                    .map_err(|_allocation_failure| PrepareError::Capacity {
+                        required: words,
+                        available,
+                    })?;
+                self.slots.push(Vec::new());
+            }
+            let Some(slot) = self.slots.get_mut(index) else {
+                return Err(PrepareError::InternalState(
+                    "the workspace lost a slot it just reserved",
+                ));
+            };
+            if slot.capacity() < words {
+                let available = slot.capacity();
+                // `slot.len() <= slot.capacity() < words`, so the deficit
+                // never underflows.
+                let missing = words - slot.len();
+                slot.try_reserve_exact(missing)
+                    .map_err(|_allocation_failure| PrepareError::Capacity {
+                        required: words,
+                        available,
+                    })?;
+            }
+            slot.resize(words, zero);
+        }
+        Ok(())
+    }
+
+    /// The total slot capacity in words: the high-water mark of every
+    /// successful [`Self::reserve`].
+    #[must_use]
+    pub fn capacity_words(&self) -> usize {
+        self.slots.iter().map(Vec::capacity).sum()
+    }
+
+    /// Copies every upload's values into its plan slot, without
+    /// allocating.
+    ///
+    /// The copy step of the upload path. It validates first — before any
+    /// slot is written — that the uploads still pair with the plan: the
+    /// entry counts agree, every slot is sized for its entry, and per
+    /// entry the parameters, instance identifier, rows, columns, and
+    /// value count match the plan. Each slot is then overwritten in place
+    /// with exactly one slice copy from the upload's borrowed view; no
+    /// allocation happens, since [`Self::reserve`] sized the slots.
+    ///
+    /// The per-entry agreement check is the same shape validation
+    /// [`AnswerEngine::plan_prepare`] ran, so a copied workspace always
+    /// commits.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PrepareError::PlanMismatch`] when the uploads disagree
+    /// with the plan and [`PrepareError::Capacity`] when a slot does not
+    /// fit its entry — reserve the workspace for the plan first. Nothing
+    /// is written on error.
+    pub fn copy(
+        &mut self,
+        plan: &PreparePlan,
+        uploads: &[UploadRef<MODULUS>],
+    ) -> Result<(), PrepareError> {
+        if uploads.len() != plan.entries.len() {
+            return Err(PrepareError::PlanMismatch {
+                index: uploads.len().min(plan.entries.len()),
+            });
+        }
+        if self.slots.len() < plan.entries.len() {
+            return Err(PrepareError::PlanMismatch {
+                index: self.slots.len(),
+            });
+        }
+        for (index, (entry, upload)) in plan.entries.iter().zip(uploads).enumerate() {
+            let agrees = upload.params == entry.params
+                && upload.matrix.instance_id() == entry.instance_id
+                && upload.matrix.rows() == entry.rows
+                && upload.matrix.columns() == entry.columns
+                && upload.matrix.values().len() == entry.words;
+            if !agrees {
+                return Err(PrepareError::PlanMismatch { index });
+            }
+            let Some(slot) = self.slots.get(index) else {
+                return Err(PrepareError::InternalState(
+                    "the workspace lost a slot copy validated",
+                ));
+            };
+            if slot.len() != entry.words {
+                return Err(PrepareError::Capacity {
+                    required: entry.words,
+                    available: slot.len(),
+                });
+            }
+        }
+        for ((_entry, upload), slot) in plan.entries.iter().zip(uploads).zip(&mut self.slots) {
+            slot.copy_from_slice(upload.matrix.values());
+        }
+        Ok(())
+    }
+
+    /// Releases the workspace and returns the freed slot capacity in
+    /// words.
+    ///
+    /// The workspace is also released through [`Drop`]; this form reports
+    /// the freed capacity explicitly. A workspace consumed by
+    /// [`AnswerEngine::prepare_committed`] releases nothing here: its
+    /// slots moved into the committed matrices.
+    #[must_use]
+    pub fn release(self) -> usize {
+        self.capacity_words()
+    }
+}
+
 impl<const MODULUS: u32> AnswerEngine<MODULUS> {
     /// Creates an engine that evaluates every matrix on the CPU.
     #[must_use]
@@ -956,6 +1386,118 @@ impl<const MODULUS: u32> AnswerEngine<MODULUS> {
             });
         }
         Ok(prepared)
+    }
+
+    /// Validates a whole upload set and plans its retention without
+    /// committing anything.
+    ///
+    /// The plan step of the plan → reserve → copy → commit upload path.
+    /// It runs the exact shape validation [`Self::prepare_batch`]
+    /// applies — parameter dimensions, width `n`, positive rows, and the
+    /// exact row-major value count — over borrowed decoded views, totals
+    /// the set's field words, and records per entry the facts
+    /// [`Self::prepare_committed`] needs to rebuild the owned matrix.
+    /// Planning has no device or memory side effects: no budget is
+    /// reserved, no workspace is touched, and no device work happens; the
+    /// plan itself is the only allocation. It holds no borrows, so it can
+    /// be reserved against and committed later, including from another
+    /// task, as long as the copy step is given the same uploads.
+    ///
+    /// The returned plan keeps the input order.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PrepareError::Empty`] for an empty upload set or
+    /// [`PrepareError::Protocol`] with the input index of the first
+    /// malformed upload. Nothing else can fail and nothing was staged.
+    pub fn plan_prepare<'u, 'v, I>(&self, uploads: I) -> Result<PreparePlan, PrepareError>
+    where
+        I: IntoIterator<Item = &'u UploadRef<'v, MODULUS>>,
+        'v: 'u,
+    {
+        let mut entries = Vec::new();
+        let mut total_words = 0_usize;
+        for (index, upload) in uploads.into_iter().enumerate() {
+            let words = validate_matrix_shape(&upload.params, &upload.matrix)
+                .map_err(|source| PrepareError::Protocol { index, source })?;
+            total_words = total_words
+                .checked_add(words)
+                .ok_or(PrepareError::Protocol {
+                    index,
+                    source: ProtocolError::DimensionOverflow,
+                })?;
+            entries.push(PrepareEntry {
+                params: upload.params,
+                instance_id: upload.matrix.instance_id(),
+                rows: upload.matrix.rows(),
+                columns: upload.matrix.columns(),
+                words,
+            });
+        }
+        if entries.is_empty() {
+            return Err(PrepareError::Empty);
+        }
+        Ok(PreparePlan {
+            entries,
+            total_words,
+        })
+    }
+
+    /// Commits a copied workspace into retained prepared matrices.
+    ///
+    /// The commit step of the plan → reserve → copy → commit upload path —
+    /// the engine-side endpoint of the server's upload. It consumes the
+    /// workspace, moving each slot's storage — the single copy
+    /// [`PrepareWorkspace::copy`] staged from the codec's decoded views —
+    /// into an owned [`EncryptedMatrix`], then runs exactly the
+    /// [`Self::prepare_batch`] pipeline: a cheap re-verification of every
+    /// matrix, the whole set's residency reserved with one atomic budget
+    /// transition, the device uploads, and the returned shared handles.
+    /// On any failure no handle is returned and the entire reservation is
+    /// released, exactly as for [`Self::prepare_batch`]; the workspace is
+    /// consumed either way.
+    ///
+    /// The returned handles keep the plan's order — the input order of
+    /// [`Self::plan_prepare`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PrepareError::PlanMismatch`] when the workspace does not
+    /// cover the plan and [`PrepareError::Capacity`] when a slot is not
+    /// sized for its entry; otherwise the same failures as
+    /// [`Self::prepare_batch`], mapped onto [`PrepareError::Protocol`],
+    /// [`PrepareError::Budget`], and [`PrepareError::Upload`].
+    pub fn prepare_committed(
+        &self,
+        plan: &PreparePlan,
+        workspace: PrepareWorkspace<MODULUS>,
+    ) -> Result<Vec<PreparedMatrix<MODULUS>>, PrepareError> {
+        if plan.entries.is_empty() {
+            return Err(PrepareError::Empty);
+        }
+        // Rebuild the owned set by pure moves: each slot Vec becomes its
+        // matrix's storage, and any slot not sized for its entry is
+        // rejected before the first handle exists.
+        let mut matrices = Vec::with_capacity(plan.entries.len());
+        for (index, (entry, slot)) in plan.entries.iter().zip(workspace.slots).enumerate() {
+            if slot.len() != entry.words {
+                return Err(PrepareError::Capacity {
+                    required: entry.words,
+                    available: slot.len(),
+                });
+            }
+            let matrix =
+                EncryptedMatrix::from_parts(entry.instance_id, entry.rows, entry.columns, slot)
+                    .map_err(|source| PrepareError::Protocol { index, source })?;
+            matrices.push((entry.params, matrix));
+        }
+        if matrices.len() != plan.entries.len() {
+            return Err(PrepareError::PlanMismatch {
+                index: matrices.len(),
+            });
+        }
+        self.prepare_batch_core(matrices)
+            .map_err(PrepareError::from)
     }
 
     /// Whether this engine holds a live compute device, so prepared
@@ -1304,10 +1846,15 @@ impl<const MODULUS: u32> AnswerEngine<MODULUS> {
 /// count `rows * n`.
 ///
 /// This is the shape contract of both the CPU answer path and the device
-/// upload path, applied before any budget or device work.
-fn validate_matrix_shape<const MODULUS: u32>(
+/// upload path, applied before any budget or device work. It accepts any
+/// borrowed or owned matrix representation implementing
+/// [`MatrixValues`], so the owned [`EncryptedMatrix`] of
+/// [`AnswerEngine::prepare_batch`] and the [`EncryptedMatrixRef`] views
+/// of [`AnswerEngine::plan_prepare`] share one contract and cannot drift
+/// apart.
+fn validate_matrix_shape<const MODULUS: u32, M: MatrixValues<MODULUS>>(
     params: &EmvpParams,
-    matrix: &EncryptedMatrix<MODULUS>,
+    matrix: &M,
 ) -> Result<usize, ProtocolError> {
     params.validate_dimensions()?;
     let n = params.n()?;
@@ -1765,6 +2312,7 @@ mod tests {
     use prime_field_layer::PrimeField;
 
     use super::*;
+    use crate::params::ParamsError;
     use crate::view::EncryptedQueryRef;
 
     const MODULUS: u32 = 1_073_479_681;
@@ -2554,5 +3102,403 @@ mod tests {
             &cpu_queries,
             &core_reference,
         );
+    }
+
+    /// A well-formed matrix whose values encode their position and
+    /// instance, so a staged copy is distinguishable from a zeroed or
+    /// stale slot.
+    fn pattern_matrix(instance_id: u128, rows: usize) -> EncryptedMatrix<MODULUS> {
+        let field = PrimeField::<MODULUS>::new();
+        let values: Vec<_> = (0..rows * 16)
+            .map(|index| {
+                let rotated = u128::try_from(index).unwrap() * 7 + instance_id;
+                field.element_u32(u32::try_from(rotated % 1009 + 1).unwrap())
+            })
+            .collect();
+        EncryptedMatrix::from_parts(instance_id, rows, 16, values).unwrap()
+    }
+
+    /// A borrowed upload candidate over an owned host matrix.
+    fn upload_ref(matrix: &EncryptedMatrix<MODULUS>, params: EmvpParams) -> UploadRef<'_, MODULUS> {
+        UploadRef::new(params, matrix.as_ref())
+    }
+
+    #[test]
+    fn plan_prepare_rejects_invalid_uploads_and_plans_mixed_sizes() {
+        let engine = AnswerEngine::cpu();
+        // An empty upload set is rejected whole.
+        assert!(matches!(
+            engine.plan_prepare(&Vec::<UploadRef<MODULUS>>::new()),
+            Err(PrepareError::Empty)
+        ));
+        let host = matrix(11, 2);
+        // Impossible parameter dimensions.
+        let bad_params = EmvpParams { ell: 0, ..PARAMS };
+        let bad = [upload_ref(&host, bad_params)];
+        assert!(matches!(
+            engine.plan_prepare(&bad),
+            Err(PrepareError::Protocol {
+                index: 0,
+                source: ProtocolError::Params(ParamsError::ZeroEll)
+            })
+        ));
+        // A width that disagrees with the set's parameters, leading and
+        // late, is always indexed at its input position.
+        let narrow_host = narrow_matrix(12);
+        let leading = [upload_ref(&narrow_host, PARAMS), upload_ref(&host, PARAMS)];
+        assert!(matches!(
+            engine.plan_prepare(&leading),
+            Err(PrepareError::Protocol { index: 0, .. })
+        ));
+        let late = [upload_ref(&host, PARAMS), upload_ref(&narrow_host, PARAMS)];
+        assert!(matches!(
+            engine.plan_prepare(&late),
+            Err(PrepareError::Protocol { index: 1, .. })
+        ));
+        // Zero rows and a short value buffer are reachable only through
+        // the crate's unchecked view path; the plan rejects them too.
+        let field = PrimeField::<MODULUS>::new();
+        let values = [field.element_u32(1); 32];
+        let zero_rows = [UploadRef::new(
+            PARAMS,
+            EncryptedMatrixRef::new_unchecked(13, 0, 16, &values),
+        )];
+        assert!(matches!(
+            engine.plan_prepare(&zero_rows),
+            Err(PrepareError::Protocol {
+                index: 0,
+                source: ProtocolError::LengthMismatch {
+                    name: "matrix rows",
+                    ..
+                }
+            })
+        ));
+        let short = [UploadRef::new(
+            PARAMS,
+            EncryptedMatrixRef::new_unchecked(13, 2, 16, &values[..20]),
+        )];
+        assert!(matches!(
+            engine.plan_prepare(&short),
+            Err(PrepareError::Protocol {
+                index: 0,
+                source: ProtocolError::LengthMismatch {
+                    name: "encrypted matrix values",
+                    expected: 32,
+                    actual: 20
+                }
+            })
+        ));
+        // A valid mixed-size set plans with exact per-entry facts.
+        let first_host = matrix(21, 2);
+        let second_host = matrix(22, 512);
+        let third_host = matrix(23, 3);
+        let uploads = [
+            upload_ref(&first_host, PARAMS),
+            upload_ref(&second_host, PARAMS),
+            upload_ref(&third_host, PARAMS),
+        ];
+        let plan = engine.plan_prepare(&uploads).unwrap();
+        assert_eq!(plan.len(), 3);
+        assert!(!plan.is_empty());
+        assert_eq!(plan.iter().count(), 3);
+        assert_eq!(plan.total_words(), (2 + 512 + 3) * 16);
+        let total = plan.total_words();
+        assert_eq!(plan.bytes(), Some(u64::try_from(total).unwrap() * 4));
+        for (index, rows) in [2_usize, 512, 3].into_iter().enumerate() {
+            let entry = plan.entry(index).unwrap();
+            assert_eq!(entry.params(), PARAMS);
+            assert_eq!(entry.instance_id(), u128::try_from(21 + index).unwrap());
+            assert_eq!(entry.rows(), rows);
+            assert_eq!(entry.columns(), 16);
+            assert_eq!(entry.words(), rows * 16);
+        }
+        assert!(plan.entry(3).is_none());
+    }
+
+    #[test]
+    fn copy_round_trips_views_and_a_mismatch_leaves_slots_intact() {
+        let engine = AnswerEngine::cpu();
+        let first_host = pattern_matrix(11, 2);
+        let second_host = pattern_matrix(22, 3);
+        let uploads = [
+            upload_ref(&first_host, PARAMS),
+            upload_ref(&second_host, PARAMS),
+        ];
+        let plan = engine.plan_prepare(&uploads).unwrap();
+        let mut workspace = PrepareWorkspace::new();
+        // Copying before any reserve is a pairing failure, not a write.
+        assert!(matches!(
+            workspace.copy(&plan, &uploads),
+            Err(PrepareError::PlanMismatch { index: 0 })
+        ));
+        workspace.reserve(&plan).unwrap();
+        assert_eq!(workspace.capacity_words(), plan.total_words());
+        // Poison every slot; a rejected copy must not touch a single word.
+        let sentinel = PrimeField::<MODULUS>::new().element_u32(MODULUS - 1);
+        for slot in &mut workspace.slots {
+            for value in slot.iter_mut() {
+                *value = sentinel;
+            }
+        }
+        // A wrong instance identifier at entry 1.
+        let wrong_instance = pattern_matrix(99, 3);
+        let mismatched = [uploads[0], upload_ref(&wrong_instance, PARAMS)];
+        assert!(matches!(
+            workspace.copy(&plan, &mismatched),
+            Err(PrepareError::PlanMismatch { index: 1 })
+        ));
+        // A wrong shape at entry 1.
+        let wrong_shape = pattern_matrix(22, 4);
+        let mismatched = [uploads[0], upload_ref(&wrong_shape, PARAMS)];
+        assert!(matches!(
+            workspace.copy(&plan, &mismatched),
+            Err(PrepareError::PlanMismatch { index: 1 })
+        ));
+        // A wrong entry count.
+        assert!(matches!(
+            workspace.copy(&plan, &uploads[..1]),
+            Err(PrepareError::PlanMismatch { index: 1 })
+        ));
+        // A workspace whose slots are sized for another plan.
+        let mut foreign = PrepareWorkspace::new();
+        foreign.slots.push(vec![sentinel; 32]);
+        foreign.slots.push(vec![sentinel; 3]);
+        assert!(matches!(
+            foreign.copy(&plan, &uploads),
+            Err(PrepareError::Capacity {
+                required: 48,
+                available: 3
+            })
+        ));
+        // Every rejected copy left the poison untouched.
+        for slot in &workspace.slots {
+            assert!(slot.iter().all(|value| *value == sentinel));
+        }
+        // The good copy overwrites every slot with exactly the view's
+        // values, in input order.
+        workspace.copy(&plan, &uploads).unwrap();
+        assert_eq!(workspace.slots[0], first_host.values());
+        assert_eq!(workspace.slots[1], second_host.values());
+    }
+
+    #[test]
+    fn reserve_reuses_slots_across_plans_and_release_reports_capacity() {
+        let engine = AnswerEngine::cpu();
+        let big_host = pattern_matrix(11, 512);
+        let small_host = pattern_matrix(22, 2);
+        let big_plan = engine
+            .plan_prepare(&[upload_ref(&big_host, PARAMS)])
+            .unwrap();
+        let small_plan = engine
+            .plan_prepare(&[upload_ref(&small_host, PARAMS)])
+            .unwrap();
+        let mut workspace = PrepareWorkspace::<MODULUS>::new();
+        assert_eq!(workspace.capacity_words(), 0);
+        workspace.reserve(&big_plan).unwrap();
+        let peak = workspace.capacity_words();
+        assert_eq!(peak, big_plan.total_words());
+        let slot = workspace.slots[0].as_ptr();
+        // A smaller plan reuses the slot: same storage, same capacity,
+        // length re-pinned to the smaller words.
+        workspace.reserve(&small_plan).unwrap();
+        assert_eq!(workspace.capacity_words(), peak);
+        assert_eq!(workspace.slots[0].as_ptr(), slot);
+        assert_eq!(workspace.slots[0].len(), small_plan.total_words());
+        // Growing back to the big plan never needs new capacity.
+        workspace.reserve(&big_plan).unwrap();
+        assert_eq!(workspace.capacity_words(), peak);
+        assert_eq!(workspace.slots[0].as_ptr(), slot);
+        assert_eq!(workspace.release(), peak);
+        // A multi-slot plan reports the sum of its slots' capacities.
+        let hosts = [
+            pattern_matrix(31, 2),
+            pattern_matrix(32, 3),
+            pattern_matrix(33, 4),
+        ];
+        let refs = [
+            upload_ref(&hosts[0], PARAMS),
+            upload_ref(&hosts[1], PARAMS),
+            upload_ref(&hosts[2], PARAMS),
+        ];
+        let multi_plan = engine.plan_prepare(&refs).unwrap();
+        let mut multi = PrepareWorkspace::<MODULUS>::new();
+        multi.reserve(&multi_plan).unwrap();
+        assert_eq!(multi.capacity_words(), multi_plan.total_words());
+        assert_eq!(multi.release(), multi_plan.total_words());
+    }
+
+    #[test]
+    fn prepare_committed_matches_prepare_batch_answers() {
+        let engine = AnswerEngine::cpu();
+        let first_host = pattern_matrix(11, 4);
+        let second_host = pattern_matrix(22, 2);
+        let uploads = [
+            upload_ref(&first_host, PARAMS),
+            upload_ref(&second_host, PARAMS),
+        ];
+        // The old owned path pins the reference handles and answers.
+        let expected = engine
+            .prepare_batch([(PARAMS, first_host.clone()), (PARAMS, second_host.clone())])
+            .unwrap();
+        let plan = engine.plan_prepare(&uploads).unwrap();
+        let mut workspace = PrepareWorkspace::new();
+        workspace.reserve(&plan).unwrap();
+        workspace.copy(&plan, &uploads).unwrap();
+        let committed = engine.prepare_committed(&plan, workspace).unwrap();
+        assert_eq!(committed.len(), 2);
+        assert_eq!(committed[0].inner.matrix.values(), first_host.values());
+        assert_eq!(committed[1].inner.matrix.values(), second_host.values());
+        assert_eq!(committed[0].inner.matrix.instance_id(), 11);
+        assert_eq!(committed[1].inner.matrix.instance_id(), 22);
+        // Answers through plan → reserve → execute on the committed
+        // handles must equal the old path's answers for the same queries.
+        let first_queries: Vec<_> = (0..3_u64).map(|index| query(11, 40 + index)).collect();
+        let second_queries = [query(22, 50)];
+        let committed_jobs = [
+            AnswerJob {
+                matrix: &committed[0],
+                queries: &first_queries,
+            },
+            AnswerJob {
+                matrix: &committed[1],
+                queries: &second_queries,
+            },
+        ];
+        let old_jobs = [
+            AnswerJob {
+                matrix: &expected[0],
+                queries: &first_queries,
+            },
+            AnswerJob {
+                matrix: &expected[1],
+                queries: &second_queries,
+            },
+        ];
+        let expected_answers = engine.answer_many(&old_jobs).unwrap();
+        let answer_plan = engine.plan(&committed_jobs).unwrap();
+        let mut answer_workspace = EngineWorkspace::new();
+        answer_workspace.reserve(&answer_plan).unwrap();
+        let (answers, report) = engine.execute(&answer_plan, &mut answer_workspace).unwrap();
+        assert_eq!(report.cpu_entries, 2);
+        assert_eq!(report.gpu_entries, 0);
+        for index in 0..answers.len() {
+            let view = answers.entry_answers(index).unwrap();
+            assert_view_matches(
+                &view,
+                committed_jobs[index].queries,
+                &expected_answers[index],
+            );
+        }
+    }
+
+    #[test]
+    fn prepare_committed_rejects_a_workspace_that_was_not_staged_for_the_plan() {
+        let engine = AnswerEngine::cpu();
+        let host = pattern_matrix(11, 2);
+        let uploads = [upload_ref(&host, PARAMS)];
+        let plan = engine.plan_prepare(&uploads).unwrap();
+        // An unreserved workspace does not cover the plan.
+        assert!(matches!(
+            engine.prepare_committed(&plan, PrepareWorkspace::new()),
+            Err(PrepareError::PlanMismatch { index: 0 })
+        ));
+        // A workspace reserved for a different plan has the wrong slot
+        // sizes and is rejected before any handle exists.
+        let other_host = pattern_matrix(22, 3);
+        let other_plan = engine
+            .plan_prepare(&[upload_ref(&other_host, PARAMS)])
+            .unwrap();
+        let mut workspace = PrepareWorkspace::new();
+        workspace.reserve(&other_plan).unwrap();
+        assert!(matches!(
+            engine.prepare_committed(&plan, workspace),
+            Err(PrepareError::Capacity {
+                required: 32,
+                available: 48
+            })
+        ));
+        // Both refusals left the engine working.
+        engine.prepare(PARAMS, matrix(33, 2)).unwrap();
+    }
+
+    /// The committed upload path on a real device: the whole-set budget
+    /// reservation, the per-handle release, and the answers match the old
+    /// [`AnswerEngine::prepare_batch`] pipeline. Requires a compute
+    /// adapter.
+    #[cfg(feature = "gpu")]
+    #[ignore = "requires a compute adapter"]
+    #[test]
+    fn committed_upload_matches_prepare_batch_on_device() {
+        let one = (2 * PARAMS.n().unwrap() * 4) as u64;
+        let engine = AnswerEngine::new(3 * one).unwrap();
+        if engine.gpu.is_none() {
+            eprintln!("gpu test skipped: no compute adapter");
+            return;
+        }
+        let hosts = [
+            pattern_matrix(41, 2),
+            pattern_matrix(42, 2),
+            pattern_matrix(43, 2),
+        ];
+        let uploads = [
+            upload_ref(&hosts[0], PARAMS),
+            upload_ref(&hosts[1], PARAMS),
+            upload_ref(&hosts[2], PARAMS),
+        ];
+        // The plan is exact about the residency its commit will ask the
+        // budget for, and planning and staging reserve nothing.
+        let plan = engine.plan_prepare(&uploads).unwrap();
+        assert_eq!(plan.bytes(), Some(3 * one));
+        let mut workspace = PrepareWorkspace::new();
+        workspace.reserve(&plan).unwrap();
+        workspace.copy(&plan, &uploads).unwrap();
+        assert_eq!(reserved_bytes(&engine), 0);
+        // The commit reserves the whole set with one transition, exactly
+        // as prepare_batch does.
+        let committed = engine.prepare_committed(&plan, workspace).unwrap();
+        assert_eq!(reserved_bytes(&engine), 3 * one);
+        // A further set is rejected whole; the resident set released
+        // nothing.
+        let mut another = PrepareWorkspace::new();
+        another.reserve(&plan).unwrap();
+        another.copy(&plan, &uploads).unwrap();
+        assert!(matches!(
+            engine.prepare_committed(&plan, another),
+            Err(PrepareError::Budget(GpuError::BudgetExceeded { .. }))
+        ));
+        assert_eq!(reserved_bytes(&engine), 3 * one);
+        // Dropping one handle releases exactly its own matrix's bytes.
+        let keep = committed[0].clone();
+        drop(committed);
+        assert_eq!(reserved_bytes(&engine), one);
+        drop(keep);
+        assert_eq!(reserved_bytes(&engine), 0);
+        // Committed answers equal the CPU reference answers.
+        let restaged = {
+            let mut workspace = PrepareWorkspace::new();
+            workspace.reserve(&plan).unwrap();
+            workspace.copy(&plan, &uploads).unwrap();
+            workspace
+        };
+        let committed = engine.prepare_committed(&plan, restaged).unwrap();
+        let query_sets: Vec<Vec<_>> = (0..3_usize)
+            .map(|index| {
+                let instance = u128::try_from(41 + index).unwrap();
+                vec![query(instance, 1), query(instance, 2)]
+            })
+            .collect();
+        let jobs: Vec<AnswerJob<'_, MODULUS>> = committed
+            .iter()
+            .zip(query_sets.iter())
+            .map(|(prepared, queries)| AnswerJob {
+                matrix: prepared,
+                queries: queries.as_slice(),
+            })
+            .collect();
+        let answers = engine.answer_many(&jobs).unwrap();
+        for (index, host) in hosts.iter().enumerate() {
+            let expected = answer_batch(&PARAMS, host, &query_sets[index]).unwrap();
+            assert_eq!(answers[index], expected);
+        }
     }
 }
