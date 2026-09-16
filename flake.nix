@@ -99,6 +99,8 @@
             version = "0.1.0";
             src = ./.;
             cargoLock.lockFile = ./Cargo.lock;
+
+            postPatch = "rm -rf .cargo";
           };
           handout = handoutDrv;
           default = app;

@@ -5,9 +5,13 @@ resolver = "3"
 
 [profile.release]
 debug = true
+lto = "fat"
+codegen-units = 1
 
 [profile.bench]
 debug = true
+lto = "fat"
+codegen-units = 1
 
 [workspace.dependencies]
 clap = { version = "4", features = ["derive"] }
