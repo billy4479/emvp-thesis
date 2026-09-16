@@ -1,6 +1,7 @@
 # EMVP Experiments
 
-This workspace is part of a larger project, read `../AGENTS.md` before continuing.
+This folder is a workspace for my thesis work, which is based on the EMVP paper which you can find in `../paper/2025-858.pdf`.
+My work is about implementing the protocol suggested in the paper in particular for LLM-scale matrix operations.
 
 ## Code style
 
@@ -22,10 +23,8 @@ When you need to implement a new feature or change something you should follow t
 - Implement your change.
 - Measure again against the baseline.
 
-Let a subagent do this benchmarking work, while you focus on the actual feature.
-
 ## References
 
 Always cite your references, so that I can use them in my bibliography.
 Keep track of them in `BIBLIOGRAPHY.yml`.
-This file uses the Hayagriva bibliography format, more information at https://raw.githubusercontent.com/typst/hayagriva/refs/heads/main/docs/file-format.md
+This file uses the Hayagriva bibliography format, more information at `https://raw.githubusercontent.com/typst/hayagriva/refs/heads/main/docs/file-format.md`
