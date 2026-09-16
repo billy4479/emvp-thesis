@@ -106,6 +106,7 @@ pub(crate) const fn is_parallel_work(work: usize, grid: usize, threads: usize) -
 /// dispatcher falls back to when the raw policy selects the GPU tier but no
 /// usable device exists. All dimension products saturate, so every `usize`
 /// input is accepted.
+#[must_use]
 pub const fn select_cpu_backend(
     queries: usize,
     rows: usize,

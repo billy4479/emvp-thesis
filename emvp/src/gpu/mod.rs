@@ -116,6 +116,8 @@ use crate::protocol::{
     validate_query_against_matrix,
 };
 
+pub(crate) mod packed;
+
 /// The answer compute kernel, compiled once per modulus.
 const ANSWER_WGSL: &str = include_str!("answer.wgsl");
 
@@ -193,6 +195,14 @@ pub enum GpuError {
         /// Which buffer allocation failed.
         context: &'static str,
     },
+    /// Long-lived matrix residency would exceed the engine's configured
+    /// device-memory budget.
+    BudgetExceeded {
+        /// Bytes required by this matrix.
+        requested_bytes: u64,
+        /// Bytes still available in the configured budget.
+        available_bytes: u64,
+    },
     /// A slice did not have the required length.
     LengthMismatch {
         /// The rejected slice.
@@ -263,6 +273,13 @@ impl fmt::Display for GpuError {
                     "device ran out of memory allocating the {context}"
                 )
             }
+            Self::BudgetExceeded {
+                requested_bytes,
+                available_bytes,
+            } => write!(
+                formatter,
+                "GPU matrix needs {requested_bytes} bytes but only {available_bytes} budget bytes remain"
+            ),
             Self::LengthMismatch {
                 name,
                 expected,
@@ -451,10 +468,11 @@ impl<const MODULUS: u32> fmt::Debug for GpuEncryptedMatrix<MODULUS> {
 /// rather than once per call. See [`AnswerScratch`] for the growth
 /// contract.
 pub struct GpuAnswerer {
-    device: wgpu::Device,
-    queue: wgpu::Queue,
+    pub(crate) device: wgpu::Device,
+    pub(crate) queue: wgpu::Queue,
     pipelines: Mutex<HashMap<u32, wgpu::ComputePipeline>>,
     scratch_pool: Mutex<Vec<AnswerScratch>>,
+    pub(crate) packed_scratch_pool: Mutex<Vec<packed::PackedScratch>>,
 }
 
 impl GpuAnswerer {
@@ -522,6 +540,7 @@ impl GpuAnswerer {
             queue,
             pipelines: Mutex::new(HashMap::new()),
             scratch_pool: Mutex::new(Vec::new()),
+            packed_scratch_pool: Mutex::new(Vec::new()),
         })
     }
 
@@ -720,7 +739,7 @@ impl GpuAnswerer {
 
     /// Returns the cached answer pipeline for this modulus, compiling it on
     /// first use.
-    fn answer_pipeline<const MODULUS: u32>(&self) -> wgpu::ComputePipeline {
+    pub(crate) fn answer_pipeline<const MODULUS: u32>(&self) -> wgpu::ComputePipeline {
         // Pipelines are immutable once built, so a panic in another thread
         // mid-insert cannot have corrupted anything: recover the guard. The
         // guard is dropped before compilation so concurrent batches are not
@@ -977,7 +996,7 @@ impl GpuAnswerer {
     /// [`wgpu::PollType::wait_indefinitely`] means the device has drained
     /// the given submission: the staged uploads, the dispatch, and the
     /// device-to-host copy.
-    fn wait_for_staged_slice(
+    pub(crate) fn wait_for_staged_slice(
         &self,
         staging_buffer: &wgpu::Buffer,
         byte_len: u64,
@@ -1163,7 +1182,7 @@ impl AnswerScratch {
 /// Locks `mutex`, recovering from poisoning: the guarded values (pipeline
 /// cache, buffer pool) are immutable or self-consistent between calls, so a
 /// panic in another thread mid-insert cannot have corrupted anything.
-fn lock_recovered<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+pub(crate) fn lock_recovered<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     match mutex.lock() {
         Ok(guard) => guard,
         Err(poisoned) => poisoned.into_inner(),
@@ -1194,7 +1213,7 @@ fn answer_buffer_descriptor(
 /// popped (buffer validation and its OOM reporting are synchronous), so the
 /// blocking wait never parks meaningfully; error scopes are thread-local,
 /// which every caller satisfies by creating and popping on one thread.
-fn create_buffer_checked(
+pub(crate) fn create_buffer_checked(
     device: &wgpu::Device,
     context: &'static str,
     descriptor: &wgpu::BufferDescriptor<'_>,
@@ -1305,7 +1324,9 @@ fn read_staged_answers<const MODULUS: u32>(
 
 /// Wraps one little-endian staged answer word as a canonical field
 /// element, rejecting a corrupt word precisely.
-fn staged_answer_word<const MODULUS: u32>(word: &[u8]) -> Result<FieldElement<MODULUS>, GpuError> {
+pub(crate) fn staged_answer_word<const MODULUS: u32>(
+    word: &[u8],
+) -> Result<FieldElement<MODULUS>, GpuError> {
     let raw = u32::from_le_bytes([word[0], word[1], word[2], word[3]]);
     FieldElement::<MODULUS>::try_from_raw(raw).map_err(|_field_error| GpuError::NonCanonicalWord {
         word: raw,
@@ -1382,7 +1403,7 @@ fn reconstruct_answers<const MODULUS: u32>(
 /// Callers must have capped `answer_words` at [`MAX_ANSWER_WORDS`], which
 /// keeps every issued thread index (including workgroup padding) inside
 /// `u32` and `workgroups_y` near its lower bound.
-fn dispatch_grid(answer_words: usize) -> Result<(u32, u32), GpuError> {
+pub(crate) fn dispatch_grid(answer_words: usize) -> Result<(u32, u32), GpuError> {
     let workgroup_total = answer_words.div_ceil(WORKGROUP_SIZE_USIZE);
     let workgroups_x = u32::try_from(workgroup_total)
         .map_err(|_conversion| GpuError::UploadTooLarge {
@@ -1401,7 +1422,7 @@ fn dispatch_grid(answer_words: usize) -> Result<(u32, u32), GpuError> {
 /// Callers must have validated the usize dimensions against the kernel's
 /// u32 index bounds before calling; the narrowings here fail closed with
 /// [`GpuError::DimensionOverflow`].
-fn dims_uniform_bytes(
+pub(crate) fn dims_uniform_bytes(
     n: usize,
     b: usize,
     s: usize,
@@ -1432,7 +1453,7 @@ const fn check_modulus<const MODULUS: u32>() -> Result<(), GpuError> {
 }
 
 /// Byte length of a buffer holding `words` u32 words.
-fn byte_len_of_words(words: u32) -> wgpu::BufferAddress {
+pub(crate) fn byte_len_of_words(words: u32) -> wgpu::BufferAddress {
     u64::from(words) * 4
 }
 
