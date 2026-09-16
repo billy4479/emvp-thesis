@@ -507,10 +507,13 @@ fn execute_into_reuses_the_workspace_across_calls() -> Result<(), GpuError> {
     let (first_ptr, first_shape, first_arena) = {
         let (first, _) =
             answerer.execute_answer_batch_into(&gpu_matrix, &queries, &mut workspace)?;
-        (first.arena().as_ptr(), first.shape(), first.arena().to_vec())
+        (
+            first.arena().as_ptr(),
+            first.shape(),
+            first.arena().to_vec(),
+        )
     };
-    let (second, _) =
-        answerer.execute_answer_batch_into(&gpu_matrix, &queries, &mut workspace)?;
+    let (second, _) = answerer.execute_answer_batch_into(&gpu_matrix, &queries, &mut workspace)?;
 
     // Identical answers over the identical storage prove the workspace was
     // reused: the second execute neither reallocated nor grew the arena.
