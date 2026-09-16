@@ -16,8 +16,9 @@ use emvp::{
 use emvp_network::v2::{
     EvaluateEntryInput, EvaluateWorkspace, ProductEntryInput, ProductsWorkspace,
     UploadAcceptedWorkspace, UploadMatrixView, UploadWorkspace, decode_evaluate, decode_products,
-    decode_upload, plan_evaluate, plan_products, plan_upload, write_evaluate as write_evaluate_views,
-    write_products as write_products_views, write_upload_matrices as write_upload_views,
+    decode_upload, plan_evaluate, plan_products, plan_upload,
+    write_evaluate as write_evaluate_views, write_products as write_products_views,
+    write_upload_matrices as write_upload_views,
 };
 use emvp_network::{
     ClientHello, CodecError, ErrorCode, ErrorResponse, EvaluateEntry, FrameKind, FrameReader,
@@ -109,11 +110,8 @@ fn encode_evaluate(entries: &[&EvaluateEntry]) -> Vec<u8> {
     let inputs: Vec<EvaluateEntryInput<'_>> = entries
         .iter()
         .map(|entry| {
-            let refs: Vec<EncryptedQueryRef<'_, PROTOCOL_MODULUS>> = entry
-                .queries
-                .iter()
-                .map(EncryptedQueryRef::from)
-                .collect();
+            let refs: Vec<EncryptedQueryRef<'_, PROTOCOL_MODULUS>> =
+                entry.queries.iter().map(EncryptedQueryRef::from).collect();
             EvaluateEntryInput {
                 matrix_id: entry.matrix_id,
                 queries: refs.leak(),
@@ -345,7 +343,10 @@ fn upload_matrices_has_golden_v2_bytes() {
     assert_eq!(view.instance_id, 42);
     assert_eq!(view.rows, 2);
     assert_eq!(view.columns, 2);
-    assert_eq!(view.values, [1, 2, 3, 4].map(|value| field.element_u32(value)));
+    assert_eq!(
+        view.values,
+        [1, 2, 3, 4].map(|value| field.element_u32(value))
+    );
 }
 
 #[test]
@@ -468,8 +469,14 @@ fn evaluate_round_trips_through_views() {
     assert_eq!(first.matrix_id(), 7);
     assert_eq!(first.query_width(), 16);
     assert_eq!(first.len(), 2);
-    assert_eq!(first.query(0).unwrap().values(), entries[0].queries[0].values());
-    assert_eq!(first.query(1).unwrap().values(), entries[0].queries[1].values());
+    assert_eq!(
+        first.query(0).unwrap().values(),
+        entries[0].queries[0].values()
+    );
+    assert_eq!(
+        first.query(1).unwrap().values(),
+        entries[0].queries[1].values()
+    );
     assert!(first.query(2).is_none());
     let second = views.get(1).unwrap();
     assert_eq!(second.matrix_id(), 9);
@@ -491,7 +498,9 @@ fn products_has_golden_v2_bytes() {
         answers: vec![AnswerMatrix::from_parts(
             42,
             3,
-            [5_u32, 6, 7, 8].map(|value| field.element_u32(value)).to_vec(),
+            [5_u32, 6, 7, 8]
+                .map(|value| field.element_u32(value))
+                .to_vec(),
             2,
             2,
         )],
@@ -534,7 +543,10 @@ fn products_has_golden_v2_bytes() {
     assert_eq!(answer.instance_id(), 42);
     assert_eq!(answer.rows(), 2);
     assert_eq!(answer.blocks(), 2);
-    assert_eq!(answer.values(), [5, 6, 7, 8].map(|value| field.element_u32(value)));
+    assert_eq!(
+        answer.values(),
+        [5, 6, 7, 8].map(|value| field.element_u32(value))
+    );
 }
 
 #[test]
@@ -542,13 +554,9 @@ fn products_round_trips_through_views() {
     let entries = vec![product_entry(), {
         let mut second = product_entry();
         second.matrix_id = 9;
-        second.answers.push(AnswerMatrix::from_parts(
-            42,
-            4,
-            values(8),
-            4,
-            2,
-        ));
+        second
+            .answers
+            .push(AnswerMatrix::from_parts(42, 4, values(8), 4, 2));
         second
     }];
     let borrowed: Vec<&ProductEntry> = entries.iter().collect();
@@ -973,7 +981,9 @@ fn read_field_slice_into_matches_read_field_slice() {
 
         let mut cursor = Cursor::new(&encoded);
         let mut frame = FrameReader::new(&mut cursor, encoded.len() as u64);
-        let allocated = frame.read_field_slice(u64::try_from(count).unwrap()).unwrap();
+        let allocated = frame
+            .read_field_slice(u64::try_from(count).unwrap())
+            .unwrap();
         assert_eq!(allocated, source);
 
         let zero = PrimeField::<PROTOCOL_MODULUS>::new().element_u32(0);
@@ -1038,11 +1048,17 @@ fn workspaces_reuse_capacity_across_frames() {
     decode(&big, &mut workspace);
     assert_eq!(workspace.capacity_fields(), grown_capacity);
     assert_eq!(workspace.views().get(0).unwrap().len(), 2);
-    assert_eq!(workspace.views().get(0).unwrap().query(0).unwrap().values(), values(16));
+    assert_eq!(
+        workspace.views().get(0).unwrap().query(0).unwrap().values(),
+        values(16)
+    );
     decode(&small, &mut workspace);
     assert_eq!(workspace.capacity_fields(), grown_capacity);
     assert_eq!(workspace.views().get(0).unwrap().len(), 1);
-    assert_eq!(workspace.views().get(0).unwrap().query(0).unwrap().values(), values(16));
+    assert_eq!(
+        workspace.views().get(0).unwrap().query(0).unwrap().values(),
+        values(16)
+    );
 
     // Products: one answer, then two.
     let one_answer = product_entry();
@@ -1067,7 +1083,13 @@ fn workspaces_reuse_capacity_across_frames() {
     assert_eq!(workspace.capacity_fields(), grown_capacity);
     assert_eq!(workspace.views().get(0).unwrap().len(), 2);
     assert_eq!(
-        workspace.views().get(0).unwrap().answer(1).unwrap().values(),
+        workspace
+            .views()
+            .get(0)
+            .unwrap()
+            .answer(1)
+            .unwrap()
+            .values(),
         values(8)
     );
     decode(&small, &mut workspace);

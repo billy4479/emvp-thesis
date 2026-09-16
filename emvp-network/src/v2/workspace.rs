@@ -26,11 +26,7 @@ fn zero_field() -> Field {
 
 /// Grows a vector's length and capacity to `len` if smaller, filling new
 /// slots with `fill`, and never shrinking.
-fn grow<T: Clone>(
-    vector: &mut Vec<T>,
-    len: usize,
-    fill: impl Fn() -> T,
-) -> Result<(), CodecError> {
+fn grow<T: Clone>(vector: &mut Vec<T>, len: usize, fill: impl Fn() -> T) -> Result<(), CodecError> {
     if vector.len() < len {
         vector
             .try_reserve_exact(len - vector.len())
@@ -134,8 +130,7 @@ impl UploadAcceptedWorkspace {
     pub fn reserve(&mut self, plan: &UploadAcceptedPlan) -> Result<(), CodecError> {
         grow_capacity(&mut self.identifiers, plan.identifiers.len())?;
         self.identifiers.clear();
-        self.identifiers
-            .extend_from_slice(&plan.identifiers);
+        self.identifiers.extend_from_slice(&plan.identifiers);
         Ok(())
     }
 

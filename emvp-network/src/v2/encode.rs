@@ -35,10 +35,7 @@ pub fn write_upload_matrices(
     let mut payload_len = UPLOAD_SUMMARY_BYTES;
     for upload in uploads {
         payload_len = checked_size(payload_len, UPLOAD_DESCRIPTOR_BYTES)?;
-        payload_len = checked_size(
-            payload_len,
-            field_byte_len(wire_len(upload.values.len())?)?,
-        )?;
+        payload_len = checked_size(payload_len, field_byte_len(wire_len(upload.values.len())?)?)?;
     }
     write_frame_header(writer, FrameKind::UploadMatrices, payload_len)?;
     write_u64(writer, wire_len(uploads.len())?)?;

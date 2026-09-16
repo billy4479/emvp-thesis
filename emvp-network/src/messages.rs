@@ -19,7 +19,9 @@
 use std::fmt;
 use std::io::{Read, Write};
 
-use emvp::{AnswerMatrix, AnswerRef, EmvpParams, EncryptedMatrix, EncryptedQuery, EncryptedQueryRef};
+use emvp::{
+    AnswerMatrix, AnswerRef, EmvpParams, EncryptedMatrix, EncryptedQuery, EncryptedQueryRef,
+};
 
 use crate::error::{CodecError, ErrorCode};
 use crate::frame::{
@@ -28,11 +30,10 @@ use crate::frame::{
 };
 use crate::v2::{
     EvaluateEntryInput, EvaluateEntryView, EvaluateWorkspace, ProductEntryInput, ProductEntryView,
-    ProductsWorkspace, UploadAcceptedWorkspace, UploadMatrixView, UploadWorkspace,
-    decode_evaluate, decode_products, decode_upload, decode_upload_accepted, plan_evaluate,
-    plan_products, plan_upload, plan_upload_accepted, write_evaluate as write_evaluate_views,
-    write_products as write_products_views,
-    write_upload_matrices as write_upload_matrices_views,
+    ProductsWorkspace, UploadAcceptedWorkspace, UploadMatrixView, UploadWorkspace, decode_evaluate,
+    decode_products, decode_upload, decode_upload_accepted, plan_evaluate, plan_products,
+    plan_upload, plan_upload_accepted, write_evaluate as write_evaluate_views,
+    write_products as write_products_views, write_upload_matrices as write_upload_matrices_views,
 };
 
 /// One uploaded encrypted matrix together with the parameters it was
@@ -181,10 +182,7 @@ pub fn write_products(
         .zip(&answer_refs)
         .map(|(entry, answers)| ProductEntryInput {
             matrix_id: entry.matrix_id,
-            instance_id: entry
-                .answers
-                .first()
-                .map_or(0, AnswerMatrix::instance_id),
+            instance_id: entry.answers.first().map_or(0, AnswerMatrix::instance_id),
             rows: entry.answers.first().map_or(0, AnswerMatrix::rows),
             blocks: entry.answers.first().map_or(0, AnswerMatrix::blocks),
             answers,

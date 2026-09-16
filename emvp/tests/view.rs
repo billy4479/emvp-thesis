@@ -168,7 +168,13 @@ fn owned_types_round_trip_through_views() {
     let blocks = state.params().blocks().unwrap();
     let zero = field().element_u32(0);
     let mut answer_values = vec![zero; rows * blocks];
-    answer_into(&state.params(), &encrypted, &encrypted_query, &mut answer_values).unwrap();
+    answer_into(
+        &state.params(),
+        &encrypted,
+        &encrypted_query,
+        &mut answer_values,
+    )
+    .unwrap();
     let answer = AnswerMatrix::from_parts(
         encrypted.instance_id(),
         encrypted_query.query_id(),
@@ -235,8 +241,21 @@ fn decode_through_a_ref_matches_the_owned_matrix() {
 
     // The same answer buffer, decoded through the owned matrix and through
     // a validated borrowed view, must produce identical products.
-    let owned = AnswerMatrix::from_parts(encrypted.instance_id(), encrypted_query.query_id(), values.clone(), rows, blocks);
-    let borrowed = AnswerRef::new(encrypted.instance_id(), encrypted_query.query_id(), &values, rows, blocks).unwrap();
+    let owned = AnswerMatrix::from_parts(
+        encrypted.instance_id(),
+        encrypted_query.query_id(),
+        values.clone(),
+        rows,
+        blocks,
+    );
+    let borrowed = AnswerRef::new(
+        encrypted.instance_id(),
+        encrypted_query.query_id(),
+        &values,
+        rows,
+        blocks,
+    )
+    .unwrap();
 
     let mut from_owned = vec![zero; rows];
     decode_into(&owned, &decoding_key, &mut from_owned).unwrap();

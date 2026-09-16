@@ -492,7 +492,11 @@ fn evaluate_entries_strategy() -> impl Strategy<Value = Vec<EvaluateEntry>> {
                         .prop_map(move |(instance_id, query_id, values)| {
                             EncryptedQuery::from_parts(instance_id, query_id, values)
                         }),
-                    if query_width == 0 { 0..=0_usize } else { 0..=2_usize },
+                    if query_width == 0 {
+                        0..=0_usize
+                    } else {
+                        0..=2_usize
+                    },
                 ),
             )
                 .prop_map(move |(matrix_id, queries)| EvaluateEntry { matrix_id, queries })
@@ -508,21 +512,11 @@ fn products_strategy() -> impl Strategy<Value = Vec<ProductEntry>> {
         (any::<u64>(), 1_usize..=4, 1_usize..=4, any::<u128>()).prop_flat_map(
             move |(matrix_id, rows, blocks, instance_id)| {
                 prop::collection::vec(
-                    (any::<u64>(), Just(rows * blocks)).prop_flat_map(
-                        move |(query_id, words)| {
-                            prop::collection::vec(field_strategy(), words).prop_map(
-                                move |values| {
-                                    AnswerMatrix::from_parts(
-                                        instance_id,
-                                        query_id,
-                                        values,
-                                        rows,
-                                        blocks,
-                                    )
-                                },
-                            )
-                        },
-                    ),
+                    (any::<u64>(), Just(rows * blocks)).prop_flat_map(move |(query_id, words)| {
+                        prop::collection::vec(field_strategy(), words).prop_map(move |values| {
+                            AnswerMatrix::from_parts(instance_id, query_id, values, rows, blocks)
+                        })
+                    }),
                     1..=2,
                 )
                 .prop_map(move |answers| ProductEntry { matrix_id, answers })

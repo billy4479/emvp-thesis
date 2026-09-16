@@ -11,12 +11,8 @@ use std::io::Read;
 
 use crate::error::CodecError;
 use crate::frame::FrameReader;
-use crate::v2::plan::{
-    EvaluatePlan, ProductsPlan, UploadAcceptedPlan, UploadPlan,
-};
-use crate::v2::views::{
-    EvaluateViews, ProductsViews, UploadAcceptedIds, UploadViews,
-};
+use crate::v2::plan::{EvaluatePlan, ProductsPlan, UploadAcceptedPlan, UploadPlan};
+use crate::v2::views::{EvaluateViews, ProductsViews, UploadAcceptedIds, UploadViews};
 use crate::v2::workspace::{
     EvaluateWorkspace, ProductsWorkspace, UploadAcceptedWorkspace, UploadWorkspace,
 };
@@ -80,9 +76,7 @@ pub fn decode_upload_accepted<'ws, R: Read>(
         return Err(CodecError::AllocationFailed);
     }
     workspace.identifiers.clear();
-    workspace
-        .identifiers
-        .extend_from_slice(&plan.identifiers);
+    workspace.identifiers.extend_from_slice(&plan.identifiers);
     frame.finish()?;
     Ok(workspace.identifiers())
 }

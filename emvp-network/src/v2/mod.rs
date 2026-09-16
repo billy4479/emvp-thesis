@@ -62,9 +62,9 @@ pub use decode::{decode_evaluate, decode_products, decode_upload, decode_upload_
 pub use encode::{write_evaluate, write_products, write_upload_matrices};
 pub use plan::{
     EVALUATE_ENTRY_DESCRIPTOR_BYTES, EVALUATE_QUERY_DESCRIPTOR_BYTES, EVALUATE_SUMMARY_BYTES,
-    PRODUCTS_ANSWER_DESCRIPTOR_BYTES, PRODUCTS_ENTRY_DESCRIPTOR_BYTES, PRODUCTS_SUMMARY_BYTES,
-    UPLOAD_DESCRIPTOR_BYTES, UPLOAD_SUMMARY_BYTES, EvaluateEntryMeta, EvaluatePlan,
-    EvaluateQueryMeta, ProductEntryMeta, ProductsPlan, UploadAcceptedPlan, UploadMatrixMeta,
+    EvaluateEntryMeta, EvaluatePlan, EvaluateQueryMeta, PRODUCTS_ANSWER_DESCRIPTOR_BYTES,
+    PRODUCTS_ENTRY_DESCRIPTOR_BYTES, PRODUCTS_SUMMARY_BYTES, ProductEntryMeta, ProductsPlan,
+    UPLOAD_DESCRIPTOR_BYTES, UPLOAD_SUMMARY_BYTES, UploadAcceptedPlan, UploadMatrixMeta,
     UploadPlan, plan_evaluate, plan_products, plan_upload, plan_upload_accepted,
 };
 pub use views::{

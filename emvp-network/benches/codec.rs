@@ -20,12 +20,13 @@ use std::io::Cursor;
 use std::time::Duration;
 
 use criterion::{Criterion, Throughput, criterion_group, criterion_main};
-use emvp::{AnswerMatrix, AnswerRef, EmvpParams, EncryptedMatrix, EncryptedQuery, EncryptedQueryRef};
+use emvp::{
+    AnswerMatrix, AnswerRef, EmvpParams, EncryptedMatrix, EncryptedQuery, EncryptedQueryRef,
+};
 use emvp_network::v2::{
-    EvaluateEntryInput, EvaluateWorkspace, ProductEntryInput, ProductsWorkspace,
-    UploadMatrixView, UploadWorkspace, decode_evaluate, decode_products, decode_upload,
-    plan_evaluate, plan_products, plan_upload, write_evaluate, write_products,
-    write_upload_matrices,
+    EvaluateEntryInput, EvaluateWorkspace, ProductEntryInput, ProductsWorkspace, UploadMatrixView,
+    UploadWorkspace, decode_evaluate, decode_products, decode_upload, plan_evaluate, plan_products,
+    plan_upload, write_evaluate, write_products, write_upload_matrices,
 };
 use emvp_network::{FrameReader, HEADER_BYTES, PROTOCOL_MODULUS, read_frame_header};
 use prime_field_layer::PrimeField;
