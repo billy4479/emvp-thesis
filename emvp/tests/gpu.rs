@@ -16,15 +16,15 @@
 //! and host-reconstruction checks live in `emvp/src/gpu`'s unit tests.
 //! Running this suite explicitly with `--ignored` on a machine with a
 //! compute adapter proves the WGSL kernel bit-identical to the CPU
-//! `answer_batch`; on a GPU-less machine the adapter acquisition fails the
-//! test clearly instead of silently succeeding.
+//! single-query kernel; on a GPU-less machine the adapter acquisition
+//! fails the test clearly instead of silently succeeding.
 
 use std::time::Duration;
 
 use emvp::{
-    AnswerPlan, AnswerWorkspace, DecodingKey, DerivedState, EmvpParams, EncryptedMatrix,
-    EncryptedQuery, GpuAnswerer, GpuError, MaskContextId, ProtocolError, SecretKey, answer_batch,
-    decode_into, encrypt, query,
+    AnswerPlan, AnswerRef, AnswerWorkspace, Answers, DecodingKey, DerivedState, EmvpParams,
+    EncryptedMatrix, EncryptedQuery, GpuAnswerer, GpuError, MaskContextId, PhaseTimings,
+    ProtocolError, SecretKey, answer_into, decode_into, encrypt, query,
 };
 use prime_field_layer::{FieldElement, PrimeField};
 use proptest::{prelude::*, test_runner::TestCaseError};
@@ -177,19 +177,44 @@ fn gpu_answerer() -> Result<GpuAnswerer, GpuError> {
     GpuAnswerer::new()
 }
 
+/// The reference oracle: the kept single-query CPU kernel, one fresh
+/// vector per query.
+fn cpu_reference<const M: u32>(fixture: &BatchFixture<M>) -> Vec<Vec<FieldElement<M>>> {
+    let zero = PrimeField::<M>::new().element_u32(0);
+    let blocks = fixture.params.blocks().unwrap();
+    fixture
+        .queries
+        .iter()
+        .map(|query| {
+            let mut values = vec![zero; fixture.encrypted.rows() * blocks];
+            answer_into(&fixture.params, &fixture.encrypted, query, &mut values).unwrap();
+            values
+        })
+        .collect()
+}
+
+/// Runs the batch on the device through the plan-reserve-execute GPU path.
+fn run_gpu_batch<'ws, const M: u32>(
+    answerer: &GpuAnswerer,
+    fixture: &BatchFixture<M>,
+    workspace: &'ws mut AnswerWorkspace<M>,
+) -> Result<(Answers<'ws, M>, PhaseTimings), GpuError> {
+    let gpu_matrix = answerer.upload_matrix(&fixture.params, &fixture.encrypted)?;
+    let plan = AnswerPlan::plan(&fixture.params, &fixture.encrypted, &fixture.queries).unwrap();
+    workspace.reserve(&plan).unwrap();
+    answerer.execute_answer_batch_into(&gpu_matrix, &fixture.queries, workspace)
+}
+
 fn assert_gpu_matches_cpu<const M: u32>(answerer: &GpuAnswerer, fixture: &BatchFixture<M>) {
-    let cpu = answer_batch(&fixture.params, &fixture.encrypted, &fixture.queries).unwrap();
-    let gpu_matrix = answerer
-        .upload_matrix(&fixture.params, &fixture.encrypted)
-        .unwrap();
-    let gpu = answerer
-        .answer_batch(&gpu_matrix, &fixture.queries)
-        .unwrap();
-    assert_eq!(gpu.len(), cpu.len());
-    for (gpu_answer, cpu_answer) in gpu.iter().zip(&cpu) {
-        assert_eq!(gpu_answer, cpu_answer);
-        assert_eq!(gpu_answer.instance_id(), cpu_answer.instance_id());
-        assert_eq!(gpu_answer.query_id(), cpu_answer.query_id());
+    let cpu = cpu_reference(fixture);
+    let mut workspace = AnswerWorkspace::new();
+    let (gpu, _timings) = run_gpu_batch(answerer, fixture, &mut workspace).unwrap();
+    assert_eq!(gpu.shape().queries(), cpu.len());
+    for (index, cpu_values) in cpu.iter().enumerate() {
+        let gpu_answer = gpu.answer(&fixture.queries, index).unwrap();
+        assert_eq!(gpu_answer.values(), cpu_values.as_slice());
+        assert_eq!(gpu_answer.instance_id(), fixture.encrypted.instance_id());
+        assert_eq!(gpu_answer.query_id(), fixture.queries[index].query_id());
     }
 }
 
@@ -237,9 +262,14 @@ fn gpu_answer_matches_hardcoded_golden_words() -> Result<(), GpuError> {
     let (params, encrypted, queries) = transparent_fixture::<MODULUS>();
 
     let gpu_matrix = answerer.upload_matrix(&params, &encrypted)?;
-    let gpu = answerer.answer_batch(&gpu_matrix, &queries)?;
+    let plan = AnswerPlan::plan(&params, &encrypted, &queries).unwrap();
+    let mut workspace = AnswerWorkspace::new();
+    workspace.reserve(&plan).unwrap();
+    let (gpu, _timings) =
+        answerer.execute_answer_batch_into(&gpu_matrix, &queries, &mut workspace)?;
     let field = PrimeField::<MODULUS>::new();
-    for (index, answer) in gpu.iter().enumerate() {
+    for index in 0..queries.len() {
+        let answer = gpu.answer(&queries, index)?;
         let words: Vec<u32> = answer.values().iter().map(|value| value.to_raw()).collect();
         assert_eq!(words, GOLDEN_WORDS[index], "query {index} words");
         for (value, &sum) in answer.values().iter().zip(GOLDEN_SUMS[index]) {
@@ -272,11 +302,16 @@ fn gpu_answer_handles_near_modulus_operands() -> Result<(), GpuError> {
     let queries = [EncryptedQuery::from_parts(0xBEE, 0, vec![word(3), word(4)])];
 
     let gpu_matrix = answerer.upload_matrix(&params, &encrypted)?;
-    let gpu = answerer.answer_batch(&gpu_matrix, &queries)?;
+    let plan = AnswerPlan::plan(&params, &encrypted, &queries).unwrap();
+    let mut workspace = AnswerWorkspace::new();
+    workspace.reserve(&plan).unwrap();
+    let (gpu, _timings) =
+        answerer.execute_answer_batch_into(&gpu_matrix, &queries, &mut workspace)?;
+    let answer = gpu.answer(&queries, 0)?;
     let field = PrimeField::<MODULUS>::new();
-    let words: Vec<u32> = gpu[0].values().iter().map(|value| value.to_raw()).collect();
+    let words: Vec<u32> = answer.values().iter().map(|value| value.to_raw()).collect();
     assert_eq!(words, [327_155_665, 796_917_593]);
-    for (value, sum) in gpu[0].values().iter().zip([11_u32, 39]) {
+    for (value, sum) in answer.values().iter().zip([11_u32, 39]) {
         assert_eq!(*value, field.element_u32(sum));
     }
     Ok(())
@@ -297,9 +332,14 @@ fn gpu_answer_matches_hand_derived_words_on_the_widest_supported_odd_prime() -> 
     let answerer = gpu_answerer()?;
     let (params, encrypted, queries) = transparent_fixture::<WIDE_MODULUS>();
     let gpu_matrix = answerer.upload_matrix(&params, &encrypted)?;
-    let gpu = answerer.answer_batch(&gpu_matrix, &queries)?;
+    let plan = AnswerPlan::plan(&params, &encrypted, &queries).unwrap();
+    let mut workspace = AnswerWorkspace::new();
+    workspace.reserve(&plan).unwrap();
+    let (gpu, _timings) =
+        answerer.execute_answer_batch_into(&gpu_matrix, &queries, &mut workspace)?;
     let field = PrimeField::<WIDE_MODULUS>::new();
-    for (index, answer) in gpu.iter().enumerate() {
+    for index in 0..queries.len() {
+        let answer = gpu.answer(&queries, index)?;
         let words: Vec<u32> = answer.values().iter().map(|value| value.to_raw()).collect();
         assert_eq!(words, GOLDEN_WORDS[index], "query {index} words");
         for (value, &sum) in answer.values().iter().zip(GOLDEN_SUMS[index]) {
@@ -309,8 +349,14 @@ fn gpu_answer_matches_hand_derived_words_on_the_widest_supported_odd_prime() -> 
     // The same transparent answers must equal the CPU reference path over
     // this modulus, pinning the per-modulus pipeline constants (NEG_INV,
     // R2) derivation end to end.
-    let cpu = answer_batch(&params, &encrypted, &queries)?;
-    assert_eq!(gpu, cpu);
+    let zero = PrimeField::<WIDE_MODULUS>::new().element_u32(0);
+    let blocks = params.blocks().unwrap();
+    for (index, query) in queries.iter().enumerate() {
+        let mut cpu = vec![zero; encrypted.rows() * blocks];
+        answer_into(&params, &encrypted, query, &mut cpu)?;
+        let answer = gpu.answer(&queries, index)?;
+        assert_eq!(answer.values(), cpu.as_slice());
+    }
     Ok(())
 }
 
@@ -319,18 +365,37 @@ fn gpu_answer_matches_hand_derived_words_on_the_widest_supported_odd_prime() -> 
 fn gpu_answer_followed_by_decode_matches_the_cpu_reference() -> Result<(), GpuError> {
     let answerer = gpu_answerer()?;
     let fixture = protocol_fixture::<MODULUS>(8, 8, 2, 5, 3, 0x55);
-    let gpu_matrix = answerer.upload_matrix(&fixture.params, &fixture.encrypted)?;
-    let gpu = answerer.answer_batch(&gpu_matrix, &fixture.queries)?;
-    let cpu = answer_batch(&fixture.params, &fixture.encrypted, &fixture.queries)?;
+    let mut workspace = AnswerWorkspace::new();
+    let (gpu, _timings) = run_gpu_batch(&answerer, &fixture, &mut workspace)?;
+    let cpu = cpu_reference(&fixture);
     let zero = PrimeField::<MODULUS>::new().element_u32(0);
-    for ((gpu_answer, cpu_answer), key) in gpu.iter().zip(&cpu).zip(&fixture.decoding_keys) {
+    for (index, key) in fixture.decoding_keys.iter().enumerate() {
+        let gpu_answer = gpu.answer(&fixture.queries, index)?;
         let mut gpu_decoded = vec![zero; fixture.encrypted.rows()];
-        decode_into(gpu_answer, key, &mut gpu_decoded)?;
+        decode_into(&gpu_answer, key, &mut gpu_decoded)?;
+        let cpu_answer = answer_ref_of(&fixture, index, &cpu[index]);
         let mut cpu_decoded = vec![zero; fixture.encrypted.rows()];
-        decode_into(cpu_answer, key, &mut cpu_decoded)?;
+        decode_into(&cpu_answer, key, &mut cpu_decoded)?;
         assert_eq!(gpu_decoded, cpu_decoded);
     }
     Ok(())
+}
+
+/// Wraps one reference answer vector in a validated view carrying the
+/// fixture's public identifiers.
+fn answer_ref_of<'a, const M: u32>(
+    fixture: &BatchFixture<M>,
+    index: usize,
+    values: &'a [FieldElement<M>],
+) -> AnswerRef<'a, M> {
+    AnswerRef::new(
+        fixture.encrypted.instance_id(),
+        fixture.queries[index].query_id(),
+        values,
+        fixture.encrypted.rows(),
+        fixture.params.blocks().unwrap(),
+    )
+    .unwrap()
 }
 
 #[test]
@@ -362,12 +427,13 @@ fn gpu_answer_reuses_scratch_buffers_across_shapes() -> Result<(), GpuError> {
 fn gpu_answer_timings_report_every_phase() -> Result<(), GpuError> {
     let answerer = gpu_answerer()?;
     let fixture = protocol_fixture::<MODULUS>(8, 8, 2, 4, 2, 0x64);
-    let gpu_matrix = answerer.upload_matrix(&fixture.params, &fixture.encrypted)?;
-    let (gpu, timings) = answerer.answer_batch_with_timings(&gpu_matrix, &fixture.queries)?;
-    let cpu = answer_batch(&fixture.params, &fixture.encrypted, &fixture.queries).unwrap();
-    assert_eq!(gpu.len(), cpu.len());
-    for (gpu_answer, cpu_answer) in gpu.iter().zip(&cpu) {
-        assert_eq!(gpu_answer, cpu_answer);
+    let cpu = cpu_reference(&fixture);
+    let mut workspace = AnswerWorkspace::new();
+    let (gpu, timings) = run_gpu_batch(&answerer, &fixture, &mut workspace)?;
+    assert_eq!(gpu.shape().queries(), cpu.len());
+    for (index, cpu_values) in cpu.iter().enumerate() {
+        let gpu_answer = gpu.answer(&fixture.queries, index).unwrap();
+        assert_eq!(gpu_answer.values(), cpu_values.as_slice());
     }
     // A blocking call pays the wait phase at minimum, and the reported
     // total must reflect real elapsed host time.
@@ -392,8 +458,10 @@ fn gpu_answer_validation_mirrors_the_cpu_path() -> Result<(), GpuError> {
         .upload_matrix(&fixture.params, &fixture.encrypted)
         .unwrap();
 
+    let mut workspace = AnswerWorkspace::new();
+
     assert!(matches!(
-        answerer.answer_batch(&gpu_matrix, &[]),
+        answerer.execute_answer_batch_into(&gpu_matrix, &[], &mut workspace),
         Err(GpuError::LengthMismatch {
             name: "queries",
             expected: 1,
@@ -409,7 +477,7 @@ fn gpu_answer_validation_mirrors_the_cpu_path() -> Result<(), GpuError> {
     );
     let mixed = [fixture.queries[0].clone(), truncated];
     assert!(matches!(
-        answerer.answer_batch(&gpu_matrix, &mixed),
+        answerer.execute_answer_batch_into(&gpu_matrix, &mixed, &mut workspace),
         Err(GpuError::LengthMismatch {
             name: "encrypted query",
             ..
@@ -419,7 +487,7 @@ fn gpu_answer_validation_mirrors_the_cpu_path() -> Result<(), GpuError> {
     let other = protocol_fixture::<MODULUS>(8, 8, 2, 4, 1, 0x53);
     let foreign = [other.queries.into_iter().next().unwrap()];
     assert!(matches!(
-        answerer.answer_batch(&gpu_matrix, &foreign),
+        answerer.execute_answer_batch_into(&gpu_matrix, &foreign, &mut workspace),
         Err(GpuError::InstanceMismatch { .. })
     ));
 
@@ -482,12 +550,28 @@ proptest! {
             let (encrypted_query, _decoding_key) = query(&mut state, &record).unwrap();
             queries.push(encrypted_query);
         }
-        let cpu = answer_batch(&params, &encrypted, &queries).unwrap();
+        // The reference oracle: the kept single-query CPU kernel.
+        let zero = PrimeField::<MODULUS>::new().element_u32(0);
+        let blocks = params.blocks().unwrap();
+        let mut cpu = Vec::new();
+        for query in &queries {
+            let mut values = vec![zero; rows * blocks];
+            answer_into(&params, &encrypted, query, &mut values).unwrap();
+            cpu.push(values);
+        }
         let gpu_matrix = answerer.upload_matrix(&params, &encrypted).unwrap();
-        let gpu = answerer.answer_batch(&gpu_matrix, &queries).unwrap();
-        prop_assert_eq!(gpu.len(), cpu.len());
-        for (gpu_answer, cpu_answer) in gpu.iter().zip(&cpu) {
-            prop_assert_eq!(gpu_answer, cpu_answer);
+        let plan = AnswerPlan::plan(&params, &encrypted, &queries).unwrap();
+        let mut workspace = AnswerWorkspace::new();
+        workspace.reserve(&plan).unwrap();
+        let (gpu, _timings) = answerer
+            .execute_answer_batch_into(&gpu_matrix, &queries, &mut workspace)
+            .unwrap();
+        prop_assert_eq!(gpu.shape().queries(), cpu.len());
+        for (index, cpu_values) in cpu.iter().enumerate() {
+            let gpu_answer = gpu.answer(&queries, index).unwrap();
+            prop_assert_eq!(gpu_answer.values(), cpu_values.as_slice());
+            prop_assert_eq!(gpu_answer.instance_id(), encrypted.instance_id());
+            prop_assert_eq!(gpu_answer.query_id(), queries[index].query_id());
         }
     }
 }
@@ -520,10 +604,14 @@ fn execute_into_reuses_the_workspace_across_calls() -> Result<(), GpuError> {
     assert_eq!(first_ptr, second.arena().as_ptr());
     assert_eq!(first_shape, second.shape());
     assert_eq!(first_arena, second.arena());
-    let cpu = answer_batch(&params, &encrypted, &queries).unwrap();
-    for (index, cpu_answer) in cpu.iter().enumerate() {
+    // The reference oracle: the kept single-query CPU kernel.
+    let zero = PrimeField::<MODULUS>::new().element_u32(0);
+    let blocks = params.blocks().unwrap();
+    for (index, query) in queries.iter().enumerate() {
+        let mut cpu = vec![zero; encrypted.rows() * blocks];
+        answer_into(&params, &encrypted, query, &mut cpu)?;
         let view = second.answer(&queries, index).unwrap();
-        assert_eq!(view.values(), cpu_answer.values());
+        assert_eq!(view.values(), cpu.as_slice());
     }
     Ok(())
 }

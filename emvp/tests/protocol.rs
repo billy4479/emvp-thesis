@@ -4,10 +4,10 @@
 )]
 
 use emvp::{
-    AnswerBackend, AnswerMatrix, AnswerPlan, AnswerWorkspace, DecodingKey, DerivedState,
-    EmvpParams, EncryptedMatrix, EncryptedQuery, MaskContextId, ProtocolError, SecretKey, TdmMask,
-    answer_batch, answer_into, decode_into, encrypt, execute_answer_batch, purpose, query,
-    query_batch, query_with_scratch, search,
+    AnswerBackend, AnswerPlan, AnswerRef, AnswerWorkspace, DecodingKey, DerivedState, EmvpParams,
+    EncryptedMatrix, EncryptedQuery, MaskContextId, ProtocolError, SecretKey, TdmMask, answer_into,
+    decode_into, encrypt, execute_answer_batch, purpose, query, query_batch, query_with_scratch,
+    search,
 };
 use prime_field_layer::{FieldElement, PrimeField};
 use proptest::prelude::*;
@@ -131,25 +131,39 @@ fn derive_toeplitz(
         .unwrap()
 }
 
-fn answer_matrix(
+/// The single-query reference oracle: the kept `answer_into` kernel into a
+/// fresh vector.
+fn answer_values(
     params: &EmvpParams,
     encrypted: &EncryptedMatrix<MODULUS>,
     query: &EncryptedQuery<MODULUS>,
-) -> AnswerMatrix<MODULUS> {
+) -> Vec<FieldElement<MODULUS>> {
     let zero = field().element_u32(0);
     let mut values = vec![zero; encrypted.rows() * params.blocks().unwrap()];
     answer_into(params, encrypted, query, &mut values).unwrap();
-    AnswerMatrix::from_parts(
+    values
+}
+
+/// Wraps already-computed answer values in a validated borrowed view
+/// carrying the fixture's public identifiers.
+fn answer_ref<'a>(
+    params: &EmvpParams,
+    encrypted: &EncryptedMatrix<MODULUS>,
+    query: &EncryptedQuery<MODULUS>,
+    values: &'a [FieldElement<MODULUS>],
+) -> AnswerRef<'a, MODULUS> {
+    AnswerRef::new(
         encrypted.instance_id(),
         query.query_id(),
         values,
         encrypted.rows(),
         params.blocks().unwrap(),
     )
+    .unwrap()
 }
 
 fn decode_answer(
-    answer: &AnswerMatrix<MODULUS>,
+    answer: &AnswerRef<'_, MODULUS>,
     key: &DecodingKey<MODULUS>,
 ) -> Vec<FieldElement<MODULUS>> {
     let mut output = vec![field().element_u32(0); answer.rows()];
@@ -164,7 +178,8 @@ fn run_protocol<M: TdmMask<MODULUS>>(
 ) -> Vec<FieldElement<MODULUS>> {
     let encrypted = encrypt(state, matrix).unwrap();
     let (encrypted_query, decoding_key) = query(state, q).unwrap();
-    let answer = answer_matrix(&state.params(), &encrypted, &encrypted_query);
+    let values = answer_values(&state.params(), &encrypted, &encrypted_query);
+    let answer = answer_ref(&state.params(), &encrypted, &encrypted_query, &values);
     decode_answer(&answer, &decoding_key)
 }
 
@@ -382,7 +397,8 @@ fn query_randomness_is_fresh() {
     let (first_query, first_key) = query(&mut state, &q).unwrap();
     let (second_query, _second_key) = query(&mut state, &q).unwrap();
     assert_ne!(first_query.values(), second_query.values());
-    let first_answer = answer_matrix(&state.params(), &encrypted, &first_query);
+    let first_values = answer_values(&state.params(), &encrypted, &first_query);
+    let first_answer = answer_ref(&state.params(), &encrypted, &first_query, &first_values);
     let decoded = decode_answer(&first_answer, &first_key);
     assert_eq!(decoded, naive_matrix_vector(&matrix, &q, rows, ell));
 }
@@ -453,7 +469,8 @@ fn decode_rejects_a_key_for_another_query() {
     let encrypted = encrypt(&mut state, &matrix).unwrap();
     let (first_query, _) = query(&mut state, &q).unwrap();
     let (_, second_key) = query(&mut state, &q).unwrap();
-    let first_answer = answer_matrix(&state.params(), &encrypted, &first_query);
+    let first_values = answer_values(&state.params(), &encrypted, &first_query);
+    let first_answer = answer_ref(&state.params(), &encrypted, &first_query, &first_values);
 
     assert!(matches!(
         decode_into(&first_answer, &second_key, &mut []),
@@ -483,12 +500,11 @@ fn caller_owned_buffers_are_fully_overwritten() {
     )
     .unwrap();
 
-    let answer = AnswerMatrix::from_parts(
-        encrypted.instance_id(),
-        encrypted_query.query_id(),
-        answer_values,
-        rows,
-        state.params().blocks().unwrap(),
+    let answer = answer_ref(
+        &state.params(),
+        &encrypted,
+        &encrypted_query,
+        &answer_values,
     );
     let mut decoded = vec![garbage; rows];
     decode_into(&answer, &decoding_key, &mut decoded).unwrap();
@@ -764,11 +780,9 @@ fn permutation_direction_is_pinned_by_naive_oracle() {
             .iter()
             .map(|&value| field().element_u32(value))
             .collect();
-        let answer = answer_matrix(
-            &params,
-            &encrypted_naive,
-            &EncryptedQuery::from_parts(state.instance_id(), 0, q_hat_elements),
-        );
+        let naive_query = EncryptedQuery::from_parts(state.instance_id(), 0, q_hat_elements);
+        let naive_values = answer_values(&params, &encrypted_naive, &naive_query);
+        let answer = answer_ref(&params, &encrypted_naive, &naive_query, &naive_values);
         // Mask share r' = R q_tilde on the UNPERMUTED query.
         let q_tilde_elements: Vec<FieldElement<MODULUS>> = q_tilde
             .iter()
@@ -818,7 +832,7 @@ fn length_errors_are_rejected_before_mutation() {
 
     let encrypted = encrypt(&mut state, &random_vector(rows * ell, &mut rng)).unwrap();
     let (encrypted_query, decoding_key) = query(&mut state, &q).unwrap();
-    let answer_matrix = answer_matrix(&state.params(), &encrypted, &encrypted_query);
+    let answer_values = answer_values(&state.params(), &encrypted, &encrypted_query);
 
     let truncated_query = EncryptedQuery::from_parts(
         encrypted_query.instance_id(),
@@ -836,12 +850,11 @@ fn length_errors_are_rejected_before_mutation() {
         decoding_key.p_prime()[..state.params().blocks().unwrap() - 1].to_vec(),
         decoding_key.r_prime().to_vec(),
     );
-    let sentinel = AnswerMatrix::from_parts(
-        answer_matrix.instance_id(),
-        answer_matrix.query_id(),
-        answer_matrix.values().to_vec(),
-        rows,
-        state.params().blocks().unwrap(),
+    let sentinel = answer_ref(
+        &state.params(),
+        &encrypted,
+        &encrypted_query,
+        &answer_values,
     );
     assert!(matches!(
         decode_into(&sentinel, &short_key, &mut []),
@@ -850,13 +863,19 @@ fn length_errors_are_rejected_before_mutation() {
 }
 
 #[test]
-fn malformed_answer_is_validated_before_output_allocation() {
-    let zero = field().element_u32(0);
-    let answer = AnswerMatrix::from_parts(1, 0, Vec::new(), usize::MAX, 2);
-    let key = DecodingKey::from_parts(1, 0, vec![zero; 2], Vec::new());
+fn malformed_answers_are_rejected_before_decoding() {
+    // A view whose value buffer is shorter than `rows * blocks` is
+    // rejected at construction, before any decode work or output
+    // allocation.
+    let empty: Vec<FieldElement<MODULUS>> = Vec::new();
     assert!(matches!(
-        decode_into(&answer, &key, &mut []),
+        AnswerRef::new(1, 0, &empty, 2, 2),
         Err(ProtocolError::LengthMismatch { .. })
+    ));
+    // A shape whose word count overflows is rejected too.
+    assert!(matches!(
+        AnswerRef::new(1, 0, &empty, usize::MAX, 2),
+        Err(ProtocolError::DimensionOverflow)
     ));
 }
 
@@ -954,7 +973,7 @@ fn parallel_encrypt_matches_the_serial_row_loop_and_naive_oracle() {
 }
 
 #[test]
-fn answer_batch_rejects_malformed_batches_before_answering() {
+fn answer_planning_rejects_malformed_batches_before_answering() {
     let mut rng = ChaCha20Rng::seed_from_u64(0x8200);
     let (rows, ell) = (5_usize, 8_usize);
     let mut state = derive_toeplitz(rows, ell, 0x82);
@@ -964,7 +983,11 @@ fn answer_batch_rejects_malformed_batches_before_answering() {
     let (good_query, _) = query(&mut state, &q).unwrap();
 
     assert!(matches!(
-        answer_batch(&state.params(), &encrypted, &[]),
+        AnswerPlan::plan(
+            &state.params(),
+            &encrypted,
+            &[] as &[EncryptedQuery<MODULUS>]
+        ),
         Err(ProtocolError::LengthMismatch {
             name: "queries",
             expected: 1,
@@ -979,7 +1002,7 @@ fn answer_batch_rejects_malformed_batches_before_answering() {
         vec![field().element_u32(0); n - 1],
     );
     assert!(matches!(
-        answer_batch(
+        AnswerPlan::plan(
             &state.params(),
             &encrypted,
             &[good_query.clone(), truncated]
@@ -999,7 +1022,7 @@ fn answer_batch_rejects_malformed_batches_before_answering() {
         .unwrap();
     let (foreign_query, _) = query(&mut other, &q).unwrap();
     assert!(matches!(
-        answer_batch(&state.params(), &encrypted, &[good_query, foreign_query]),
+        AnswerPlan::plan(&state.params(), &encrypted, &[good_query, foreign_query]),
         Err(ProtocolError::InstanceMismatch { .. })
     ));
 }
@@ -1034,7 +1057,7 @@ fn parallel_derive_matches_the_serial_block_loop() {
 }
 
 #[test]
-fn parallel_answer_batch_matches_the_serial_loop() {
+fn parallel_execute_matches_the_serial_loop_and_the_single_query_reference() {
     // 16 queries * 128 rows * n = 16 = 32768 estimated multiplications
     // clear the crate's parallel-work threshold and the 2048-row grid
     // satisfies the 2 * 4-threads guard, so the four-thread run forces the
@@ -1044,30 +1067,40 @@ fn parallel_answer_batch_matches_the_serial_loop() {
     let mut rng = ChaCha20Rng::seed_from_u64(0x8400);
     let matrix = random_vector(rows * ell, &mut rng);
     let q = random_vector(ell, &mut rng);
-    let zero = field().element_u32(0);
     let mut state = derive_toeplitz(rows, ell, 0x85);
     let encrypted = encrypt(&mut state, &matrix).unwrap();
-    let blocks = params.blocks().unwrap();
 
+    // The reference oracle: the kept single-query kernel, one fresh
+    // vector per query.
     let mut queries = Vec::new();
     let mut expected = Vec::new();
     for _ in 0..batch {
         let (encrypted_query, _key) = query(&mut state, &q).unwrap();
-        let mut answer_values = vec![zero; rows * blocks];
-        answer_into(&params, &encrypted, &encrypted_query, &mut answer_values).unwrap();
+        let answer_values = answer_values(&params, &encrypted, &encrypted_query);
         queries.push(encrypted_query);
         expected.extend_from_slice(&answer_values);
     }
 
-    let flatten = |answers: Vec<AnswerMatrix<MODULUS>>| {
-        answers
-            .iter()
-            .flat_map(|answer| answer.values().iter().copied())
-            .collect::<Vec<_>>()
-    };
-    let parallel =
-        flatten(pool(4).install(|| answer_batch(&params, &encrypted, &queries).unwrap()));
-    let serial = flatten(pool(1).install(|| answer_batch(&params, &encrypted, &queries).unwrap()));
+    let parallel = pool(4).install(|| {
+        let plan = AnswerPlan::plan(&params, &encrypted, &queries).unwrap();
+        assert_eq!(plan.backend(), AnswerBackend::Rayon);
+        let mut workspace = AnswerWorkspace::new();
+        workspace.reserve(&plan).unwrap();
+        execute_answer_batch(&plan, &mut workspace)
+            .unwrap()
+            .arena()
+            .to_vec()
+    });
+    let serial = pool(1).install(|| {
+        let plan = AnswerPlan::plan(&params, &encrypted, &queries).unwrap();
+        assert_eq!(plan.backend(), AnswerBackend::SingleCore);
+        let mut workspace = AnswerWorkspace::new();
+        workspace.reserve(&plan).unwrap();
+        execute_answer_batch(&plan, &mut workspace)
+            .unwrap()
+            .arena()
+            .to_vec()
+    });
     assert_eq!(parallel, expected);
     assert_eq!(parallel, serial);
 }
@@ -1086,7 +1119,13 @@ fn parallel_decode_matches_the_serial_row_loop() {
     let mut state = derive_toeplitz(rows, ell, 0x87);
     let encrypted = encrypt(&mut state, &matrix).unwrap();
     let (encrypted_query, decoding_key) = query(&mut state, &q).unwrap();
-    let answer = answer_matrix(&state.params(), &encrypted, &encrypted_query);
+    let answer_values = answer_values(&state.params(), &encrypted, &encrypted_query);
+    let answer = answer_ref(
+        &state.params(),
+        &encrypted,
+        &encrypted_query,
+        &answer_values,
+    );
 
     let decode_with = |threads: usize| {
         let mut output = vec![field().element_u32(0); rows];
@@ -1185,7 +1224,7 @@ proptest! {
     }
 
     #[test]
-    fn answer_batch_matches_sequential_single_query_answers(
+    fn execute_matches_sequential_single_query_answers(
         ell in 1_usize..=8_usize,
         rows in 1_usize..=24_usize,
         batch in 1_usize..=4_usize,
@@ -1197,25 +1236,30 @@ proptest! {
         let q = random_vector(ell, &mut rng);
         let encrypted = encrypt(&mut state, &matrix).unwrap();
         let blocks = params.blocks().unwrap();
-        let zero = field().element_u32(0);
 
+        // The reference oracle: the kept single-query kernel, one fresh
+        // vector per query.
         let mut queries = Vec::new();
         let mut expected = Vec::new();
         for _ in 0..batch {
             let (encrypted_query, _key) = query(&mut state, &q).unwrap();
-            let mut answer_values = vec![zero; rows * blocks];
-            answer_into(&params, &encrypted, &encrypted_query, &mut answer_values).unwrap();
+            let answer_values = answer_values(&params, &encrypted, &encrypted_query);
             queries.push(encrypted_query);
             expected.extend_from_slice(&answer_values);
         }
 
-        let batched = answer_batch(&params, &encrypted, &queries).unwrap();
-        prop_assert_eq!(batched.len(), batch);
-        for (answer, answer_values) in batched.iter().zip(expected.chunks(rows * blocks)) {
+        let plan = AnswerPlan::plan(&params, &encrypted, &queries).unwrap();
+        let mut workspace = AnswerWorkspace::new();
+        workspace.reserve(&plan).unwrap();
+        let answers = execute_answer_batch(&plan, &mut workspace).unwrap();
+        prop_assert_eq!(answers.shape().queries(), batch);
+        for (index, answer_values) in expected.chunks(rows * blocks).enumerate() {
+            let answer = answers.answer(&queries, index).unwrap();
             prop_assert_eq!(answer.values(), answer_values);
             prop_assert_eq!(answer.rows(), rows);
             prop_assert_eq!(answer.blocks(), blocks);
             prop_assert_eq!(answer.instance_id(), encrypted.instance_id());
+            prop_assert_eq!(answer.query_id(), queries[index].query_id());
         }
     }
 }
@@ -1249,17 +1293,18 @@ fn batch_fixture(rows: usize, batch: usize, key: u8, seed: u64) -> BatchFixture 
     }
 }
 
-fn answer_batch_collect(
+/// The reference oracle: per-query `answer_into` into fresh vectors,
+/// flattened query-major with the queries' public identifiers.
+fn reference_collect(
     params: &EmvpParams,
     matrix: &EncryptedMatrix<MODULUS>,
     queries: &[EncryptedQuery<MODULUS>],
 ) -> (Vec<u64>, Vec<FieldElement<MODULUS>>) {
-    let answers = answer_batch(params, matrix, queries).unwrap();
-    let ids = answers.iter().map(AnswerMatrix::query_id).collect();
-    let values = answers
-        .iter()
-        .flat_map(|answer| answer.values().iter().copied())
-        .collect();
+    let ids = queries.iter().map(EncryptedQuery::query_id).collect();
+    let mut values = Vec::new();
+    for query in queries {
+        values.extend(answer_values(params, matrix, query));
+    }
     (ids, values)
 }
 
@@ -1286,14 +1331,14 @@ fn plan_execute_collect(
 }
 
 #[test]
-fn plan_reserve_execute_matches_answer_batch_on_both_cpu_tiers() {
+fn plan_execute_matches_the_single_query_reference_on_both_cpu_tiers() {
     // Serial tier: 3 queries * 5 rows * n = 240 estimated multiplications
     // stay far below the parallel threshold, so a one-thread pool plans the
     // single-core tier. Parallel tier: 16 queries * 128 rows * n = 32768
     // clear the threshold and the 2048-row grid satisfies the
     // two-rows-per-thread guard for a four-thread pool, so that plan fixes
-    // the rayon tier. The one-shot path must produce the very same answers
-    // and identifiers on each tier.
+    // the rayon tier. Both tiers must produce exactly the per-query
+    // reference answers and identifiers.
     let serial = batch_fixture(5, 3, 0x30, 0x8d00);
     let parallel = batch_fixture(128, 16, 0x31, 0x8d10);
 
@@ -1318,10 +1363,10 @@ fn plan_reserve_execute_matches_answer_batch_on_both_cpu_tiers() {
         )
     });
 
-    let (expected_serial_ids, expected_serial_values) = pool(1)
-        .install(|| answer_batch_collect(&serial.params, &serial.encrypted, &serial.queries));
+    let (expected_serial_ids, expected_serial_values) =
+        pool(1).install(|| reference_collect(&serial.params, &serial.encrypted, &serial.queries));
     let (expected_parallel_ids, expected_parallel_values) = pool(4)
-        .install(|| answer_batch_collect(&parallel.params, &parallel.encrypted, &parallel.queries));
+        .install(|| reference_collect(&parallel.params, &parallel.encrypted, &parallel.queries));
     assert_eq!(serial_ids, expected_serial_ids);
     assert_eq!(serial_values, expected_serial_values);
     assert_eq!(parallel_ids, expected_parallel_ids);
@@ -1390,7 +1435,7 @@ fn workspace_reuse_grows_once_and_never_shrinks() {
     workspace.reserve(&small_plan).unwrap();
     assert_eq!(workspace.capacity_words(), words);
     let (small_ids, small_values) =
-        answer_batch_collect(&fixture.params, &fixture.encrypted, small_queries);
+        reference_collect(&fixture.params, &fixture.encrypted, small_queries);
     {
         let shrunk = execute_answer_batch(&small_plan, &mut workspace).unwrap();
         assert_eq!(shrunk.arena().as_ptr(), arena_ptr);
@@ -1439,7 +1484,7 @@ fn a_plan_executes_repeatedly_with_identical_answers() {
     assert_eq!(second_values, first_values);
 
     let (expected_ids, expected_values) =
-        answer_batch_collect(&fixture.params, &fixture.encrypted, &fixture.queries);
+        reference_collect(&fixture.params, &fixture.encrypted, &fixture.queries);
     assert_eq!(first_ids, expected_ids);
     assert_eq!(first_values, expected_values);
 }

@@ -4,8 +4,8 @@
 //! mirror: constructors reject the same malformed shapes and lengths, the
 //! `From`/`as_ref` conversions preserve every accessor value, and the pure
 //! consumers that were genericized over the view traits (`decode_into` and
-//! the shape validators) produce identical results over borrowed and owned
-//! answers.
+//! the shape validators) accept wire workspaces without copies and
+//! produce identical results over borrowed and owned storage.
 
 #![expect(
     clippy::unwrap_used,
@@ -13,9 +13,8 @@
 )]
 
 use emvp::{
-    AnswerMatrix, AnswerRef, DecodingKey, DerivedState, EmvpParams, EncryptedMatrixRef,
-    EncryptedQueryRef, MaskContextId, ProtocolError, SecretKey, answer_into, decode_into, encrypt,
-    query,
+    AnswerRef, DecodingKey, DerivedState, EmvpParams, EncryptedMatrixRef, EncryptedQueryRef,
+    MaskContextId, ProtocolError, SecretKey, answer_into, decode_into, encrypt, query,
 };
 use prime_field_layer::{FieldElement, PrimeField};
 use rand_chacha::ChaCha20Rng;
@@ -175,13 +174,6 @@ fn owned_types_round_trip_through_views() {
         &mut answer_values,
     )
     .unwrap();
-    let answer = AnswerMatrix::from_parts(
-        encrypted.instance_id(),
-        encrypted_query.query_id(),
-        answer_values,
-        rows,
-        blocks,
-    );
 
     // `as_ref` and `From` must agree and preserve every accessor value of
     // the owned artifacts.
@@ -210,14 +202,21 @@ fn owned_types_round_trip_through_views() {
         query_ref
     );
 
-    let answer_ref = answer.as_ref();
-    let answer_from: AnswerRef<'_, MODULUS> = (&answer).into();
-    assert_eq!(answer_ref, answer_from);
-    assert_eq!(answer_ref.rows(), answer.rows());
-    assert_eq!(answer_ref.blocks(), answer.blocks());
-    assert_eq!(answer_ref.instance_id(), answer.instance_id());
-    assert_eq!(answer_ref.query_id(), answer.query_id());
-    assert_eq!(answer_ref.values(), answer.values());
+    // The answer view carries the same shape and identifiers the answer
+    // buffer was filled under.
+    let answer_ref = AnswerRef::new(
+        encrypted.instance_id(),
+        encrypted_query.query_id(),
+        &answer_values,
+        rows,
+        blocks,
+    )
+    .unwrap();
+    assert_eq!(answer_ref.rows(), rows);
+    assert_eq!(answer_ref.blocks(), blocks);
+    assert_eq!(answer_ref.instance_id(), encrypted.instance_id());
+    assert_eq!(answer_ref.query_id(), encrypted_query.query_id());
+    assert_eq!(answer_ref.values(), answer_values);
 
     // And the views still round-trip the decoding key's identifiers.
     assert_eq!(answer_ref.instance_id(), decoding_key.instance_id());
@@ -225,7 +224,7 @@ fn owned_types_round_trip_through_views() {
 }
 
 #[test]
-fn decode_through_a_ref_matches_the_owned_matrix() {
+fn decode_through_views_matches_the_naive_product() {
     let mut rng = ChaCha20Rng::seed_from_u64(4);
     let (rows, ell) = (5_usize, 8_usize);
     let mut state = derive_toeplitz(rows, ell);
@@ -239,16 +238,17 @@ fn decode_through_a_ref_matches_the_owned_matrix() {
     let mut values = vec![zero; rows * blocks];
     answer_into(&state.params(), &encrypted, &encrypted_query, &mut values).unwrap();
 
-    // The same answer buffer, decoded through the owned matrix and through
-    // a validated borrowed view, must produce identical products.
-    let owned = AnswerMatrix::from_parts(
+    // The same answer buffer, decoded through two independently
+    // constructed validated views, must produce identical products.
+    let first = AnswerRef::new(
         encrypted.instance_id(),
         encrypted_query.query_id(),
-        values.clone(),
+        &values,
         rows,
         blocks,
-    );
-    let borrowed = AnswerRef::new(
+    )
+    .unwrap();
+    let second = AnswerRef::new(
         encrypted.instance_id(),
         encrypted_query.query_id(),
         &values,
@@ -257,13 +257,13 @@ fn decode_through_a_ref_matches_the_owned_matrix() {
     )
     .unwrap();
 
-    let mut from_owned = vec![zero; rows];
-    decode_into(&owned, &decoding_key, &mut from_owned).unwrap();
-    let mut from_ref = vec![zero; rows];
-    decode_into(&borrowed, &decoding_key, &mut from_ref).unwrap();
+    let mut from_first = vec![zero; rows];
+    decode_into(&first, &decoding_key, &mut from_first).unwrap();
+    let mut from_second = vec![zero; rows];
+    decode_into(&second, &decoding_key, &mut from_second).unwrap();
 
-    assert_eq!(from_owned, from_ref);
-    assert_eq!(from_ref, naive_matrix_vector(&matrix, &q, rows, ell));
+    assert_eq!(from_first, from_second);
+    assert_eq!(from_first, naive_matrix_vector(&matrix, &q, rows, ell));
 }
 
 #[test]
