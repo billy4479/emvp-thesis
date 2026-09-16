@@ -623,7 +623,8 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use std::thread;
 
-    use emvp::{EmvpParams, EncryptedMatrix, answer_batch};
+    use emvp::{AnswerRef, EmvpParams, EncryptedMatrix, answer_batch, answer_into};
+    use prime_field_layer::PrimeField;
     use emvp_network::{
         EvaluateEntry, FrameKind, FrameReader, MatrixUpload, ProductEntry, PROTOCOL_VERSION,
         read_evaluate_payload, read_frame_header, read_upload_matrices_payload, server_handshake,
@@ -632,7 +633,7 @@ mod tests {
     };
     use trapdoor_matrices::ToeplitzFastProduct;
 
-    use super::{Config, Instance, Session, derive_instance, run};
+    use super::{Config, Instance, Session, derive_instance, run, verify_answer};
     use crate::demo::{
         CONTEXT_TOEPLITZ, PROTOCOL_MODULUS, master_seed_from_u64, random_master_seed,
     };
@@ -997,5 +998,58 @@ mod tests {
 
         drop(client_stream);
         server.join().unwrap();
+    }
+
+    /// Steady-state verification of one answer must not allocate: the
+    /// buffers arrive pre-sized from the warm-up call, and every step —
+    /// the pairing check, the protocol decode, the plaintext product, and
+    /// the comparison — runs inline on the calling thread.
+    #[test]
+    fn verify_answer_allocates_nothing_in_steady_state() {
+        let config = config();
+        let instances = derive_instances(&config);
+        let instance = &instances[0];
+        let params = config.params;
+        let encrypted_query = &instance.queries[0];
+        let key = &instance.decoding_keys[0];
+        let rows = instance.rows;
+        let blocks = params.blocks().unwrap();
+        let field = PrimeField::<PROTOCOL_MODULUS>::new();
+        let mut answer_values = vec![field.element_u32(0); rows * blocks];
+        answer_into(&params, &instance.encrypted, encrypted_query, &mut answer_values).unwrap();
+        let answer = AnswerRef::new(
+            instance.encrypted.instance_id(),
+            encrypted_query.query_id(),
+            &answer_values,
+            rows,
+            blocks,
+        )
+        .unwrap();
+        let mut decoded = Vec::new();
+        let mut expected = Vec::new();
+        verify_answer(
+            &answer,
+            key,
+            &instance.plaintext_queries[0],
+            instance,
+            1,
+            &mut decoded,
+            &mut expected,
+        )
+        .unwrap();
+
+        let allocations = allocation_counter::measure(|| {
+            verify_answer(
+                &answer,
+                key,
+                &instance.plaintext_queries[0],
+                instance,
+                1,
+                &mut decoded,
+                &mut expected,
+            )
+            .unwrap();
+        });
+        assert_eq!(allocations.count_total, 0);
     }
 }

@@ -3501,4 +3501,54 @@ mod tests {
             assert_eq!(answers[index], expected);
         }
     }
+
+    /// The execute step of a reserved plan must not allocate on its
+    /// steady-state path: a serial-tier entry runs the inline row kernel on
+    /// the calling thread, so the counting allocator observes the whole
+    /// execution. Parallel-tier counting is deferred with the CPU
+    /// workspace's.
+    #[test]
+    fn execute_into_a_reserved_workspace_allocates_nothing() {
+        // One query against a 2-row matrix stays far below the parallel
+        // threshold under any pool, so the plan fixes the serial tier.
+        let engine = AnswerEngine::cpu();
+        let prepared = engine.prepare(PARAMS, matrix(11, 2)).unwrap();
+        let queries = [query(11, 70)];
+        let jobs = [AnswerJob {
+            matrix: &prepared,
+            queries: &queries,
+        }];
+        let plan = engine.plan(&jobs).unwrap();
+        assert_eq!(
+            plan.entry(0).unwrap().backend(),
+            select_cpu_backend(1, 2, PARAMS.n().unwrap(), rayon::current_num_threads())
+        );
+        let mut workspace = EngineWorkspace::new();
+        workspace.reserve(&plan).unwrap();
+        let _ = engine.execute(&plan, &mut workspace).unwrap();
+
+        let allocations = allocation_counter::measure(|| {
+            let _ = engine.execute(&plan, &mut workspace).unwrap();
+        });
+        assert_eq!(allocations.count_total, 0);
+    }
+
+    /// `release` reports the arena's capacity and ends the workspace: a
+    /// fresh workspace reserves the same plan again from empty.
+    #[test]
+    fn engine_workspace_release_reports_capacity() {
+        let engine = AnswerEngine::cpu();
+        let prepared = engine.prepare(PARAMS, matrix(12, 8)).unwrap();
+        let queries = [query(12, 71), query(12, 72)];
+        let jobs = [AnswerJob {
+            matrix: &prepared,
+            queries: &queries,
+        }];
+        let plan = engine.plan(&jobs).unwrap();
+        let mut workspace = EngineWorkspace::new();
+        workspace.reserve(&plan).unwrap();
+        let capacity = workspace.capacity_words();
+        assert!(capacity >= plan.total_words());
+        assert_eq!(workspace.release(), capacity);
+    }
 }

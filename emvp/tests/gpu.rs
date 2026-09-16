@@ -22,8 +22,9 @@
 use std::time::Duration;
 
 use emvp::{
-    DecodingKey, DerivedState, EmvpParams, EncryptedMatrix, EncryptedQuery, GpuAnswerer, GpuError,
-    MaskContextId, ProtocolError, SecretKey, answer_batch, decode_into, encrypt, query,
+    AnswerPlan, AnswerWorkspace, DecodingKey, DerivedState, EmvpParams, EncryptedMatrix,
+    EncryptedQuery, GpuAnswerer, GpuError, MaskContextId, ProtocolError, SecretKey, answer_batch,
+    decode_into, encrypt, query,
 };
 use prime_field_layer::{FieldElement, PrimeField};
 use proptest::{prelude::*, test_runner::TestCaseError};
@@ -489,4 +490,37 @@ proptest! {
             prop_assert_eq!(gpu_answer, cpu_answer);
         }
     }
+}
+
+#[test]
+#[ignore = "requires a compute adapter"]
+fn execute_into_reuses_the_workspace_across_calls() -> Result<(), GpuError> {
+    let answerer = gpu_answerer()?;
+    let (params, encrypted, queries) = transparent_fixture::<MODULUS>();
+    // The arena is reserved through the shared CPU plan type: the shape
+    // arithmetic is identical on both tiers.
+    let plan = AnswerPlan::plan(&params, &encrypted, &queries).unwrap();
+    let mut workspace = AnswerWorkspace::new();
+    workspace.reserve(&plan).unwrap();
+
+    let gpu_matrix = answerer.upload_matrix(&params, &encrypted)?;
+    let (first_ptr, first_shape, first_arena) = {
+        let (first, _) =
+            answerer.execute_answer_batch_into(&gpu_matrix, &queries, &mut workspace)?;
+        (first.arena().as_ptr(), first.shape(), first.arena().to_vec())
+    };
+    let (second, _) =
+        answerer.execute_answer_batch_into(&gpu_matrix, &queries, &mut workspace)?;
+
+    // Identical answers over the identical storage prove the workspace was
+    // reused: the second execute neither reallocated nor grew the arena.
+    assert_eq!(first_ptr, second.arena().as_ptr());
+    assert_eq!(first_shape, second.shape());
+    assert_eq!(first_arena, second.arena());
+    let cpu = answer_batch(&params, &encrypted, &queries).unwrap();
+    for (index, cpu_answer) in cpu.iter().enumerate() {
+        let view = second.answer(&queries, index).unwrap();
+        assert_eq!(view.values(), cpu_answer.values());
+    }
+    Ok(())
 }

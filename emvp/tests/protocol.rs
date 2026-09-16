@@ -1522,3 +1522,14 @@ fn serial_execute_into_a_reserved_workspace_allocates_nothing() {
     });
     assert_eq!(allocations.count_total, 0);
 }
+
+#[test]
+fn answer_workspace_release_reports_capacity() {
+    let fixture = batch_fixture(4, 2, 0x38, 0x8d61);
+    let plan = AnswerPlan::plan(&fixture.params, &fixture.encrypted, &fixture.queries).unwrap();
+    let mut workspace = AnswerWorkspace::new();
+    workspace.reserve(&plan).unwrap();
+    let capacity = workspace.capacity_words();
+    assert!(capacity >= plan.arena_words());
+    assert_eq!(workspace.release(), capacity);
+}

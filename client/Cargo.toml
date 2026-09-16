@@ -13,5 +13,8 @@ rand_chacha = { workspace = true }
 rand_core = { workspace = true }
 trapdoor-matrices = { path = "../trapdoor-matrices" }
 
+[dev-dependencies]
+allocation-counter = { workspace = true }
+
 [lints]
 workspace = true
