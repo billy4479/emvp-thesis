@@ -11,8 +11,8 @@
 use emvp::{AnswerRef, EmvpParams, EncryptedMatrixRef, EncryptedQueryRef, ProtocolError};
 
 use crate::frame::{Field, PROTOCOL_MODULUS};
-use crate::v2::plan::{EvaluateEntryMeta, EvaluateQueryMeta, ProductsEntryMeta, UploadMatrixMeta};
-use crate::v2::workspace::{EvaluateWorkspace, ProductsWorkspace, UploadWorkspace};
+use crate::plan::{EvaluateEntryMeta, EvaluateQueryMeta, ProductsEntryMeta, UploadMatrixMeta};
+use crate::workspace::{EvaluateWorkspace, ProductsWorkspace, UploadWorkspace};
 
 /// One uploaded encrypted matrix, viewed generically.
 ///
@@ -578,5 +578,5 @@ impl<'a> Iterator for ProductAnswerIter<'a> {
 impl ExactSizeIterator for ProductAnswerIter<'_> {}
 
 /// The decoded upload acknowledgment: the accepted matrix identifiers, in
-/// upload order, borrowing the [`crate::v2::UploadAcceptedWorkspace`].
+/// upload order, borrowing the [`crate::UploadAcceptedWorkspace`].
 pub type UploadAcceptedIds<'a> = &'a [u64];

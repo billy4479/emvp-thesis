@@ -21,7 +21,7 @@ use std::time::Duration;
 
 use criterion::{Criterion, Throughput, criterion_group, criterion_main};
 use emvp::{AnswerRef, EmvpParams, EncryptedQueryRef};
-use emvp_network::v2::{
+use emvp_network::{
     EvaluateEntryInput, EvaluateWorkspace, ProductEntryInput, ProductsWorkspace, UploadMatrixView,
     UploadWorkspace, decode_evaluate, decode_products, decode_upload, plan_evaluate, plan_products,
     plan_upload, write_evaluate, write_products, write_upload_matrices,

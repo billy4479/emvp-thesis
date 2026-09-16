@@ -3,9 +3,9 @@
 //! A workspace owns the field-element arena the value region streams into
 //! plus the plain-scalar descriptor metadata the plan validated. No
 //! borrowed view is ever stored inside a workspace: views construct
-//! [`EncryptedQueryRef`], [`AnswerRef`], and matrix views lazily on
+//! [`emvp::EncryptedQueryRef`], [`emvp::AnswerRef`], and matrix views lazily on
 //! access from the scalars and arena subslices, so a workspace never
-//! holds self-references. [`Workspace::reserve`] is the pipeline's only
+//! holds self-references. [`UploadWorkspace::reserve`] and its siblings are the pipeline's only
 //! growth point; it is monotone, and reusing a workspace across frames of
 //! the same or smaller shape reuses every allocation.
 
@@ -13,11 +13,11 @@ use prime_field_layer::PrimeField;
 
 use crate::error::CodecError;
 use crate::frame::{Field, PROTOCOL_MODULUS};
-use crate::v2::plan::{
+use crate::plan::{
     EvaluateEntryMeta, EvaluatePlan, EvaluateQueryMeta, ProductsEntryMeta, ProductsPlan,
     UploadAcceptedPlan, UploadMatrixMeta, UploadPlan,
 };
-use crate::v2::views::{EvaluateViews, ProductsViews, UploadAcceptedIds, UploadViews};
+use crate::views::{EvaluateViews, ProductsViews, UploadAcceptedIds, UploadViews};
 
 /// The additive zero of the protocol field, the arena's fill value.
 fn zero_field() -> Field {

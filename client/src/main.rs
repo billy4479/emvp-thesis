@@ -226,7 +226,7 @@ mod tests {
     use std::thread;
 
     use emvp::{AnswerRef, EmvpParams, EncryptedMatrix, EncryptedQuery, answer_into};
-    use emvp_network::v2::{
+    use emvp_network::{
         EvaluateWorkspace, ProductEntryInput, UploadWorkspace, decode_evaluate, decode_upload,
         plan_evaluate, plan_upload, write_products,
     };

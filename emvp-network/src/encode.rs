@@ -13,12 +13,12 @@ use crate::frame::{
     FrameKind, HEADER_BYTES, checked_size, field_byte_len, wire_len, write_field_slice,
     write_frame_header, write_u32, write_u64, write_u128,
 };
-use crate::v2::plan::{
+use crate::plan::{
     EVALUATE_ENTRY_DESCRIPTOR_BYTES, EVALUATE_QUERY_DESCRIPTOR_BYTES, EVALUATE_SUMMARY_BYTES,
     PRODUCTS_ANSWER_DESCRIPTOR_BYTES, PRODUCTS_ENTRY_DESCRIPTOR_BYTES, PRODUCTS_SUMMARY_BYTES,
     UPLOAD_DESCRIPTOR_BYTES, UPLOAD_SUMMARY_BYTES,
 };
-use crate::v2::views::{EvaluateEntryInput, ProductEntryInput, UploadMatrixView};
+use crate::views::{EvaluateEntryInput, ProductEntryInput, UploadMatrixView};
 
 /// Writes the one matrix-set upload of a session from borrowed views.
 ///

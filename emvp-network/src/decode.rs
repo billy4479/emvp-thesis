@@ -11,9 +11,9 @@ use std::io::Read;
 
 use crate::error::CodecError;
 use crate::frame::FrameReader;
-use crate::v2::plan::{EvaluatePlan, ProductsPlan, UploadAcceptedPlan, UploadPlan};
-use crate::v2::views::{EvaluateViews, ProductsViews, UploadAcceptedIds, UploadViews};
-use crate::v2::workspace::{
+use crate::plan::{EvaluatePlan, ProductsPlan, UploadAcceptedPlan, UploadPlan};
+use crate::views::{EvaluateViews, ProductsViews, UploadAcceptedIds, UploadViews};
+use crate::workspace::{
     EvaluateWorkspace, ProductsWorkspace, UploadAcceptedWorkspace, UploadWorkspace,
 };
 

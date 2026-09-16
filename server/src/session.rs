@@ -48,14 +48,14 @@ use emvp::{
     AnswerEngine, AnswerEngineError, AnswerJob, EmvpParams, EngineAnswers, EnginePlan,
     EngineWorkspace, PrepareError, PrepareMatrixError, PrepareWorkspace, PreparedMatrix, UploadRef,
 };
-use emvp_network::v2::{
-    EvaluateViews, EvaluateWorkspace, ProductEntryInput, UploadAcceptedPlan,
-    UploadAcceptedWorkspace, UploadViews, UploadWorkspace, decode_evaluate, decode_upload,
-    plan_evaluate, plan_upload, write_products,
-};
 use emvp_network::{
     CodecError, ErrorCode, FrameHeader, FrameKind, FrameReader, HandshakeError, PROTOCOL_MODULUS,
     read_frame_header, server_handshake, write_error, write_upload_accepted,
+};
+use emvp_network::{
+    EvaluateViews, EvaluateWorkspace, ProductEntryInput, UploadAcceptedPlan,
+    UploadAcceptedWorkspace, UploadViews, UploadWorkspace, decode_evaluate, decode_upload,
+    plan_evaluate, plan_upload, write_products,
 };
 
 use crate::failure::RequestFailure;
@@ -826,16 +826,16 @@ mod tests {
         AnswerEngine, AnswerRef, DecodingKey, DerivedState, EmvpParams, EncryptedMatrix,
         EncryptedQuery, EncryptedQueryRef, MaskContextId, ProtocolError, SecretKey, encrypt, query,
     };
-    use emvp_network::v2::{
-        EvaluateEntryInput, EvaluateViews, EvaluateWorkspace, ProductEntryInput, ProductsViews,
-        ProductsWorkspace, UploadMatrixView, UploadViews, UploadWorkspace, decode_evaluate,
-        decode_products, decode_upload, plan_evaluate, plan_products, plan_upload, write_products,
-        write_upload_matrices,
-    };
     use emvp_network::{
         CodecError, ErrorCode, FrameKind, FrameReader, HEADER_BYTES, PROTOCOL_MODULUS,
         client_handshake, read_error, read_frame_header, read_upload_accepted, write_evaluate,
         write_frame_header,
+    };
+    use emvp_network::{
+        EvaluateEntryInput, EvaluateViews, EvaluateWorkspace, ProductEntryInput, ProductsViews,
+        ProductsWorkspace, UploadMatrixView, UploadViews, UploadWorkspace, decode_evaluate,
+        decode_products, decode_upload, plan_evaluate, plan_products, plan_upload, write_products,
+        write_upload_matrices,
     };
     use prime_field_layer::{FieldElement, PrimeField};
     use rand_chacha::ChaCha20Rng;

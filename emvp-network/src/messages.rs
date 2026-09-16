@@ -1,7 +1,7 @@
 //! The error and upload-acknowledgment message codecs.
 //!
 //! Protocol v2 moves the bulk messages (matrix uploads, evaluations,
-//! products) to the zero-copy view pipeline in [`crate::v2`]; this module
+//! products) to the zero-copy view pipeline in [`crate::plan`], [`crate::workspace`], [`crate::decode`], and [`crate::encode`]; this module
 //! keeps only the surface that stays off the hot path by decision: the
 //! structured [`ErrorResponse`] record with its writer and readers, and
 //! the `UploadAccepted` acknowledgment pair, which carries only `u64`
@@ -105,14 +105,14 @@ pub fn write_error(
 ///
 /// # Errors
 ///
-/// Returns the errors of [`crate::v2::plan_upload_accepted`].
+/// Returns the errors of [`crate::plan_upload_accepted`].
 pub fn read_upload_accepted_payload<R: Read>(
     frame: &mut FrameReader<'_, R>,
 ) -> Result<Vec<u64>, CodecError> {
-    let plan = crate::v2::plan_upload_accepted(frame)?;
-    let mut workspace = crate::v2::UploadAcceptedWorkspace::new();
+    let plan = crate::plan_upload_accepted(frame)?;
+    let mut workspace = crate::UploadAcceptedWorkspace::new();
     workspace.reserve(&plan)?;
-    let identifiers = crate::v2::decode_upload_accepted(frame, &plan, &mut workspace)?;
+    let identifiers = crate::decode_upload_accepted(frame, &plan, &mut workspace)?;
     Ok(identifiers.to_vec())
 }
 

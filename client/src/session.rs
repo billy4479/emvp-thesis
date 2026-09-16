@@ -21,14 +21,14 @@ use emvp::{
     AnswerRef, DecodingKey, EmvpParams, EncryptedMatrix, EncryptedQuery, EncryptedQueryRef,
     MaskContextId, ProtocolError, SecretKey, TdmMask, decode_into, encrypt, query_batch,
 };
-use emvp_network::v2::{
-    EvaluateEntryInput, ProductsViews, ProductsWorkspace, UploadAcceptedWorkspace,
-    UploadMatrixView, decode_products, decode_upload_accepted, plan_products, plan_upload_accepted,
-    write_evaluate, write_upload_matrices,
-};
 use emvp_network::{
     CodecError, FrameKind, FrameReader, HEADER_BYTES, PROTOCOL_MODULUS, client_handshake,
     read_error_payload, read_frame_header,
+};
+use emvp_network::{
+    EvaluateEntryInput, ProductsViews, ProductsWorkspace, UploadAcceptedWorkspace,
+    UploadMatrixView, decode_products, decode_upload_accepted, plan_products, plan_upload_accepted,
+    write_evaluate, write_upload_matrices,
 };
 use prime_field_layer::PrimeField;
 use rand_chacha::ChaCha20Rng;
@@ -630,7 +630,7 @@ mod tests {
     use emvp::{
         AnswerRef, EmvpParams, EncryptedMatrix, EncryptedQuery, EncryptedQueryRef, answer_into,
     };
-    use emvp_network::v2::{
+    use emvp_network::{
         EvaluateEntryInput, EvaluateViews, EvaluateWorkspace, ProductEntryInput, UploadMatrixView,
         UploadWorkspace, decode_evaluate, decode_upload, plan_evaluate, plan_upload,
         write_products,
