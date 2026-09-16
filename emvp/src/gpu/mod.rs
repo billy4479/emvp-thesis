@@ -63,8 +63,11 @@
 //! and the staging copy are fused into a single pass with no intermediate
 //! allocation (all wgpu-supported hosts are little-endian, and the
 //! workspace denies `unsafe`). Readbacks map only the live slice of the
-//! staging buffer, and the per-query answer vectors are reconstructed in
-//! one pass over the mapped bytes.
+//! staging buffer and stream the answer words straight into a caller-owned
+//! arena in one pass over the mapped bytes
+//! ([`GpuAnswerer::execute_answer_batch_into`]); the legacy
+//! [`GpuAnswerer::answer_batch`] adapters run that same into-write and
+//! convert the arena into per-query [`AnswerMatrix`]s on top.
 //!
 //! # Blocking behavior
 //!
@@ -110,6 +113,7 @@ use std::time::{Duration, Instant};
 
 use prime_field_layer::{FieldElement, PrimeField};
 
+use crate::answer::{AnswerWorkspace, Answers};
 use crate::params::EmvpParams;
 use crate::protocol::{
     AnswerMatrix, EncryptedMatrix, EncryptedQuery, ProtocolError, validate_matrix_shape,
@@ -212,6 +216,15 @@ pub enum GpuError {
         /// The observed length.
         actual: usize,
     },
+    /// A caller-owned answer arena was too small for the batch's answers.
+    /// Reported before any device work or arena mutation, so the caller can
+    /// grow the workspace and retry whole.
+    Capacity {
+        /// The required arena word count.
+        required: usize,
+        /// The available arena word count.
+        available: usize,
+    },
     /// Two protocol artifacts belong to different matrix instances.
     InstanceMismatch {
         /// The required public instance identifier.
@@ -287,6 +300,13 @@ impl fmt::Display for GpuError {
             } => write!(
                 formatter,
                 "{name} length mismatch: expected {expected}, got {actual}"
+            ),
+            Self::Capacity {
+                required,
+                available,
+            } => write!(
+                formatter,
+                "answer workspace holds {available} words but the batch needs {required}"
             ),
             Self::InstanceMismatch { expected, actual } => write!(
                 formatter,
@@ -624,9 +644,11 @@ impl GpuAnswerer {
     /// a two-step Montgomery fold plus an `R2` correction, writing one
     /// canonical word per element of the query-major answer arena.
     /// Validation is all-or-nothing and
-    /// mirrors the CPU path; results are bit-identical to it. Buffers are
-    /// leased from the answerer's scratch pool and returned afterwards, so
-    /// steady-state calls allocate nothing.
+    /// mirrors the CPU path; results are bit-identical to it. This is the
+    /// temporary allocating adapter over the plan-reserve-execute path
+    /// ([`Self::answer_batch_plan`] and [`Self::execute_answer_batch_into`]);
+    /// it pays one arena allocation plus one per-query [`AnswerMatrix`]
+    /// conversion the into-API avoids.
     ///
     /// # Errors
     ///
@@ -654,7 +676,8 @@ impl GpuAnswerer {
     /// [`PhaseTimings::dispatch_submit`]), how long the calling thread
     /// blocks on the device ([`PhaseTimings::wait_readback`]), and how long
     /// the host spends reconstructing the answers afterwards
-    /// ([`PhaseTimings::reconstruct`]).
+    /// ([`PhaseTimings::reconstruct`], which on this adapter covers the
+    /// into-arena write and the per-query [`AnswerMatrix`] conversion).
     ///
     /// # Errors
     ///
@@ -666,16 +689,142 @@ impl GpuAnswerer {
     ) -> Result<(Vec<AnswerMatrix<MODULUS>>, PhaseTimings), GpuError> {
         check_modulus::<MODULUS>()?;
         let shape = self.answer_shape(matrix, queries)?;
-        let pipeline = self.answer_pipeline::<MODULUS>();
-        let (workgroups_x, workgroups_y) = dispatch_grid(shape.answer_words)?;
-        let uniform_bytes = dims_uniform_bytes(
-            shape.n,
-            shape.b,
-            shape.s,
-            shape.rows,
-            shape.batch,
-            workgroups_x,
+        let mut workspace = AnswerWorkspace::<MODULUS>::new();
+        workspace
+            .reserve_words(shape.answer_words)
+            .map_err(map_capacity_error)?;
+        let host_shape =
+            crate::answer::AnswerShape::new(shape.rows, shape.s, shape.batch, matrix.instance_id());
+        let mut timings = {
+            let arena = workspace.arena_mut();
+            self.execute_validated_batch_into(
+                matrix,
+                queries,
+                &shape,
+                &mut arena[..shape.answer_words],
+            )?
+        };
+        let conversion_start = Instant::now();
+        let answers = owned_answers(
+            &workspace.arena()[..shape.answer_words],
+            queries,
+            &host_shape,
         )?;
+        timings.reconstruct += conversion_start.elapsed();
+        Ok((answers, timings))
+    }
+
+    /// Plans a single-batch GPU answer without device-side side effects on
+    /// the batch itself.
+    ///
+    /// This is the plan step of the GPU plan-reserve-execute path: it runs
+    /// the same all-or-nothing validation as
+    /// [`Self::answer_batch_with_timings`] and derives and validates the
+    /// dispatch grid and uniform bytes, so a plan that returns here is
+    /// executable except for caller-side arena capacity. It also warms the
+    /// per-modulus pipeline cache, moving one-time shader compilation out
+    /// of the execute call.
+    ///
+    /// The returned [`crate::answer::AnswerShape`] is the CPU path's shape
+    /// type: `shape.arena_words()` is the exact word count
+    /// [`Self::execute_answer_batch_into`] writes into the caller's
+    /// workspace, so a caller can size an [`AnswerWorkspace`] from it.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error before any device work if the parameters are
+    /// malformed, the batch is empty, any query has the wrong length or a
+    /// foreign instance identifier, an index or size would overflow, the
+    /// query/output buffers exceed the device's capacity, or the kernel's
+    /// dispatch grid cannot be derived.
+    pub fn answer_batch_plan<const MODULUS: u32>(
+        &self,
+        matrix: &GpuEncryptedMatrix<MODULUS>,
+        queries: &[EncryptedQuery<MODULUS>],
+    ) -> Result<crate::answer::AnswerShape, GpuError> {
+        check_modulus::<MODULUS>()?;
+        let shape = self.answer_shape(matrix, queries)?;
+        let _dispatch = self.answer_dispatch::<MODULUS>(&shape)?;
+        Ok(crate::answer::AnswerShape::new(
+            shape.rows,
+            shape.s,
+            shape.batch,
+            matrix.instance_id(),
+        ))
+    }
+
+    /// Executes a planned single-batch GPU answer into a caller-owned
+    /// workspace, without allocating.
+    ///
+    /// The execute step of the GPU plan-reserve-execute path: it re-runs
+    /// the plan's validation, checks the workspace's capacity first, and
+    /// then runs the same pipeline as [`Self::answer_batch_with_timings`]
+    /// — scratch lease from the pool, query upload, dispatch, staged
+    /// readback — but streams the readback words straight into the
+    /// workspace's arena subslice `[0, shape.arena_words())` in the CPU
+    /// path's query-major layout: query `q` of the batch occupies
+    /// `[q * rows * s, (q + 1) * rows * s)`. A warm scratch pool serves the
+    /// whole call without allocating; the scratch set returns to the pool
+    /// on success and is dropped on any error path, as before.
+    ///
+    /// The returned [`Answers`] borrows the workspace's arena, so a client
+    /// decodes straight from it without copying.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`GpuError::Capacity`] before any device work or arena
+    /// mutation when `workspace.capacity_words()` is below
+    /// `shape.arena_words()`; returns the plan's validation errors and the
+    /// device errors of [`Self::answer_batch`] otherwise. On an error the
+    /// arena's contents are unspecified: callers must treat it as
+    /// unwritten.
+    pub fn execute_answer_batch_into<'ws, const MODULUS: u32>(
+        &self,
+        matrix: &GpuEncryptedMatrix<MODULUS>,
+        queries: &[EncryptedQuery<MODULUS>],
+        workspace: &'ws mut AnswerWorkspace<MODULUS>,
+    ) -> Result<(Answers<'ws, MODULUS>, PhaseTimings), GpuError> {
+        check_modulus::<MODULUS>()?;
+        let shape = self.answer_shape(matrix, queries)?;
+        // Capacity first: reject before any device work or mutation.
+        check_arena_capacity(workspace.capacity_words(), shape.answer_words)?;
+        let host_shape =
+            crate::answer::AnswerShape::new(shape.rows, shape.s, shape.batch, matrix.instance_id());
+        let timings = {
+            let arena = workspace.arena_mut();
+            self.execute_validated_batch_into(
+                matrix,
+                queries,
+                &shape,
+                &mut arena[..shape.answer_words],
+            )?
+        };
+        Ok((
+            Answers::from_arena(&workspace.arena()[..shape.answer_words], host_shape),
+            timings,
+        ))
+    }
+
+    /// The shared validated pipeline behind
+    /// [`Self::execute_answer_batch_into`] and the legacy allocating
+    /// adapters: lease scratch, prepare, encode and upload, submit, wait,
+    /// and stream the staged answers into `dest`.
+    ///
+    /// `dest` must hold at least `shape.answer_words` words; exactly that
+    /// prefix is written, query-major. On every success path the leased
+    /// scratch set returns to the pool; on any error path it is dropped
+    /// instead, which only costs the next call a fresh allocation.
+    fn execute_validated_batch_into<const MODULUS: u32>(
+        &self,
+        matrix: &GpuEncryptedMatrix<MODULUS>,
+        queries: &[EncryptedQuery<MODULUS>],
+        shape: &AnswerShape,
+        dest: &mut [FieldElement<MODULUS>],
+    ) -> Result<PhaseTimings, GpuError> {
+        // Fail-closed: the callers slice `dest` to the validated length,
+        // and the write below trusts that slice.
+        check_arena_capacity(dest.len(), shape.answer_words)?;
+        let dispatch = self.answer_dispatch::<MODULUS>(shape)?;
         let mut timings = PhaseTimings::default();
         let pooled = {
             let mut pool = lock_recovered(&self.scratch_pool);
@@ -700,7 +849,8 @@ impl GpuAnswerer {
             let mut view = staged_write_view(&self.queue, query_buffer, shape.query_words_u32)?;
             fill_query_view(&mut view, queries);
             drop(view);
-            self.queue.write_buffer(uniform_buffer, 0, &uniform_bytes);
+            self.queue
+                .write_buffer(uniform_buffer, 0, &dispatch.uniform);
             start.elapsed()
         };
 
@@ -709,9 +859,9 @@ impl GpuAnswerer {
             let start = Instant::now();
             let submission = self.submit_answer_dispatch::<MODULUS>(
                 matrix,
-                &pipeline,
+                &dispatch.pipeline,
                 (query_buffer, uniform_buffer, output_buffer, staging_buffer),
-                (workgroups_x, workgroups_y),
+                dispatch.workgroups,
                 answer_bytes,
             );
             timings.dispatch_submit = start.elapsed();
@@ -724,17 +874,43 @@ impl GpuAnswerer {
             timings.wait_readback = start.elapsed();
         }
 
-        let answers = {
+        {
             let start = Instant::now();
-            let answers =
-                read_staged_answers(matrix.instance_id(), queries, staging_buffer, &shape)?;
+            reconstruct_staged_into::<MODULUS>(
+                staging_buffer,
+                &mut dest[..shape.answer_words],
+                shape.answer_words_u32,
+            )?;
             timings.reconstruct = start.elapsed();
-            answers
-        };
+        }
         // Return the set to the pool. Error paths above drop it instead,
         // which only costs the next call a fresh allocation.
         lock_recovered(&self.scratch_pool).push(scratch);
-        Ok((answers, timings))
+        Ok(timings)
+    }
+
+    /// Derives the pipeline, dispatch grid, and uniform bytes for one
+    /// validated answer shape — the shared preflight of the plan and
+    /// execute paths, so both reject the same undeliverable shapes.
+    fn answer_dispatch<const MODULUS: u32>(
+        &self,
+        shape: &AnswerShape,
+    ) -> Result<AnswerDispatch, GpuError> {
+        let pipeline = self.answer_pipeline::<MODULUS>();
+        let workgroups = dispatch_grid(shape.answer_words)?;
+        let uniform = dims_uniform_bytes(
+            shape.n,
+            shape.b,
+            shape.s,
+            shape.rows,
+            shape.batch,
+            workgroups.0,
+        )?;
+        Ok(AnswerDispatch {
+            pipeline,
+            workgroups,
+            uniform,
+        })
     }
 
     /// Returns the cached answer pipeline for this modulus, compiling it on
@@ -919,7 +1095,6 @@ impl GpuAnswerer {
             query_words_u32,
             answer_words_u32,
             answer_words,
-            answer_words_per_query,
         })
     }
 
@@ -1020,6 +1195,15 @@ impl GpuAnswerer {
     }
 }
 
+/// The device-ready dispatch plan for one validated answer shape: the
+/// modulus's compiled pipeline, the 2D workgroup grid the kernel
+/// reconstructs its linear index from, and the encoded `Dims` uniform.
+struct AnswerDispatch {
+    pipeline: wgpu::ComputePipeline,
+    workgroups: (u32, u32),
+    uniform: [u8; DIMS_UNIFORM_WORDS * WORD_BYTES],
+}
+
 /// Kernel dimensions and buffer sizes for one validated answer batch.
 struct AnswerShape {
     /// The codeword length `n = 2k`.
@@ -1038,8 +1222,6 @@ struct AnswerShape {
     answer_words_u32: u32,
     /// `B * rows * s` in host arithmetic, for the readback allocation.
     answer_words: usize,
-    /// `rows * s`, the per-query answer slice length.
-    answer_words_per_query: usize,
 }
 
 /// A reusable set of device buffers for one answer batch.
@@ -1290,18 +1472,20 @@ fn fill_query_view<const MODULUS: u32>(
     );
 }
 
-/// Converts the mapped staging bytes into one [`AnswerMatrix`] per
-/// query and releases the mapping.
+/// Maps the staged answer bytes and streams them into `dest`, releasing
+/// the mapping on every path.
 ///
-/// The mapping is released on every path after it succeeded, so a pooled
-/// scratch set is always returned to the pool unmapped.
-fn read_staged_answers<const MODULUS: u32>(
-    instance_id: u128,
-    queries: &[EncryptedQuery<MODULUS>],
+/// The staging buffer holds the kernel's query-major arena for the batch;
+/// `dest` must hold exactly the same word count, which the validated shape
+/// fixes. On an error the mapping is still released, so a pooled scratch
+/// set is always returned to the pool unmapped, and `dest`'s contents are
+/// unspecified: the caller treats the whole batch as failed.
+fn reconstruct_staged_into<const MODULUS: u32>(
     staging_buffer: &wgpu::Buffer,
-    shape: &AnswerShape,
-) -> Result<Vec<AnswerMatrix<MODULUS>>, GpuError> {
-    let byte_len = byte_len_of_words(shape.answer_words_u32);
+    dest: &mut [FieldElement<MODULUS>],
+    answer_words_u32: u32,
+) -> Result<(), GpuError> {
+    let byte_len = byte_len_of_words(answer_words_u32);
     let data = match staging_buffer.slice(0..byte_len).get_mapped_range() {
         Ok(data) => data,
         Err(error) => {
@@ -1309,17 +1493,114 @@ fn read_staged_answers<const MODULUS: u32>(
             return Err(GpuError::Map(error.to_string()));
         }
     };
-    let answers = match reconstruct_answers(instance_id, queries, shape, &data) {
-        Ok(answers) => answers,
-        Err(error) => {
-            drop(data);
-            staging_buffer.unmap();
-            return Err(error);
-        }
-    };
+    let result = reconstruct_bytes_into::<MODULUS>(dest, &data);
     drop(data);
     staging_buffer.unmap();
-    Ok(answers)
+    result
+}
+
+/// Streams little-endian staged answer words into `dest` as canonical
+/// field elements, rejecting a corrupt word precisely.
+///
+/// Each word is wrapped with the checked
+/// [`FieldElement::try_from_raw`](prime_field_layer::FieldElement::try_from_raw):
+/// the kernel's final fold produces canonical words, so a word outside
+/// `0..MODULUS` means a corrupt readback and is rejected as
+/// [`GpuError::NonCanonicalWord`] with the offending word, never
+/// canonicalized. The byte length is checked against `dest` before any
+/// write, so a length mismatch leaves `dest` untouched.
+///
+/// This is the device-free core of the into-arena readback: one pass over
+/// the mapped bytes, no intermediate allocation.
+fn reconstruct_bytes_into<const MODULUS: u32>(
+    dest: &mut [FieldElement<MODULUS>],
+    bytes: &[u8],
+) -> Result<(), GpuError> {
+    let expected = dest
+        .len()
+        .checked_mul(WORD_BYTES)
+        .ok_or(GpuError::DimensionOverflow)?;
+    if bytes.len() != expected {
+        return Err(GpuError::LengthMismatch {
+            name: "staged answer bytes",
+            expected,
+            actual: bytes.len(),
+        });
+    }
+    for (slot, word) in dest.iter_mut().zip(bytes.chunks_exact(WORD_BYTES)) {
+        *slot = staged_answer_word::<MODULUS>(word)?;
+    }
+    Ok(())
+}
+
+/// Checks a destination arena can hold a batch's answers before any work
+/// or mutation happens.
+const fn check_arena_capacity(dest_words: usize, required: usize) -> Result<(), GpuError> {
+    if dest_words >= required {
+        Ok(())
+    } else {
+        Err(GpuError::Capacity {
+            required,
+            available: dest_words,
+        })
+    }
+}
+
+/// Maps the workspace-growth failure onto its GPU equivalent. Only
+/// [`ProtocolError::Capacity`] is reachable from [`AnswerWorkspace::reserve_words`],
+/// and it maps losslessly; the catch-all arm keeps the conversion total
+/// and fail-closed.
+fn map_capacity_error(error: ProtocolError) -> GpuError {
+    match error {
+        ProtocolError::Capacity {
+            required,
+            available,
+        } => GpuError::Capacity {
+            required,
+            available,
+        },
+        other => GpuError::from(other),
+    }
+}
+
+/// Splits a filled query-major arena prefix into one owned
+/// [`AnswerMatrix`] per query — the temporary conversion the legacy
+/// allocating adapters run over the into-API's output.
+///
+/// `shape` must be the shape the arena was validated and filled with, so
+/// the arena length is checked against it only fail-closed. The split
+/// allocates one `Vec` per query, which is exactly the allocation profile
+/// the old pre-arena path had.
+fn owned_answers<const MODULUS: u32>(
+    arena: &[FieldElement<MODULUS>],
+    queries: &[EncryptedQuery<MODULUS>],
+    shape: &crate::answer::AnswerShape,
+) -> Result<Vec<AnswerMatrix<MODULUS>>, GpuError> {
+    let answer_words = shape.answer_words().ok_or(GpuError::DimensionOverflow)?;
+    let expected = queries
+        .len()
+        .checked_mul(answer_words)
+        .ok_or(GpuError::DimensionOverflow)?;
+    if arena.len() != expected {
+        return Err(GpuError::LengthMismatch {
+            name: "answer arena",
+            expected,
+            actual: arena.len(),
+        });
+    }
+    queries
+        .iter()
+        .zip(arena.chunks_exact(answer_words))
+        .map(|(query, values)| {
+            Ok(AnswerMatrix::from_parts(
+                shape.instance_id(),
+                query.query_id(),
+                values.to_vec(),
+                shape.rows(),
+                shape.blocks(),
+            ))
+        })
+        .collect()
 }
 
 /// Wraps one little-endian staged answer word as a canonical field
@@ -1332,67 +1613,6 @@ pub(crate) fn staged_answer_word<const MODULUS: u32>(
         word: raw,
         modulus: MODULUS,
     })
-}
-
-/// Splits the staged answer bytes into one [`AnswerMatrix`] per query.
-///
-/// The byte layout is fixed by the validated shape: `bytes` holds exactly
-/// `queries.len() * words_per_query` little-endian words in query-major
-/// order (the kernel's arena layout), so a length mismatch is unreachable;
-/// the check exists to stay fail-closed.
-///
-/// Each readback word is wrapped with the checked
-/// [`FieldElement::try_from_raw`](prime_field_layer::FieldElement::try_from_raw):
-/// the kernel's final fold produces canonical words, so a word outside
-/// `0..MODULUS` means a corrupt readback and is rejected as
-/// [`GpuError::NonCanonicalWord`] with the offending word, never
-/// canonicalized.
-///
-/// Each per-query `collect` runs over a trusted-length iterator
-/// (`chunks_exact` over an exact-multiple slice), so it performs one
-/// allocation and writes the [`FieldElement`]s directly: no intermediate
-/// answer arena, no per-element growth, and no later per-query copy.
-fn reconstruct_answers<const MODULUS: u32>(
-    instance_id: u128,
-    queries: &[EncryptedQuery<MODULUS>],
-    shape: &AnswerShape,
-    bytes: &[u8],
-) -> Result<Vec<AnswerMatrix<MODULUS>>, GpuError> {
-    let bytes_per_query = shape
-        .answer_words_per_query
-        .checked_mul(WORD_BYTES)
-        .ok_or(GpuError::DimensionOverflow)?;
-    let expected = queries
-        .len()
-        .checked_mul(bytes_per_query)
-        .ok_or(GpuError::DimensionOverflow)?;
-    if bytes.len() != expected {
-        return Err(GpuError::LengthMismatch {
-            name: "staged answer bytes",
-            expected,
-            actual: bytes.len(),
-        });
-    }
-    let answers = queries
-        .iter()
-        .zip(bytes.chunks_exact(bytes_per_query))
-        .map(
-            |(query, chunk)| -> Result<AnswerMatrix<MODULUS>, GpuError> {
-                let values: Vec<FieldElement<MODULUS>> = chunk
-                    .chunks_exact(WORD_BYTES)
-                    .map(staged_answer_word)
-                    .collect::<Result<Vec<_>, GpuError>>()?;
-                Ok(AnswerMatrix::from_parts(
-                    instance_id,
-                    query.query_id(),
-                    values,
-                    shape.rows,
-                    shape.s,
-                ))
-            },
-        )
-        .collect::<Result<Vec<_>, GpuError>>()?;
-    Ok(answers)
 }
 
 /// Folds the linear output count into a 2D workgroup dispatch that stays
@@ -1460,9 +1680,10 @@ pub(crate) fn byte_len_of_words(words: u32) -> wgpu::BufferAddress {
 #[cfg(test)]
 mod tests {
     use super::{
-        ANSWER_WGSL, AnswerShape, MAX_ANSWER_WORDS, MAX_WORKGROUPS_PER_DIMENSION,
-        WORKGROUP_SIZE_USIZE, dispatch_grid, reconstruct_answers,
+        ANSWER_WGSL, MAX_ANSWER_WORDS, MAX_WORKGROUPS_PER_DIMENSION, WORKGROUP_SIZE_USIZE,
+        check_arena_capacity, dispatch_grid, owned_answers, reconstruct_bytes_into,
     };
+    use crate::answer::AnswerShape;
     use crate::params::EmvpParams;
     use crate::protocol::{EncryptedMatrix, EncryptedQuery};
     use prime_field_layer::{FieldElement, PrimeField};
@@ -1487,19 +1708,11 @@ mod tests {
     }
 
     /// The validated shape of the two-query host-reconstruction fixture:
-    /// n = 2 (k = 1), b = 2, s = 1, two rows, two queries.
+    /// n = 2 (k = 1), b = 2, s = 1, two rows, two queries. The host shape
+    /// is the plan/execute API's shape type, whose arena holds exactly
+    /// `queries * rows * s = 4` words.
     fn host_shape() -> AnswerShape {
-        AnswerShape {
-            n: 2,
-            b: 2,
-            s: 1,
-            rows: 2,
-            batch: 2,
-            query_words_u32: 4,
-            answer_words_u32: 4,
-            answer_words: 4,
-            answer_words_per_query: 2,
-        }
+        AnswerShape::new(2, 1, 2, 7)
     }
 
     /// The canonical Montgomery words of the sums 17, 39, 23, 53: each is
@@ -1524,22 +1737,43 @@ mod tests {
         words.iter().flat_map(|word| word.to_le_bytes()).collect()
     }
 
-    /// Canonical device words must reconstruct into exactly the elements
-    /// they are the Montgomery images of, split per query in the kernel's
-    /// query-major arena order.
+    /// A destination arena poisoned with a sentinel element (the field
+    /// value `p - 1`, distinct from every fixture answer), so a test can
+    /// observe exactly which slots a rejected write touched.
+    fn poison_sentinel() -> FieldElement<MODULUS> {
+        PrimeField::<MODULUS>::new().element_u32(MODULUS - 1)
+    }
+
+    fn poisoned_dest() -> Vec<FieldElement<MODULUS>> {
+        vec![poison_sentinel(); HOST_GOLDEN_WORDS.len()]
+    }
+
+    /// Canonical device words must stream into the caller's arena as
+    /// exactly the elements they are the Montgomery images of, in the
+    /// kernel's query-major order, leaving no allocation behind.
     #[test]
-    fn reconstruct_answers_accepts_canonical_device_words() {
+    fn reconstruct_into_arena_accepts_canonical_device_words() {
         let field = PrimeField::<MODULUS>::new();
+        let mut dest = poisoned_dest();
+        reconstruct_bytes_into::<MODULUS>(&mut dest, &host_bytes(&HOST_GOLDEN_WORDS))
+            .expect("canonical words must reconstruct");
+        let expected = [17_u32, 39, 23, 53]
+            .iter()
+            .map(|&sum| field.element_u32(sum));
+        for (slot, expected_element) in dest.iter().zip(expected) {
+            assert_eq!(slot, &expected_element);
+        }
+        // The owned split the legacy adapter performs over the filled arena
+        // pairs the same elements with the batch's public identifiers.
         let queries = host_queries();
         let answers =
-            reconstruct_answers(7, &queries, &host_shape(), &host_bytes(&HOST_GOLDEN_WORDS))
-                .expect("canonical words must reconstruct");
+            owned_answers(&dest, &queries, &host_shape()).expect("the fixture shape fits");
         assert_eq!(answers.len(), 2);
-        let expected: Vec<Vec<FieldElement<MODULUS>>> = [[17_u32, 39], [23, 53]]
+        let expected_per_query: Vec<Vec<FieldElement<MODULUS>>> = [[17_u32, 39], [23, 53]]
             .iter()
             .map(|sums| sums.iter().map(|&sum| field.element_u32(sum)).collect())
             .collect();
-        for (answer, expected_values) in answers.iter().zip(&expected) {
+        for (answer, expected_values) in answers.iter().zip(&expected_per_query) {
             assert_eq!(answer.values(), expected_values.as_slice());
             assert_eq!(answer.rows(), 2);
             assert_eq!(answer.blocks(), 1);
@@ -1550,19 +1784,17 @@ mod tests {
     }
 
     /// A device word at or above the modulus is not a canonical Montgomery
-    /// residue: reconstruction must reject it precisely, carrying the
+    /// residue: the into-write must reject it precisely, carrying the
     /// offending word, instead of silently canonicalizing it.
     #[test]
-    fn reconstruct_answers_rejects_noncanonical_device_words() {
-        let queries = host_queries();
-        let shape = host_shape();
-        // First query's words are canonical (the Montgomery images of 17
-        // and 39); the second query's first word is the smallest
-        // noncanonical residue, the modulus itself.
+    fn reconstruct_into_arena_rejects_noncanonical_device_words() {
+        // The third word is the smallest noncanonical residue, the modulus
+        // itself; the first two were already streamed when the rejection
+        // fires, so the caller treats the whole arena as failed.
         let mut words = HOST_GOLDEN_WORDS.to_vec();
         words[2] = MODULUS;
-        let error = reconstruct_answers(7, &queries, &shape, &host_bytes(&words))
-            .expect_err("the modulus itself is not canonical");
+        let mut dest = poisoned_dest();
+        let error = reconstruct_bytes_into::<MODULUS>(&mut dest, &host_bytes(&words)).unwrap_err();
         assert_eq!(
             error,
             super::GpuError::NonCanonicalWord {
@@ -1575,23 +1807,49 @@ mod tests {
         let mut words = HOST_GOLDEN_WORDS.to_vec();
         words[3] = u32::MAX;
         assert!(matches!(
-            reconstruct_answers(7, &queries, &host_shape(), &host_bytes(&words)),
+            reconstruct_bytes_into::<MODULUS>(&mut poisoned_dest(), &host_bytes(&words)),
             Err(super::GpuError::NonCanonicalWord {
                 word: u32::MAX,
                 modulus: MODULUS,
             })
         ));
 
-        // A byte buffer shorter than the validated shape is rejected
-        // fail-closed before any word is wrapped.
+        // A byte buffer shorter than the destination is rejected
+        // fail-closed before any word is wrapped, leaving the destination
+        // poisoned untouched.
         let bytes = host_bytes(&HOST_GOLDEN_WORDS);
+        let mut dest = poisoned_dest();
         assert!(matches!(
-            reconstruct_answers(7, &queries, &host_shape(), &bytes[..bytes.len() - 1]),
+            reconstruct_bytes_into::<MODULUS>(&mut dest, &bytes[..bytes.len() - 1]),
             Err(super::GpuError::LengthMismatch {
                 name: "staged answer bytes",
                 ..
             })
         ));
+        assert!(dest.iter().all(|slot| *slot == poison_sentinel()));
+    }
+
+    /// An insufficient arena capacity must be rejected before any device
+    /// work and before any arena mutation: the rejection carries both
+    /// counts and leaves the caller's words untouched.
+    #[test]
+    fn insufficient_capacity_is_rejected_before_any_mutation() {
+        // No `mut`: the rejection happens before any mutation could, which
+        // is exactly the property under test.
+        let dest = poisoned_dest();
+        assert_eq!(
+            check_arena_capacity(dest.len(), HOST_GOLDEN_WORDS.len() + 1),
+            Err(super::GpuError::Capacity {
+                required: HOST_GOLDEN_WORDS.len() + 1,
+                available: HOST_GOLDEN_WORDS.len(),
+            })
+        );
+        // Exactly enough capacity is accepted; the caller proceeds.
+        assert_eq!(
+            check_arena_capacity(dest.len(), HOST_GOLDEN_WORDS.len()),
+            Ok(())
+        );
+        assert!(dest.iter().all(|slot| *slot == poison_sentinel()));
     }
 
     /// The shared matrix-shape validation the GPU upload runs (and the CPU

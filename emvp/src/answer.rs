@@ -56,6 +56,22 @@ pub struct AnswerShape {
 }
 
 impl AnswerShape {
+    /// Builds a shape from already-validated parts.
+    ///
+    /// Crate-internal constructor for the GPU answer path, whose batch
+    /// validation runs against device-resident shapes in `crate::gpu` and
+    /// produces the same rows, blocks, query count, and instance identifier
+    /// this type pins for the CPU path.
+    #[cfg(feature = "gpu")]
+    pub(crate) const fn new(rows: usize, blocks: usize, queries: usize, instance_id: u128) -> Self {
+        Self {
+            rows,
+            blocks,
+            queries,
+            instance_id,
+        }
+    }
+
     /// Returns the answer row count (`m`).
     #[must_use]
     pub const fn rows(&self) -> usize {
@@ -340,6 +356,48 @@ impl<const MODULUS: u32> AnswerWorkspace<MODULUS> {
         self.arena.len()
     }
 
+    /// Grows the arena to hold `words` field elements, and never shrinks it.
+    ///
+    /// The word-count form of [`Self::reserve`]: same single growth point,
+    /// same never-shrinking contract, for plans whose shapes were validated
+    /// outside this module (the GPU answer path).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProtocolError::Capacity`] when the allocator refuses the
+    /// growth, naming the requirement and the workspace's usable words.
+    #[cfg(feature = "gpu")]
+    pub(crate) fn reserve_words(&mut self, words: usize) -> Result<(), ProtocolError> {
+        let available = self.arena.len();
+        if words <= available {
+            return Ok(());
+        }
+        self.arena
+            .try_reserve_exact(words - available)
+            .map_err(|_allocation_failure| ProtocolError::Capacity {
+                required: words,
+                available,
+            })?;
+        let zero = PrimeField::<MODULUS>::new().element_u32(0);
+        self.arena.resize(words, zero);
+        Ok(())
+    }
+
+    /// Returns the arena for reading. Crate-internal view for consumers
+    /// that assemble [`Answers`] outside this module.
+    #[cfg(feature = "gpu")]
+    pub(crate) fn arena(&self) -> &[FieldElement<MODULUS>] {
+        &self.arena
+    }
+
+    /// Returns the arena for writing. Crate-internal view for consumers
+    /// that fill the arena outside this module, such as the GPU answer
+    /// path's staged-readback writer.
+    #[cfg(feature = "gpu")]
+    pub(crate) fn arena_mut(&mut self) -> &mut [FieldElement<MODULUS>] {
+        &mut self.arena
+    }
+
     /// Releases the workspace and returns the freed arena capacity in
     /// words.
     ///
@@ -364,6 +422,19 @@ pub struct Answers<'ws, const MODULUS: u32> {
 }
 
 impl<'ws, const MODULUS: u32> Answers<'ws, MODULUS> {
+    /// Pairs an already-filled query-major arena with its validated shape.
+    ///
+    /// Crate-internal constructor for executors that fill the arena outside
+    /// this module (the GPU staged-readback writer) and can only produce
+    /// views over arenas they validated before filling.
+    #[cfg(feature = "gpu")]
+    pub(crate) const fn from_arena(
+        arena: &'ws [FieldElement<MODULUS>],
+        shape: AnswerShape,
+    ) -> Self {
+        Self { arena, shape }
+    }
+
     /// Returns the validated batch shape.
     #[must_use]
     pub const fn shape(&self) -> AnswerShape {
