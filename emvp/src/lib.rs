@@ -42,8 +42,9 @@ pub use dispatch::{
 #[cfg(feature = "gpu")]
 pub use dispatch::{AnswerDispatchError, AnswerDispatcher, MIN_GPU_MULTIPLICATIONS};
 pub use engine::{
-    AnswerEngine, AnswerEngineError, AnswerEntryReport, AnswerJob, AnswerReport, PrepareBatchError,
-    PrepareMatrixError, PreparedMatrix,
+    AnswerEngine, AnswerEngineError, AnswerEntryReport, AnswerJob, AnswerReport, EngineAnswers,
+    EnginePlan, EngineReport, EngineWorkspace, EntryPlan, PrepareBatchError, PrepareMatrixError,
+    PreparedMatrix,
 };
 #[cfg(feature = "gpu")]
 pub use gpu::{GpuAnswerer, GpuEncryptedMatrix, GpuError, PhaseTimings};

@@ -58,11 +58,11 @@ pub struct AnswerShape {
 impl AnswerShape {
     /// Builds a shape from already-validated parts.
     ///
-    /// Crate-internal constructor for the GPU answer path, whose batch
-    /// validation runs against device-resident shapes in `crate::gpu` and
-    /// produces the same rows, blocks, query count, and instance identifier
-    /// this type pins for the CPU path.
-    #[cfg(feature = "gpu")]
+    /// Crate-internal constructor for executors whose batch validation runs
+    /// outside this module and produce the same rows, blocks, query count,
+    /// and instance identifier this type pins for the CPU path: the GPU
+    /// answer path (device-resident shapes in `crate::gpu`) and the multi-
+    /// matrix engine plan in `crate::engine`.
     pub(crate) const fn new(rows: usize, blocks: usize, queries: usize, instance_id: u128) -> Self {
         Self {
             rows,
@@ -425,9 +425,9 @@ impl<'ws, const MODULUS: u32> Answers<'ws, MODULUS> {
     /// Pairs an already-filled query-major arena with its validated shape.
     ///
     /// Crate-internal constructor for executors that fill the arena outside
-    /// this module (the GPU staged-readback writer) and can only produce
-    /// views over arenas they validated before filling.
-    #[cfg(feature = "gpu")]
+    /// this module and can only produce views over arenas they validated
+    /// before filling: the GPU staged-readback writer and the multi-matrix
+    /// engine's execute step.
     pub(crate) const fn from_arena(
         arena: &'ws [FieldElement<MODULUS>],
         shape: AnswerShape,

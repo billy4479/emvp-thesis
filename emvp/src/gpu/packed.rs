@@ -10,15 +10,20 @@ use super::{
     DIMS_UNIFORM_BYTES, GpuAnswerer, GpuEncryptedMatrix, GpuError, MAX_ANSWER_WORDS,
     create_buffer_checked, dims_uniform_bytes, dispatch_grid, lock_recovered, staged_answer_word,
 };
+use crate::view::QueryValues;
 use crate::{AnswerMatrix, EncryptedQuery};
 
 const WORD_BYTES: u64 = 4;
 
 /// One complete engine job selected for device execution.
-pub struct PackedJob<'a, const MODULUS: u32> {
+///
+/// Generic over the query representation so the engine's packed flight
+/// answers owned [`EncryptedQuery`] batches and borrowed wire views alike;
+/// the default keeps the historical owned-queries form.
+pub struct PackedJob<'a, const MODULUS: u32, Q: QueryValues<MODULUS> = EncryptedQuery<MODULUS>> {
     pub entry: usize,
     pub matrix: &'a GpuEncryptedMatrix<MODULUS>,
-    pub queries: &'a [EncryptedQuery<MODULUS>],
+    pub queries: &'a [Q],
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -184,6 +189,26 @@ pub struct PackedPlan {
     stats: PackedStats,
 }
 
+impl PackedPlan {
+    /// Returns `(job, dispatched segment count)` per packed job, the
+    /// device-free counterpart of [`PackedFlight::segment_counts`]: the
+    /// planner already knows how a job's queries split into dispatch
+    /// segments, so callers can report per-entry segment counts before any
+    /// device work. Jobs without segments (none can be planned) are
+    /// absent from the returned pairs.
+    #[must_use]
+    pub fn segment_counts(&self) -> Vec<(usize, usize)> {
+        let mut counts: Vec<(usize, usize)> = Vec::new();
+        for segment in self.chunks.iter().flat_map(|chunk| &chunk.segments) {
+            match counts.iter_mut().find(|(job, _)| *job == segment.job) {
+                Some((_, count)) => *count += 1,
+                None => counts.push((segment.job, 1)),
+            }
+        }
+        counts
+    }
+}
+
 pub type PackedAnswers<const MODULUS: u32> = Vec<(usize, Vec<AnswerMatrix<MODULUS>>)>;
 pub type PackedOutcome<const MODULUS: u32> =
     Result<(PackedAnswers<MODULUS>, PackedStats, PackedTimings), GpuError>;
@@ -312,20 +337,69 @@ pub fn segment_dest_range(
     rows: usize,
     s: usize,
 ) -> Result<Range<usize>, GpuError> {
-    if job >= entry_words.len() {
-        return Err(GpuError::LengthMismatch {
+    let entry_start = match entry_words.get(job) {
+        Some(_) => entry_words
+            .iter()
+            .take(job)
+            .try_fold(0_usize, |sum, &words| sum.checked_add(words))
+            .ok_or(GpuError::DimensionOverflow)?,
+        None => {
+            return Err(GpuError::LengthMismatch {
+                name: "packed segment job",
+                expected: entry_words.len(),
+                actual: job,
+            });
+        }
+    };
+    dest_range_at_base(entry_start, query_start, query_count, rows, s)
+}
+
+/// The absolute-base variant of [`segment_dest_range`].
+///
+/// Instead of summing a packed-subset-contiguous `entry_words` table, job
+/// `job`'s answers start at the *absolute* arena offset
+/// `job_base_words[job]`, so a packed flight can land inside a larger
+/// caller-owned engine arena whose entries interleave CPU- and GPU-tier
+/// answers. The within-entry query-major arithmetic is identical to
+/// [`segment_dest_range`]:
+/// `job_base_words[job] + query_start * rows * s ..
+/// .. + query_count * rows * s`.
+///
+/// Pure host arithmetic with checked overflow; `job_base_words` must have
+/// one slot per packed job, and the caller owns the invariant that the
+/// per-job runs are disjoint inside `dest`.
+pub fn segment_dest_range_at(
+    job_base_words: &[usize],
+    job: usize,
+    query_start: usize,
+    query_count: usize,
+    rows: usize,
+    s: usize,
+) -> Result<Range<usize>, GpuError> {
+    let base = job_base_words
+        .get(job)
+        .copied()
+        .ok_or(GpuError::LengthMismatch {
             name: "packed segment job",
-            expected: entry_words.len(),
+            expected: job_base_words.len(),
             actual: job,
-        });
-    }
+        })?;
+    dest_range_at_base(base, query_start, query_count, rows, s)
+}
+
+/// The shared query-major arithmetic of both segment-destination variants:
+/// the run `[base + query_start * words_per_query,
+/// base + (query_start + query_count) * words_per_query)` with checked
+/// overflow.
+fn dest_range_at_base(
+    base: usize,
+    query_start: usize,
+    query_count: usize,
+    rows: usize,
+    s: usize,
+) -> Result<Range<usize>, GpuError> {
     let words_per_query = rows.checked_mul(s).ok_or(GpuError::DimensionOverflow)?;
-    let entry_start = entry_words
-        .iter()
-        .take(job)
-        .try_fold(0_usize, |sum, &words| sum.checked_add(words))
-        .ok_or(GpuError::DimensionOverflow)?;
-    let start = entry_start
+    let start = base
         .checked_add(
             query_start
                 .checked_mul(words_per_query)
@@ -383,7 +457,9 @@ fn entry_words_from_segments(
 }
 
 /// The per-job kernel shapes of a packed job list.
-fn job_shapes<const MODULUS: u32>(jobs: &[PackedJob<'_, MODULUS>]) -> Result<Vec<Shape>, GpuError> {
+fn job_shapes<const MODULUS: u32, Q: QueryValues<MODULUS>>(
+    jobs: &[PackedJob<'_, MODULUS, Q>],
+) -> Result<Vec<Shape>, GpuError> {
     jobs.iter()
         .map(|job| {
             Ok(Shape {
@@ -437,50 +513,106 @@ pub fn reconstruct_packed_into<const MODULUS: u32>(
                 shape.rows,
                 shape.s,
             )?;
-            // Fail-closed cross-checks: the planner pins every segment's
-            // answer run to `query_count * rows * s` words inside its
-            // chunk's staging buffer, and the caller pins `dest` to the
-            // entry table's total.
-            let bytes_start = segment
-                .answer_offset_words
-                .checked_mul(WORD_BYTES as usize)
-                .ok_or(GpuError::DimensionOverflow)?;
-            let bytes_end = bytes_start
-                .checked_add(
-                    segment
-                        .answer_words
-                        .checked_mul(WORD_BYTES as usize)
-                        .ok_or(GpuError::DimensionOverflow)?,
-                )
-                .ok_or(GpuError::DimensionOverflow)?;
-            let words = data
-                .get(bytes_start..bytes_end)
-                .ok_or(GpuError::LengthMismatch {
-                    name: "packed staging bytes",
-                    expected: bytes_end,
-                    actual: data.len(),
-                })?;
-            let dest_len = dest.len();
-            let range_end = range.end;
-            let slots = dest.get_mut(range).ok_or(GpuError::LengthMismatch {
-                name: "packed answer arena",
-                expected: range_end,
-                actual: dest_len,
-            })?;
-            if slots.len() != segment.answer_words {
-                return Err(GpuError::LengthMismatch {
-                    name: "packed answer arena",
-                    expected: segment.answer_words,
-                    actual: slots.len(),
-                });
-            }
-            for (slot, word) in slots
-                .iter_mut()
-                .zip(words.chunks_exact(WORD_BYTES as usize))
-            {
-                *slot = staged_answer_word::<MODULUS>(word)?;
-            }
+            stream_segment_into::<MODULUS>(segment, data, range, dest)?;
         }
+    }
+    Ok(())
+}
+
+/// The absolute-base form of [`reconstruct_packed_into`].
+///
+/// Identical streaming, but each segment lands at
+/// [`segment_dest_range_at`]'s absolute range: job `job`'s answers start at
+/// `job_base_words[job]` in `dest` instead of the packed-subset-contiguous
+/// prefix sum, so a packed flight can reconstruct into a larger engine
+/// arena whose entries interleave CPU- and GPU-tier answers. The caller
+/// owns the invariant that the per-job runs are disjoint inside `dest`; a
+/// range escaping `dest` rejects the call before any word is written.
+pub fn reconstruct_packed_into_at<const MODULUS: u32>(
+    chunks: &[ChunkPlan],
+    staged: &[&[u8]],
+    job_base_words: &[usize],
+    shapes: &[Shape],
+    dest: &mut [FieldElement<MODULUS>],
+) -> Result<(), GpuError> {
+    if chunks.len() != staged.len() {
+        return Err(GpuError::LengthMismatch {
+            name: "packed staging views",
+            expected: chunks.len(),
+            actual: staged.len(),
+        });
+    }
+    for (chunk, data) in chunks.iter().zip(staged.iter().copied()) {
+        for segment in &chunk.segments {
+            let shape = shapes.get(segment.job).ok_or(GpuError::LengthMismatch {
+                name: "packed segment job",
+                expected: shapes.len(),
+                actual: segment.job,
+            })?;
+            let range = segment_dest_range_at(
+                job_base_words,
+                segment.job,
+                segment.query_start,
+                segment.query_count,
+                shape.rows,
+                shape.s,
+            )?;
+            stream_segment_into::<MODULUS>(segment, data, range, dest)?;
+        }
+    }
+    Ok(())
+}
+
+/// Streams one segment's staged answer words into their destination range
+/// — the shared per-segment tail of both reconstruct variants.
+///
+/// Fail-closed cross-checks: the planner pins every segment's answer run
+/// to `query_count * rows * s` words inside its chunk's staging buffer,
+/// and the caller pins `dest` to hold each segment's range.
+fn stream_segment_into<const MODULUS: u32>(
+    segment: &Segment,
+    data: &[u8],
+    range: Range<usize>,
+    dest: &mut [FieldElement<MODULUS>],
+) -> Result<(), GpuError> {
+    let bytes_start = segment
+        .answer_offset_words
+        .checked_mul(WORD_BYTES as usize)
+        .ok_or(GpuError::DimensionOverflow)?;
+    let bytes_end = bytes_start
+        .checked_add(
+            segment
+                .answer_words
+                .checked_mul(WORD_BYTES as usize)
+                .ok_or(GpuError::DimensionOverflow)?,
+        )
+        .ok_or(GpuError::DimensionOverflow)?;
+    let words = data
+        .get(bytes_start..bytes_end)
+        .ok_or(GpuError::LengthMismatch {
+            name: "packed staging bytes",
+            expected: bytes_end,
+            actual: data.len(),
+        })?;
+    let dest_len = dest.len();
+    let range_end = range.end;
+    let slots = dest.get_mut(range).ok_or(GpuError::LengthMismatch {
+        name: "packed answer arena",
+        expected: range_end,
+        actual: dest_len,
+    })?;
+    if slots.len() != segment.answer_words {
+        return Err(GpuError::LengthMismatch {
+            name: "packed answer arena",
+            expected: segment.answer_words,
+            actual: slots.len(),
+        });
+    }
+    for (slot, word) in slots
+        .iter_mut()
+        .zip(words.chunks_exact(WORD_BYTES as usize))
+    {
+        *slot = staged_answer_word::<MODULUS>(word)?;
     }
     Ok(())
 }
@@ -612,9 +744,9 @@ impl GpuAnswerer {
     ///
     /// Returns an error when dimensions overflow, parameters are invalid, or
     /// one query cannot fit the device's buffer and binding limits.
-    pub fn plan_packed<const MODULUS: u32>(
+    pub fn plan_packed<const MODULUS: u32, Q: QueryValues<MODULUS>>(
         &self,
-        jobs: &[PackedJob<'_, MODULUS>],
+        jobs: &[PackedJob<'_, MODULUS, Q>],
     ) -> Result<PackedPlan, GpuError> {
         let limits = self.device.limits();
         let max_buffer_words =
@@ -672,9 +804,9 @@ impl GpuAnswerer {
     /// # Errors
     ///
     /// Returns allocation, upload, encoding, or submission failures.
-    pub fn begin_packed<const MODULUS: u32>(
+    pub fn begin_packed<const MODULUS: u32, Q: QueryValues<MODULUS>>(
         &self,
-        jobs: &[PackedJob<'_, MODULUS>],
+        jobs: &[PackedJob<'_, MODULUS, Q>],
         plan: PackedPlan,
     ) -> Result<PackedFlight<MODULUS>, GpuError> {
         let mut timings = PackedTimings::default();
@@ -717,7 +849,7 @@ impl GpuAnswerer {
                     instance_id: job.matrix.instance_id,
                     rows: job.matrix.rows,
                     blocks: job.matrix.params.blocks()?,
-                    query_ids: job.queries.iter().map(EncryptedQuery::query_id).collect(),
+                    query_ids: job.queries.iter().map(QueryValues::query_id).collect(),
                 })
             })
             .collect::<Result<_, GpuError>>()?;
@@ -731,9 +863,9 @@ impl GpuAnswerer {
         })
     }
 
-    fn upload_packed_inputs<const MODULUS: u32>(
+    fn upload_packed_inputs<const MODULUS: u32, Q: QueryValues<MODULUS>>(
         &self,
-        jobs: &[PackedJob<'_, MODULUS>],
+        jobs: &[PackedJob<'_, MODULUS, Q>],
         plan: &PackedPlan,
         scratch: &PackedScratch,
     ) -> Result<(), GpuError> {
@@ -759,9 +891,9 @@ impl GpuAnswerer {
         Ok(())
     }
 
-    fn encode_packed_commands<const MODULUS: u32>(
+    fn encode_packed_commands<const MODULUS: u32, Q: QueryValues<MODULUS>>(
         &self,
-        jobs: &[PackedJob<'_, MODULUS>],
+        jobs: &[PackedJob<'_, MODULUS, Q>],
         plan: &PackedPlan,
         scratch: &PackedScratch,
         pipeline: &wgpu::ComputePipeline,
@@ -793,10 +925,10 @@ impl GpuAnswerer {
         Ok(encoder)
     }
 
-    fn encode_packed_segment<const MODULUS: u32>(
+    fn encode_packed_segment<const MODULUS: u32, Q: QueryValues<MODULUS>>(
         &self,
         encoder: &mut wgpu::CommandEncoder,
-        job: &PackedJob<'_, MODULUS>,
+        job: &PackedJob<'_, MODULUS, Q>,
         buffers: &ChunkScratch,
         segment: &Segment,
         uniform_offset: u64,
@@ -898,9 +1030,9 @@ impl GpuAnswerer {
     /// Returns allocation, upload, encoding, or submission failures, and
     /// [`GpuError::LengthMismatch`] when the plan's segment coverage does
     /// not match the jobs' shapes.
-    pub fn begin_packed_into<const MODULUS: u32>(
+    pub fn begin_packed_into<const MODULUS: u32, Q: QueryValues<MODULUS>>(
         &self,
-        jobs: &[PackedJob<'_, MODULUS>],
+        jobs: &[PackedJob<'_, MODULUS, Q>],
         plan: &PackedPlan,
     ) -> Result<PackedFlightInto<MODULUS>, GpuError> {
         let shapes = job_shapes(jobs)?;
@@ -1026,10 +1158,10 @@ impl GpuAnswerer {
     /// Returns [`GpuError::LengthMismatch`] when `dest` does not match the
     /// plan's arena, and the plan, upload, submission, wait, or readback
     /// failures of the split API otherwise.
-    pub fn execute_packed_into<const MODULUS: u32>(
+    pub fn execute_packed_into<const MODULUS: u32, Q: QueryValues<MODULUS>>(
         &self,
         plan: &PackedPlan,
-        jobs: &[PackedJob<'_, MODULUS>],
+        jobs: &[PackedJob<'_, MODULUS, Q>],
         dest: &mut [FieldElement<MODULUS>],
     ) -> Result<(PackedStats, PackedTimings), GpuError> {
         // Length-check the destination against the plan's arena before any
@@ -1046,6 +1178,143 @@ impl GpuAnswerer {
         }
         let flight = self.begin_packed_into(jobs, plan)?;
         self.finish_packed_into(flight, dest)
+    }
+
+    /// Executes a planned packed operation end to end, streaming the
+    /// answers into a caller-owned arena at *absolute* per-job offsets.
+    ///
+    /// The [`Self::execute_packed_into`] variant for callers whose
+    /// destination is a larger engine arena whose entries interleave CPU-
+    /// and GPU-tier answers: instead of writing the packed jobs
+    /// back-to-back at the packed-subset-contiguous offsets, job `k`'s
+    /// answers land at `job_base_words[k]`, query-major inside the job —
+    /// exactly what [`reconstruct_packed_into_at`] and
+    /// [`segment_dest_range_at`] stream. Everything else is identical:
+    /// plan → submit → wait → reconstruct with the pooled [`PackedScratch`]
+    /// semantics of the split API.
+    ///
+    /// Before any device work or mutation the call checks that every job's
+    /// absolute run (`job_base_words[k] + queries_k * rows_k * s_k`) fits
+    /// inside `dest`, rejecting with [`GpuError::Capacity`] otherwise. The
+    /// caller owns the invariant that the per-job runs are disjoint inside
+    /// `dest`; the engine's plan phase guarantees this by construction with
+    /// prefix-sum offsets, and overlapping bases would silently overwrite
+    /// answers rather than fault.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`GpuError::LengthMismatch`] when `job_base_words` does not
+    /// have one slot per packed job, [`GpuError::Capacity`] when a job's
+    /// absolute run escapes `dest`, and the plan, upload, submission, wait,
+    /// or readback failures of the split API otherwise.
+    pub fn execute_packed_into_at<const MODULUS: u32, Q: QueryValues<MODULUS>>(
+        &self,
+        plan: &PackedPlan,
+        jobs: &[PackedJob<'_, MODULUS, Q>],
+        job_base_words: &[usize],
+        dest: &mut [FieldElement<MODULUS>],
+    ) -> Result<(PackedStats, PackedTimings), GpuError> {
+        // Fail-closed layout checks before any device work or mutation.
+        if job_base_words.len() != jobs.len() {
+            return Err(GpuError::LengthMismatch {
+                name: "packed answer bases",
+                expected: jobs.len(),
+                actual: job_base_words.len(),
+            });
+        }
+        let shapes = job_shapes(jobs)?;
+        let dest_len = dest.len();
+        for (base, (job, shape)) in job_base_words.iter().zip(jobs.iter().zip(&shapes)) {
+            let words_per_query = shape
+                .rows
+                .checked_mul(shape.s)
+                .ok_or(GpuError::DimensionOverflow)?;
+            let end = base
+                .checked_add(
+                    job.queries
+                        .len()
+                        .checked_mul(words_per_query)
+                        .ok_or(GpuError::DimensionOverflow)?,
+                )
+                .ok_or(GpuError::DimensionOverflow)?;
+            if end > dest_len {
+                return Err(GpuError::Capacity {
+                    required: end,
+                    available: dest_len,
+                });
+            }
+        }
+        let flight = self.begin_packed_into(jobs, plan)?;
+        self.finish_packed_into_at(flight, job_base_words, dest)
+    }
+
+    /// Waits for a submitted into-flight's staging mappings and returns the
+    /// elapsed wait duration, so both finish variants share the poll and
+    /// mapping-callback semantics.
+    fn wait_packed_into_flight<const MODULUS: u32>(
+        &self,
+        flight: &PackedFlightInto<MODULUS>,
+    ) -> Result<Duration, GpuError> {
+        let wait_start = Instant::now();
+        self.device
+            .poll(wgpu::PollType::Wait {
+                submission_index: Some(flight.submission.clone()),
+                timeout: None,
+            })
+            .map_err(|error| GpuError::Submission(error.to_string()))?;
+        for chunk in &flight.chunks {
+            chunk
+                .receiver
+                .recv()
+                .map_err(|_disconnected| {
+                    GpuError::Map("mapping callback result unavailable".into())
+                })?
+                .map_err(GpuError::Map)?;
+        }
+        Ok(wait_start.elapsed())
+    }
+
+    /// Waits for a submitted packed operation and streams its answers into
+    /// `dest` at *absolute* per-job offsets.
+    ///
+    /// The [`Self::finish_packed_into`] variant paired with
+    /// [`Self::execute_packed_into_at`]: same wait and scratch-pool
+    /// semantics, but the staged words stream via
+    /// [`reconstruct_packed_into_at`] to
+    /// `job_base_words[k] + query_start * rows * s` per segment instead of
+    /// the packed-subset-contiguous layout. `job_base_words` must have one
+    /// slot per packed job; a segment's range escaping `dest` rejects the
+    /// call.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`GpuError::LengthMismatch`] when `job_base_words` does not
+    /// match the flight's job count, and polling, mapping, or noncanonical
+    /// readback failures otherwise.
+    pub fn finish_packed_into_at<const MODULUS: u32>(
+        &self,
+        mut flight: PackedFlightInto<MODULUS>,
+        job_base_words: &[usize],
+        dest: &mut [FieldElement<MODULUS>],
+    ) -> Result<(PackedStats, PackedTimings), GpuError> {
+        if job_base_words.len() != flight.entries.len() {
+            return Err(GpuError::LengthMismatch {
+                name: "packed answer bases",
+                expected: flight.entries.len(),
+                actual: job_base_words.len(),
+            });
+        }
+        flight.timings.wait_readback = self.wait_packed_into_flight(&flight)?;
+
+        let reconstruct_start = Instant::now();
+        let reconstruct = reconstruct_flight_into_at(&flight, job_base_words, dest);
+        flight.timings.reconstruct = reconstruct_start.elapsed();
+        reconstruct?;
+        let Some(scratch) = flight.scratch.take() else {
+            return Err(GpuError::Map("packed scratch unavailable".into()));
+        };
+        lock_recovered(&self.packed_scratch_pool).push(scratch);
+        Ok((flight.stats, flight.timings))
     }
 }
 
@@ -1078,12 +1347,43 @@ fn reconstruct_flight_into<const MODULUS: u32>(
     Ok(())
 }
 
-fn write_query_segment<const MODULUS: u32>(
+/// The absolute-base counterpart of [`reconstruct_flight_into`]: maps each
+/// chunk's staging buffer and streams its words into `dest` via
+/// [`reconstruct_packed_into_at`], unmapping every chunk before returning.
+fn reconstruct_flight_into_at<const MODULUS: u32>(
+    flight: &PackedFlightInto<MODULUS>,
+    job_base_words: &[usize],
+    dest: &mut [FieldElement<MODULUS>],
+) -> Result<(), GpuError> {
+    let Some(scratch) = flight.scratch.as_ref() else {
+        return Err(GpuError::Map("packed scratch unavailable".into()));
+    };
+    for (flight_chunk, buffers) in flight.chunks.iter().zip(&scratch.chunks) {
+        let data = buffers
+            .staging
+            .slice(0..flight_chunk.plan.answer_words as u64 * WORD_BYTES)
+            .get_mapped_range()
+            .map_err(|error| GpuError::Map(error.to_string()))?;
+        let result = reconstruct_packed_into_at::<MODULUS>(
+            std::slice::from_ref(&flight_chunk.plan),
+            &[&data[..]],
+            job_base_words,
+            &flight.shapes,
+            dest,
+        );
+        drop(data);
+        buffers.staging.unmap();
+        result?;
+    }
+    Ok(())
+}
+
+fn write_query_segment<const MODULUS: u32, Q: QueryValues<MODULUS>>(
     queue: &wgpu::Queue,
     buffer: &wgpu::Buffer,
     offset: u64,
     words: usize,
-    queries: &[EncryptedQuery<MODULUS>],
+    queries: &[Q],
 ) -> Result<(), GpuError> {
     let bytes = u64::try_from(words)
         .ok()
@@ -1099,7 +1399,7 @@ fn write_query_segment<const MODULUS: u32>(
     word_bytes.write_iter(
         queries
             .iter()
-            .flat_map(EncryptedQuery::values)
+            .flat_map(QueryValues::values)
             .map(|value| value.to_raw().to_le_bytes()),
     );
     Ok(())
@@ -1209,8 +1509,9 @@ mod tests {
     use prime_field_layer::PrimeField;
 
     use super::{
-        ChunkPlan, DIMS_UNIFORM_BYTES, GpuError, Segment, Shape, entry_words_from_segments,
-        plan_chunks, reconstruct_packed_into, segment_dest_range, total_entry_words,
+        ChunkPlan, DIMS_UNIFORM_BYTES, GpuError, PackedPlan, Segment, Shape,
+        entry_words_from_segments, plan_chunks, reconstruct_packed_into,
+        reconstruct_packed_into_at, segment_dest_range, segment_dest_range_at, total_entry_words,
     };
 
     #[test]
@@ -1550,5 +1851,192 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    /// The absolute-base destination ranges must be the hand-computed
+    /// `[base + query_start * words_per_query, .. + query_count *
+    /// words_per_query)` runs, independent of any contiguous entry table,
+    /// and a job outside the base table is rejected fail-closed.
+    #[test]
+    fn segment_dest_range_at_matches_hand_computed_absolute_layouts() {
+        // Bases interleave CPU-tier entries in a larger engine arena: job 0
+        // answers start at word 100, job 1's at word 200.
+        let bases = [100, 200];
+        // Job 0 (rows 2, s 3): the whole one-query run sits at 100..106.
+        assert_eq!(
+            segment_dest_range_at(&bases, 0, 0, 1, 2, 3).unwrap(),
+            100..106
+        );
+        // Job 1 (rows 1, s 2): its second query starts one words-per-query
+        // (2) into the entry, at 202.
+        assert_eq!(
+            segment_dest_range_at(&bases, 1, 1, 2, 1, 2).unwrap(),
+            202..206
+        );
+        // A job naming a base outside the table is rejected exactly like
+        // the contiguous variant rejects an out-of-table entry.
+        assert!(matches!(
+            segment_dest_range_at(&bases, 2, 0, 1, 2, 3),
+            Err(GpuError::LengthMismatch {
+                name: "packed segment job",
+                expected: 2,
+                actual: 2,
+            })
+        ));
+        // Checked overflow on absurd inputs.
+        assert!(matches!(
+            segment_dest_range_at(&[usize::MAX], 0, 1, 1, 2, 2),
+            Err(GpuError::DimensionOverflow)
+        ));
+    }
+
+    /// Canonical staged words must stream to the *absolute* per-job bases:
+    /// jobs landing at sparse offsets inside a larger poisoned arena write
+    /// exactly their query-major runs and leave every other word untouched.
+    #[test]
+    fn reconstruct_packed_into_at_streams_to_absolute_bases() {
+        let field = PrimeField::<MODULUS>::new();
+        // Same shapes and golden words as the contiguous fixture: job 0 has
+        // two queries of 2 words, job 1 one query of 2 words.
+        let shapes = [
+            Shape {
+                n: 2,
+                b: 2,
+                rows: 2,
+                s: 1,
+            },
+            Shape {
+                n: 2,
+                b: 2,
+                rows: 1,
+                s: 2,
+            },
+        ];
+        let golden = [
+            142_606_263_u32,
+            796_917_593,
+            956_301_214,
+            33_554_204,
+            209_715_183,
+            721_420_250,
+        ];
+        let staged = golden
+            .iter()
+            .flat_map(|word| word.to_le_bytes())
+            .collect::<Vec<u8>>();
+        // Absolute bases straddling a poisoned gap: job 0 at word 8, job 1
+        // at word 100. The arena is 110 words.
+        let bases = [8, 100];
+        let sentinel = field.element_u32(MODULUS - 1);
+        let mut dest = vec![sentinel; 110];
+        let plan = chunk(vec![seg(0, 0, 2, 0, 4), seg(1, 0, 1, 4, 2)], 6);
+        reconstruct_packed_into_at::<MODULUS>(
+            std::slice::from_ref(&plan),
+            &[&staged],
+            &bases,
+            &shapes,
+            &mut dest,
+        )
+        .unwrap();
+        // Job 0's query-major run landed at 8..12, job 1's at 100..102.
+        for (index, &word) in [17_u32, 39, 23, 53].iter().enumerate() {
+            assert_eq!(dest[8 + index], field.element_u32(word));
+        }
+        assert_eq!(dest[100], field.element_u32(4));
+        assert_eq!(dest[101], field.element_u32(9));
+        // Every word outside the two runs keeps the poison sentinel,
+        // including the gap between the jobs.
+        assert!(dest[..8].iter().all(|slot| *slot == sentinel));
+        assert!(dest[12..100].iter().all(|slot| *slot == sentinel));
+        assert!(dest[102..].iter().all(|slot| *slot == sentinel));
+
+        // The same golden words through the packed-subset-contiguous bases
+        // ([0, 4], the prefix sums of entry words [4, 2]) must reproduce
+        // the contiguous layout.
+        let contiguous = [0, 4];
+        let mut flat_dest = vec![sentinel; 6];
+        reconstruct_packed_into_at::<MODULUS>(
+            std::slice::from_ref(&plan),
+            &[&staged],
+            &contiguous,
+            &shapes,
+            &mut flat_dest,
+        )
+        .unwrap();
+        let expected: Vec<_> = [17_u32, 39, 23, 53, 4, 9]
+            .iter()
+            .map(|&sum| field.element_u32(sum))
+            .collect();
+        assert_eq!(flat_dest, expected);
+
+        // A job whose absolute run escapes the destination is rejected
+        // fail-closed. Job 0's earlier segment in the same chunk had
+        // already streamed (its run is written), but nothing beyond it is
+        // touched: the caller treats the whole arena as failed.
+        let mut dest = vec![sentinel; 110];
+        assert!(matches!(
+            reconstruct_packed_into_at::<MODULUS>(
+                std::slice::from_ref(&plan),
+                &[&staged],
+                &[8, 109],
+                &shapes,
+                &mut dest,
+            ),
+            Err(GpuError::LengthMismatch {
+                name: "packed answer arena",
+                ..
+            })
+        ));
+        assert!(dest[12..].iter().all(|slot| *slot == sentinel));
+        assert_eq!(dest[8], field.element_u32(17));
+    }
+
+    /// The planner's per-job segment counts must agree with the planned
+    /// dispatch segments, so callers can report per-entry segment counts
+    /// before any device work.
+    #[test]
+    fn packed_plan_segment_counts_match_dispatch_segments() {
+        let shapes = [
+            Shape {
+                n: 16,
+                b: 2,
+                rows: 3,
+                s: 8,
+            },
+            Shape {
+                n: 8,
+                b: 2,
+                rows: 2,
+                s: 4,
+            },
+        ];
+        let chunks = plan_chunks(&shapes, &[9, 3], 256, 96, 16).unwrap();
+        let mut plan = PackedPlan {
+            chunks,
+            uniform_alignment: 64,
+            stats: super::PackedStats::default(),
+        };
+        let expected: Vec<(usize, usize)> = (0..shapes.len())
+            .map(|job| {
+                (
+                    job,
+                    plan.chunks
+                        .iter()
+                        .flat_map(|chunk| &chunk.segments)
+                        .filter(|segment| segment.job == job)
+                        .count(),
+                )
+            })
+            .collect();
+        assert_eq!(plan.segment_counts(), expected);
+        // A split plan reports two segments for the continued job.
+        let one_job = [Shape {
+            n: 4,
+            b: 2,
+            rows: 2,
+            s: 2,
+        }];
+        plan.chunks = plan_chunks(&one_job, &[10], 32, 96, 8).unwrap();
+        assert_eq!(plan.segment_counts(), vec![(0, 2)]);
     }
 }
