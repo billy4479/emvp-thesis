@@ -106,6 +106,9 @@ pub enum PrepareMatrixError {
     /// The matrix could not be reserved or uploaded to the device.
     #[cfg(feature = "gpu")]
     Gpu(GpuError),
+    /// An internal execution invariant was violated without producing a
+    /// handle.
+    InternalState(&'static str),
 }
 
 impl fmt::Display for PrepareMatrixError {
@@ -114,6 +117,7 @@ impl fmt::Display for PrepareMatrixError {
             Self::Protocol(error) => error.fmt(formatter),
             #[cfg(feature = "gpu")]
             Self::Gpu(error) => error.fmt(formatter),
+            Self::InternalState(reason) => write!(formatter, "answer engine state error: {reason}"),
         }
     }
 }
@@ -124,6 +128,7 @@ impl std::error::Error for PrepareMatrixError {
             Self::Protocol(error) => Some(error),
             #[cfg(feature = "gpu")]
             Self::Gpu(error) => Some(error),
+            Self::InternalState(_) => None,
         }
     }
 }
@@ -138,6 +143,85 @@ impl From<ProtocolError> for PrepareMatrixError {
 impl From<GpuError> for PrepareMatrixError {
     fn from(error: GpuError) -> Self {
         Self::Gpu(error)
+    }
+}
+
+/// A failure while validating, reserving, or uploading a whole matrix set.
+///
+/// Every failure is all-or-nothing: no handle of the rejected set is
+/// returned and none of its residency stays reserved.
+#[derive(Debug)]
+#[non_exhaustive]
+pub enum PrepareBatchError {
+    /// The batch contained no matrices.
+    Empty,
+    /// The matrix at `index`, or its protocol parameters, are malformed.
+    /// Nothing was reserved or uploaded.
+    Protocol {
+        /// The input position of the rejected matrix.
+        index: usize,
+        /// The validation failure.
+        source: ProtocolError,
+    },
+    /// The whole set does not fit the engine's device residency budget.
+    /// Nothing was uploaded.
+    #[cfg(feature = "gpu")]
+    Budget(GpuError),
+    /// The matrix at `index` failed its device upload. The handles already
+    /// prepared for earlier entries were discarded together with the whole
+    /// set's reservation.
+    #[cfg(feature = "gpu")]
+    Upload {
+        /// The input position of the failed matrix.
+        index: usize,
+        /// The device failure.
+        source: GpuError,
+    },
+    /// An internal execution invariant was violated without producing
+    /// partial output.
+    InternalState(&'static str),
+}
+
+impl fmt::Display for PrepareBatchError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Empty => formatter.write_str("matrix batch is empty"),
+            Self::Protocol { index, source } => write!(formatter, "batch matrix {index}: {source}"),
+            #[cfg(feature = "gpu")]
+            Self::Budget(error) => error.fmt(formatter),
+            #[cfg(feature = "gpu")]
+            Self::Upload { index, source } => {
+                write!(formatter, "batch matrix {index}: {source}")
+            }
+            Self::InternalState(reason) => write!(formatter, "answer engine state error: {reason}"),
+        }
+    }
+}
+
+impl std::error::Error for PrepareBatchError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Protocol { source, .. } => Some(source),
+            #[cfg(feature = "gpu")]
+            Self::Budget(error) | Self::Upload { source: error, .. } => Some(error),
+            Self::Empty | Self::InternalState(_) => None,
+        }
+    }
+}
+
+impl From<PrepareBatchError> for PrepareMatrixError {
+    fn from(error: PrepareBatchError) -> Self {
+        match error {
+            PrepareBatchError::Protocol { source, .. } => Self::Protocol(source),
+            #[cfg(feature = "gpu")]
+            PrepareBatchError::Budget(source) | PrepareBatchError::Upload { source, .. } => {
+                Self::Gpu(source)
+            }
+            PrepareBatchError::Empty => {
+                Self::InternalState("an empty batch reached the single-matrix preparation path")
+            }
+            PrepareBatchError::InternalState(reason) => Self::InternalState(reason),
+        }
     }
 }
 
@@ -266,6 +350,9 @@ impl<const MODULUS: u32> AnswerEngine<MODULUS> {
 
     /// Validates and retains an encrypted matrix for repeated evaluation.
     ///
+    /// A one-matrix [`Self::prepare_batch`]: the whole set is validated and
+    /// its residency reserved before any upload begins.
+    ///
     /// # Errors
     ///
     /// Returns a protocol error when the parameters and matrix disagree. A
@@ -275,92 +362,162 @@ impl<const MODULUS: u32> AnswerEngine<MODULUS> {
         params: EmvpParams,
         matrix: EncryptedMatrix<MODULUS>,
     ) -> Result<PreparedMatrix<MODULUS>, PrepareMatrixError> {
-        params.validate_dimensions().map_err(ProtocolError::from)?;
-        let n = params.n().map_err(ProtocolError::from)?;
-        if matrix.columns() != n {
-            return Err(ProtocolError::LengthMismatch {
-                name: "encrypted matrix columns",
-                expected: n,
-                actual: matrix.columns(),
-            }
-            .into());
+        let mut prepared = self
+            .prepare_batch_core(vec![(params, matrix)])
+            .map_err(PrepareMatrixError::from)?;
+        prepared.pop().ok_or(PrepareMatrixError::InternalState(
+            "a one-matrix batch produced no handle",
+        ))
+    }
+
+    /// Validates and retains a whole matrix set atomically.
+    ///
+    /// Every matrix is validated first, the device residency of the whole
+    /// set is reserved with one atomic budget transition, and only then are
+    /// the matrices uploaded. Concurrent callers therefore observe each set
+    /// as all-or-nothing: a set either fits entirely alongside every set
+    /// reserved before it, or it is rejected whole. On any failure no
+    /// handle is returned and the entire reservation is released. On
+    /// success each returned handle retains the reservation of its own
+    /// matrix's bytes, released when that handle's final clone drops, so
+    /// dropping one handle never holds another matrix's bytes.
+    ///
+    /// The returned handles keep the input order.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PrepareBatchError::Empty`] for an empty batch, the input
+    /// index of the first malformed matrix as
+    /// [`PrepareBatchError::Protocol`], the budget rejection of the whole
+    /// set as [`PrepareBatchError::Budget`], or the input index of the
+    /// first device upload failure as [`PrepareBatchError::Upload`]. A CPU
+    /// engine can only produce the validation failures.
+    pub fn prepare_batch<I>(
+        &self,
+        batch: I,
+    ) -> Result<Vec<PreparedMatrix<MODULUS>>, PrepareBatchError>
+    where
+        I: IntoIterator<Item = (EmvpParams, EncryptedMatrix<MODULUS>)>,
+    {
+        self.prepare_batch_core(batch.into_iter().collect())
+    }
+
+    /// The shared validate, reserve, and upload pipeline behind
+    /// [`Self::prepare_batch`] and [`Self::prepare`].
+    fn prepare_batch_core(
+        &self,
+        matrices: Vec<(EmvpParams, EncryptedMatrix<MODULUS>)>,
+    ) -> Result<Vec<PreparedMatrix<MODULUS>>, PrepareBatchError> {
+        if matrices.is_empty() {
+            return Err(PrepareBatchError::Empty);
         }
-        if matrix.rows() == 0 {
-            return Err(ProtocolError::LengthMismatch {
-                name: "matrix rows",
-                expected: 1,
-                actual: 0,
-            }
-            .into());
+        // Phase 1: validate the whole set and total its residency before
+        // touching the budget or the device.
+        let mut total_bytes = 0_u64;
+        #[cfg(feature = "gpu")]
+        let mut residencies = Vec::with_capacity(matrices.len());
+        for (index, (params, matrix)) in matrices.iter().enumerate() {
+            let words = validate_matrix_shape(params, matrix)
+                .map_err(|source| PrepareBatchError::Protocol { index, source })?;
+            let bytes = residency_bytes(words).ok_or(PrepareBatchError::Protocol {
+                index,
+                source: ProtocolError::DimensionOverflow,
+            })?;
+            total_bytes = total_bytes
+                .checked_add(bytes)
+                .ok_or(PrepareBatchError::Protocol {
+                    index,
+                    source: ProtocolError::DimensionOverflow,
+                })?;
+            #[cfg(feature = "gpu")]
+            residencies.push(bytes);
         }
-        let expected = matrix
-            .rows()
-            .checked_mul(n)
-            .ok_or(ProtocolError::DimensionOverflow)?;
-        if matrix.values().len() != expected {
-            return Err(ProtocolError::LengthMismatch {
-                name: "encrypted matrix values",
-                expected,
-                actual: matrix.values().len(),
-            }
-            .into());
+        // Phase 2: reserve the whole set with one atomic transition before
+        // any upload; failure rejects the set whole.
+        #[cfg(feature = "gpu")]
+        let gpu = self.gpu.as_ref();
+        #[cfg(feature = "gpu")]
+        if let Some(gpu) = gpu {
+            reserve_budget(gpu, total_bytes).map_err(PrepareBatchError::Budget)?;
         }
         #[cfg(feature = "gpu")]
-        let (gpu_matrix, reservation) = if let Some(gpu) = &self.gpu {
-            let bytes = u64::try_from(expected)
-                .ok()
-                .and_then(|words| words.checked_mul(4))
-                .ok_or(PrepareMatrixError::Protocol(
-                    ProtocolError::DimensionOverflow,
-                ))?;
-            let mut current = gpu.reserved_bytes.load(Ordering::Acquire);
-            loop {
-                let available = gpu.max_bytes.saturating_sub(current);
-                let Some(next) = current.checked_add(bytes) else {
-                    return Err(GpuError::BudgetExceeded {
-                        requested_bytes: bytes,
-                        available_bytes: available,
-                    }
-                    .into());
-                };
-                if next > gpu.max_bytes {
-                    return Err(GpuError::BudgetExceeded {
-                        requested_bytes: bytes,
-                        available_bytes: available,
-                    }
-                    .into());
+        let mut reservations = gpu.map_or_else(
+            || Box::new(std::iter::empty()) as Box<dyn Iterator<Item = Arc<GpuReservation>>>,
+            |gpu| {
+                // Split the reserved total into one reservation per matrix
+                // so every handle releases exactly its own bytes on drop.
+                // Reservations not yet attached release the un-uploaded
+                // remainder when this pipeline aborts.
+                Box::new(residencies.iter().copied().map(move |bytes| {
+                    Arc::new(GpuReservation {
+                        engine: Arc::clone(gpu),
+                        bytes,
+                    })
+                })) as Box<dyn Iterator<Item = Arc<GpuReservation>>>
+            },
+        );
+        // Phase 3: upload. Any failure drops the handles prepared so far
+        // and the reservations not yet attached, which together release
+        // exactly the reserved total.
+        let mut prepared = Vec::with_capacity(matrices.len());
+        #[cfg_attr(
+            not(feature = "gpu"),
+            expect(
+                unused_variables,
+                reason = "the input index only names GPU upload failures"
+            )
+        )]
+        for (index, (params, matrix)) in matrices.into_iter().enumerate() {
+            #[cfg(feature = "gpu")]
+            let (gpu_matrix, reservation) = match (gpu, reservations.next()) {
+                (Some(gpu), Some(reservation)) => {
+                    let uploaded = gpu
+                        .answerer
+                        .upload_matrix(&params, &matrix)
+                        .map_err(|source| PrepareBatchError::Upload { index, source })?;
+                    (Some(uploaded), Some(reservation))
                 }
-                match gpu.reserved_bytes.compare_exchange_weak(
-                    current,
-                    next,
-                    Ordering::AcqRel,
-                    Ordering::Acquire,
-                ) {
-                    Ok(_) => break,
-                    Err(observed) => current = observed,
+                (None, None) => (None, None),
+                _ => {
+                    return Err(PrepareBatchError::InternalState(
+                        "the reservation count diverged from the matrix count",
+                    ));
                 }
-            }
-            let reservation = Arc::new(GpuReservation {
-                engine: Arc::clone(gpu),
-                bytes,
+            };
+            prepared.push(PreparedMatrix {
+                inner: Arc::new(PreparedMatrixInner {
+                    id: NEXT_MATRIX_ID.fetch_add(1, Ordering::Relaxed),
+                    engine_id: self.id,
+                    params,
+                    matrix,
+                    #[cfg(feature = "gpu")]
+                    gpu_matrix,
+                    #[cfg(feature = "gpu")]
+                    _reservation: reservation,
+                }),
             });
-            let gpu_matrix = gpu.answerer.upload_matrix(&params, &matrix)?;
-            (Some(gpu_matrix), Some(reservation))
-        } else {
-            (None, None)
-        };
-        Ok(PreparedMatrix {
-            inner: Arc::new(PreparedMatrixInner {
-                id: NEXT_MATRIX_ID.fetch_add(1, Ordering::Relaxed),
-                engine_id: self.id,
-                params,
-                matrix,
-                #[cfg(feature = "gpu")]
-                gpu_matrix,
-                #[cfg(feature = "gpu")]
-                _reservation: reservation,
-            }),
-        })
+        }
+        Ok(prepared)
+    }
+
+    /// Whether this engine holds a live compute device, so prepared
+    /// matrices stay resident under the configured device budget. `false`
+    /// means every matrix is answered on the CPU and no device budget is
+    /// active.
+    #[must_use]
+    #[cfg(feature = "gpu")]
+    pub const fn has_device(&self) -> bool {
+        self.gpu.is_some()
+    }
+
+    /// Whether this engine holds a live compute device, so prepared
+    /// matrices stay resident under the configured device budget. `false`
+    /// means every matrix is answered on the CPU and no device budget is
+    /// active.
+    #[must_use]
+    #[cfg(not(feature = "gpu"))]
+    pub const fn has_device(&self) -> bool {
+        false
     }
 
     /// Answers all jobs and returns answer groups in input order.
@@ -466,6 +623,82 @@ impl<const MODULUS: u32> AnswerEngine<MODULUS> {
         self.gpu.as_deref().ok_or(AnswerEngineError::InternalState(
             "GPU work was selected without a GPU engine",
         ))
+    }
+}
+
+/// Validates one matrix against its parameters and returns its field-word
+/// count `rows * n`.
+///
+/// This is the shape contract of both the CPU answer path and the device
+/// upload path, applied before any budget or device work.
+fn validate_matrix_shape<const MODULUS: u32>(
+    params: &EmvpParams,
+    matrix: &EncryptedMatrix<MODULUS>,
+) -> Result<usize, ProtocolError> {
+    params.validate_dimensions()?;
+    let n = params.n()?;
+    if matrix.columns() != n {
+        return Err(ProtocolError::LengthMismatch {
+            name: "encrypted matrix columns",
+            expected: n,
+            actual: matrix.columns(),
+        });
+    }
+    if matrix.rows() == 0 {
+        return Err(ProtocolError::LengthMismatch {
+            name: "matrix rows",
+            expected: 1,
+            actual: 0,
+        });
+    }
+    let expected = matrix
+        .rows()
+        .checked_mul(n)
+        .ok_or(ProtocolError::DimensionOverflow)?;
+    if matrix.values().len() != expected {
+        return Err(ProtocolError::LengthMismatch {
+            name: "encrypted matrix values",
+            expected,
+            actual: matrix.values().len(),
+        });
+    }
+    Ok(expected)
+}
+
+/// The device residency of `words` field words, one `u32` each.
+fn residency_bytes(words: usize) -> Option<u64> {
+    u64::try_from(words)
+        .ok()
+        .and_then(|words| words.checked_mul(4))
+}
+
+/// Reserves `bytes` of long-lived matrix residency with one compare-and-
+/// swap transition of the engine's budget counter, so concurrent callers
+/// each reserve their whole request or nothing of it.
+#[cfg(feature = "gpu")]
+fn reserve_budget(gpu: &GpuEngine, bytes: u64) -> Result<(), GpuError> {
+    let mut current = gpu.reserved_bytes.load(Ordering::Acquire);
+    loop {
+        let available = gpu.max_bytes.saturating_sub(current);
+        let exhausted = || GpuError::BudgetExceeded {
+            requested_bytes: bytes,
+            available_bytes: available,
+        };
+        let Some(next) = current.checked_add(bytes) else {
+            return Err(exhausted());
+        };
+        if next > gpu.max_bytes {
+            return Err(exhausted());
+        }
+        match gpu.reserved_bytes.compare_exchange_weak(
+            current,
+            next,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => return Ok(()),
+            Err(observed) => current = observed,
+        }
     }
 }
 
@@ -732,6 +965,13 @@ mod tests {
         EncryptedMatrix::from_parts(instance_id, rows, 16, vec![zero; rows * 16]).unwrap()
     }
 
+    /// A well-formed matrix whose declared width disagrees with [`PARAMS`],
+    /// whose `n` is 16.
+    fn narrow_matrix(instance_id: u128) -> EncryptedMatrix<MODULUS> {
+        let zero = PrimeField::<MODULUS>::new().element_u32(0);
+        EncryptedMatrix::from_parts(instance_id, 2, 15, vec![zero; 2 * 15]).unwrap()
+    }
+
     fn query(instance_id: u128, query_id: u64) -> EncryptedQuery<MODULUS> {
         let one = PrimeField::<MODULUS>::new().element_u32(1);
         EncryptedQuery::from_parts(instance_id, query_id, vec![one; 16])
@@ -812,6 +1052,71 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn batch_prepare_returns_handles_in_input_order() {
+        let engine = AnswerEngine::cpu();
+        let batch = engine
+            .prepare_batch([
+                (PARAMS, matrix(11, 2)),
+                (PARAMS, matrix(22, 3)),
+                (PARAMS, matrix(33, 5)),
+            ])
+            .unwrap();
+        assert_eq!(batch.len(), 3);
+        let query_sets: Vec<Vec<EncryptedQuery<MODULUS>>> = vec![
+            vec![query(11, 1)],
+            vec![query(22, 2), query(22, 3)],
+            vec![query(33, 4)],
+        ];
+        let jobs: Vec<AnswerJob<'_, MODULUS>> = batch
+            .iter()
+            .zip(query_sets.iter())
+            .map(|(matrix, queries)| AnswerJob {
+                matrix,
+                queries: queries.as_slice(),
+            })
+            .collect();
+        let answers = engine.answer_many(&jobs).unwrap();
+        let answer_rows: Vec<usize> = answers
+            .iter()
+            .map(|group| group.iter().map(AnswerMatrix::rows).sum())
+            .collect();
+        assert_eq!(answer_rows, [2, 6, 5]);
+    }
+
+    #[test]
+    fn batch_prepare_rejects_the_whole_set_and_indexes_the_failure() {
+        let engine = AnswerEngine::cpu();
+        assert!(matches!(
+            engine.prepare_batch(Vec::<(EmvpParams, EncryptedMatrix<MODULUS>)>::new()),
+            Err(PrepareBatchError::Empty)
+        ));
+        // A leading malformed matrix is indexed at its input position.
+        assert!(matches!(
+            engine.prepare_batch([(PARAMS, narrow_matrix(12)), (PARAMS, matrix(11, 2))]),
+            Err(PrepareBatchError::Protocol { index: 0, .. })
+        ));
+        // A later malformed matrix rejects the whole set, including the
+        // matrices before it: no handle comes back.
+        assert!(matches!(
+            engine.prepare_batch([(PARAMS, matrix(11, 2)), (PARAMS, narrow_matrix(12))]),
+            Err(PrepareBatchError::Protocol { index: 1, .. })
+        ));
+        // The rejected set left nothing behind: the engine still works.
+        engine.prepare(PARAMS, matrix(13, 2)).unwrap();
+    }
+
+    #[test]
+    fn single_prepare_shares_the_batch_validation() {
+        let engine = AnswerEngine::cpu();
+        assert!(matches!(
+            engine.prepare(PARAMS, narrow_matrix(12)),
+            Err(PrepareMatrixError::Protocol(
+                ProtocolError::LengthMismatch { .. }
+            ))
+        ));
+    }
+
     #[cfg(feature = "gpu")]
     #[test]
     fn gpu_engine_matches_cpu_and_reports_packed_execution_when_available() {
@@ -862,5 +1167,135 @@ mod tests {
         ));
         drop(final_clone);
         engine.prepare(PARAMS, matrix(32, 2)).unwrap();
+    }
+
+    /// A GPU engine with the requested budget, or a skipped notice when the
+    /// machine has no compute adapter.
+    #[cfg(feature = "gpu")]
+    fn gpu_engine_with_budget(bytes: u64) -> AnswerEngine<MODULUS> {
+        let engine = AnswerEngine::new(bytes).unwrap();
+        if engine.gpu.is_none() {
+            eprintln!("gpu test skipped: no compute adapter");
+        }
+        engine
+    }
+
+    /// The engine's live matrix residency, readable because the tests are
+    /// in this module.
+    #[cfg(feature = "gpu")]
+    fn reserved_bytes(engine: &AnswerEngine<MODULUS>) -> u64 {
+        engine
+            .gpu
+            .as_ref()
+            .map_or(0, |gpu| gpu.reserved_bytes.load(Ordering::Acquire))
+    }
+
+    #[cfg(feature = "gpu")]
+    #[test]
+    fn batch_prepare_reserves_once_and_releases_per_handle() {
+        let one = (2 * PARAMS.n().unwrap() * 4) as u64;
+        let engine = gpu_engine_with_budget(3 * one);
+        if engine.gpu.is_none() {
+            return;
+        }
+        let batch = engine
+            .prepare_batch([
+                (PARAMS, matrix(41, 2)),
+                (PARAMS, matrix(42, 2)),
+                (PARAMS, matrix(43, 2)),
+            ])
+            .unwrap();
+        // The whole set was reserved with one transition; nothing partial.
+        assert_eq!(reserved_bytes(&engine), 3 * one);
+        let another_set = [(PARAMS, matrix(44, 2)), (PARAMS, matrix(45, 2))];
+        assert!(matches!(
+            engine.prepare_batch(another_set),
+            Err(PrepareBatchError::Budget(GpuError::BudgetExceeded {
+                requested_bytes,
+                available_bytes
+            })) if requested_bytes == 2 * one && available_bytes == 0
+        ));
+        assert_eq!(reserved_bytes(&engine), 3 * one);
+        // Dropping one handle releases exactly its own matrix's bytes; the
+        // unrelated matrices stay resident.
+        let keep = batch[0].clone();
+        drop(batch);
+        assert_eq!(reserved_bytes(&engine), one);
+        // The released room fits exactly one more matrix.
+        engine.prepare(PARAMS, matrix(44, 2)).unwrap();
+        assert_eq!(reserved_bytes(&engine), 2 * one);
+        // The final clone of the first handle releases the rest.
+        drop(keep);
+        assert_eq!(reserved_bytes(&engine), one);
+    }
+
+    #[cfg(feature = "gpu")]
+    #[test]
+    fn a_batch_validation_failure_leaves_no_reservation() {
+        let one = (2 * PARAMS.n().unwrap() * 4) as u64;
+        let engine = gpu_engine_with_budget(4 * one);
+        if engine.gpu.is_none() {
+            return;
+        }
+        assert!(matches!(
+            engine.prepare_batch([
+                (PARAMS, matrix(41, 2)),
+                (PARAMS, narrow_matrix(42)),
+                (PARAMS, matrix(43, 2)),
+            ]),
+            Err(PrepareBatchError::Protocol { index: 1, .. })
+        ));
+        // Validation precedes the reservation: the whole set was rejected
+        // before any byte was booked, so a fresh set still fits.
+        assert_eq!(reserved_bytes(&engine), 0);
+        let batch = engine
+            .prepare_batch([(PARAMS, matrix(41, 2)), (PARAMS, matrix(43, 2))])
+            .unwrap();
+        assert_eq!(reserved_bytes(&engine), 2 * one);
+        drop(batch);
+        assert_eq!(reserved_bytes(&engine), 0);
+    }
+
+    #[cfg(feature = "gpu")]
+    #[test]
+    fn concurrent_batches_reserve_the_whole_budget_atomically() {
+        let one = (2 * PARAMS.n().unwrap() * 4) as u64;
+        let engine = Arc::new(gpu_engine_with_budget(2 * one));
+        if engine.gpu.is_none() {
+            return;
+        }
+        // Two concurrent sets, each exactly the whole budget: exactly one
+        // set wins its single whole-set reservation, the loser is rejected
+        // whole, and no half-reserved set survives either outcome.
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let workers: Vec<_> = (0_usize..2)
+            .map(|worker| {
+                let engine = Arc::clone(&engine);
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    engine.prepare_batch([
+                        (PARAMS, matrix(u128::try_from(100 + worker).unwrap(), 2)),
+                        (PARAMS, matrix(u128::try_from(200 + worker).unwrap(), 2)),
+                    ])
+                })
+            })
+            .collect();
+        let mut won = None;
+        for result in workers.into_iter().map(|worker| worker.join().unwrap()) {
+            match result {
+                Ok(batch) => {
+                    assert!(won.is_none(), "two batches won one budget");
+                    won = Some(batch);
+                }
+                Err(PrepareBatchError::Budget(_)) => {}
+                Err(error) => panic!("unexpected batch failure: {error}"),
+            }
+        }
+        // The winner's whole-set residency is exactly the budget, and
+        // releasing it releases everything.
+        assert_eq!(reserved_bytes(&engine), 2 * one);
+        drop(won);
+        assert_eq!(reserved_bytes(&engine), 0);
     }
 }

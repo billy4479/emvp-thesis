@@ -39,7 +39,7 @@ pub use dispatch::{
 #[cfg(feature = "gpu")]
 pub use dispatch::{AnswerDispatchError, AnswerDispatcher, MIN_GPU_MULTIPLICATIONS};
 pub use engine::{
-    AnswerEngine, AnswerEngineError, AnswerEntryReport, AnswerJob, AnswerReport,
+    AnswerEngine, AnswerEngineError, AnswerEntryReport, AnswerJob, AnswerReport, PrepareBatchError,
     PrepareMatrixError, PreparedMatrix,
 };
 #[cfg(feature = "gpu")]
