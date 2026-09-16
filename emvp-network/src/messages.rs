@@ -1,29 +1,39 @@
 //! The protocol messages and their payload codecs.
 //!
-//! Every function comes in two levels. Full-frame functions read or write
-//! the frame header plus the payload and are what a role that only ever
-//! produces or consumes whole messages uses. Payload-level functions parse
-//! from an already open [`FrameReader`], which is how the server dispatches
-//! on the header kind before handing the payload to the message parser.
+//! The owned message types ([`MatrixUpload`], [`EvaluateEntry`],
+//! [`ProductEntry`], [`ErrorResponse`]) and the `read_*`/`write_*`
+//! functions here are the stable convenience API: each one is a thin
+//! adapter over the zero-copy pipeline in [`crate::v2`]. The writers
+//! build borrowed views over their inputs and stream; the readers run the
+//! plan → reserve → decode pipeline with a fresh workspace and convert
+//! the decoded views into the owned types. Callers that manage their own
+//! workspaces should use [`crate::v2`] directly and never allocate on the
+//! hot path.
 //!
-//! All multi-byte integers are little-endian. Lengths and dimensions
-//! travel as `u64`; each message's redundant counts are cross-checked
-//! before any element payload is read.
+//! Full-frame functions read or write the frame header plus the payload
+//! and are what a role that only ever produces or consumes whole messages
+//! uses. Payload-level functions parse from an already open
+//! [`FrameReader`], which is how the server dispatches on the header kind
+//! before handing the payload to the message parser.
 
 use std::fmt;
 use std::io::{Read, Write};
 
-use emvp::{AnswerMatrix, EmvpParams, EncryptedMatrix, EncryptedQuery};
+use emvp::{AnswerMatrix, AnswerRef, EmvpParams, EncryptedMatrix, EncryptedQuery, EncryptedQueryRef};
 
 use crate::error::{CodecError, ErrorCode};
 use crate::frame::{
-    FrameKind, FrameReader, HEADER_BYTES, PROTOCOL_MODULUS, checked_size, field_byte_len, host_len,
-    read_frame_header, wire_len, write_field_slice, write_frame_header, write_u32, write_u64,
-    write_u128,
+    Field, FrameKind, FrameReader, HEADER_BYTES, PROTOCOL_MODULUS, checked_size, host_len,
+    wire_len, write_frame_header, write_u32, write_u64,
 };
-
-/// Bytes in one little-endian `u64`.
-const U64_BYTES: u64 = size_of::<u64>() as u64;
+use crate::v2::{
+    EvaluateEntryInput, EvaluateEntryView, EvaluateWorkspace, ProductEntryInput, ProductEntryView,
+    ProductsWorkspace, UploadAcceptedWorkspace, UploadMatrixView, UploadWorkspace,
+    decode_evaluate, decode_products, decode_upload, decode_upload_accepted, plan_evaluate,
+    plan_products, plan_upload, plan_upload_accepted, write_evaluate as write_evaluate_views,
+    write_products as write_products_views,
+    write_upload_matrices as write_upload_matrices_views,
+};
 
 /// One uploaded encrypted matrix together with the parameters it was
 /// encrypted under.
@@ -78,70 +88,6 @@ impl fmt::Display for ErrorResponse {
 
 impl std::error::Error for ErrorResponse {}
 
-/// Bytes in one matrix record's fixed prefix: four parameter fields, the
-/// instance identifier, the two dimensions, and the element count.
-const MATRIX_FIXED_BYTES: u64 = 8 + 8 + 8 + 4 + 16 + 8 + 8 + 8;
-
-/// Bytes in one query record's fixed prefix.
-const QUERY_FIXED_BYTES: u64 = 16 + 8 + 8;
-
-/// Bytes in one answer record's fixed prefix.
-const ANSWER_FIXED_BYTES: u64 = 16 + 8 + 8 + 8 + 8;
-
-/// The payload length of an `UploadMatrices` frame.
-fn upload_matrices_payload_len(uploads: &[MatrixUpload]) -> Result<u64, CodecError> {
-    let mut total = U64_BYTES;
-    for upload in uploads {
-        let values = field_byte_len(wire_len(upload.matrix.values().len())?)?;
-        total = checked_size(total, MATRIX_FIXED_BYTES)?;
-        total = checked_size(total, values)?;
-    }
-    Ok(total)
-}
-
-/// The payload length of an `UploadAccepted` frame.
-fn upload_accepted_payload_len(identifiers: &[u64]) -> Result<u64, CodecError> {
-    let count = wire_len(identifiers.len())?;
-    let ids = count
-        .checked_mul(U64_BYTES)
-        .ok_or(CodecError::DimensionOverflow)?;
-    checked_size(U64_BYTES, ids)
-}
-
-/// The payload length of an `Evaluate` frame.
-fn evaluate_payload_len(entries: &[EvaluateEntry]) -> Result<u64, CodecError> {
-    let mut total = U64_BYTES;
-    for entry in entries {
-        total = checked_size(total, 8 + 8)?;
-        for query in &entry.queries {
-            let values = field_byte_len(wire_len(query.values().len())?)?;
-            total = checked_size(total, QUERY_FIXED_BYTES)?;
-            total = checked_size(total, values)?;
-        }
-    }
-    Ok(total)
-}
-
-/// The payload length of a `Products` frame.
-fn products_payload_len(entries: &[ProductEntry]) -> Result<u64, CodecError> {
-    let mut total = U64_BYTES;
-    for entry in entries {
-        total = checked_size(total, 8 + 8)?;
-        for answer in &entry.answers {
-            let values = field_byte_len(wire_len(answer.values().len())?)?;
-            total = checked_size(total, ANSWER_FIXED_BYTES)?;
-            total = checked_size(total, values)?;
-        }
-    }
-    Ok(total)
-}
-
-/// The payload length of an `Error` frame: a `u32` code, a `u64` text
-/// length, and the text itself.
-fn error_payload_len(message: &str) -> Result<u64, CodecError> {
-    checked_size(4 + 8, wire_len(message.len())?)
-}
-
 /// Writes the one matrix-set upload of a session.
 ///
 /// Returns the total bytes written, header included.
@@ -154,21 +100,8 @@ pub fn write_upload_matrices(
     writer: &mut impl Write,
     uploads: &[MatrixUpload],
 ) -> Result<u64, CodecError> {
-    let payload_len = upload_matrices_payload_len(uploads)?;
-    write_frame_header(writer, FrameKind::UploadMatrices, payload_len)?;
-    write_u64(writer, wire_len(uploads.len())?)?;
-    for upload in uploads {
-        write_u64(writer, wire_len(upload.params.k)?)?;
-        write_u64(writer, wire_len(upload.params.ell)?)?;
-        write_u64(writer, wire_len(upload.params.b)?)?;
-        write_u32(writer, upload.params.lambda)?;
-        write_u128(writer, upload.matrix.instance_id())?;
-        write_u64(writer, wire_len(upload.matrix.rows())?)?;
-        write_u64(writer, wire_len(upload.matrix.columns())?)?;
-        write_u64(writer, wire_len(upload.matrix.values().len())?)?;
-        write_field_slice(writer, upload.matrix.values())?;
-    }
-    checked_size(payload_len, HEADER_BYTES)
+    let views: Vec<UploadMatrixView<'_>> = uploads.iter().map(UploadMatrixView::from).collect();
+    write_upload_matrices_views(writer, &views)
 }
 
 /// Writes the accepted upload's matrix identifiers, in upload order.
@@ -183,9 +116,13 @@ pub fn write_upload_accepted(
     writer: &mut impl Write,
     identifiers: &[u64],
 ) -> Result<u64, CodecError> {
-    let payload_len = upload_accepted_payload_len(identifiers)?;
+    let count = wire_len(identifiers.len())?;
+    let ids = count
+        .checked_mul(size_of::<u64>() as u64)
+        .ok_or(CodecError::DimensionOverflow)?;
+    let payload_len = checked_size(8, ids)?;
     write_frame_header(writer, FrameKind::UploadAccepted, payload_len)?;
-    write_u64(writer, wire_len(identifiers.len())?)?;
+    write_u64(writer, count)?;
     for &identifier in identifiers {
         write_u64(writer, identifier)?;
     }
@@ -198,26 +135,27 @@ pub fn write_upload_accepted(
 ///
 /// # Errors
 ///
-/// Returns [`CodecError::DimensionOverflow`] if the message exceeds the
-/// wire length space, and [`CodecError::Io`] if the transport fails.
+/// Returns [`CodecError::CountMismatch`] when the queries of one entry
+/// disagree on their coordinate count, [`CodecError::DimensionOverflow`]
+/// if the message exceeds the wire length space, and [`CodecError::Io`]
+/// if the transport fails.
 pub fn write_evaluate(
     writer: &mut impl Write,
     entries: &[EvaluateEntry],
 ) -> Result<u64, CodecError> {
-    let payload_len = evaluate_payload_len(entries)?;
-    write_frame_header(writer, FrameKind::Evaluate, payload_len)?;
-    write_u64(writer, wire_len(entries.len())?)?;
-    for entry in entries {
-        write_u64(writer, entry.matrix_id)?;
-        write_u64(writer, wire_len(entry.queries.len())?)?;
-        for query in &entry.queries {
-            write_u128(writer, query.instance_id())?;
-            write_u64(writer, query.query_id())?;
-            write_u64(writer, wire_len(query.values().len())?)?;
-            write_field_slice(writer, query.values())?;
-        }
-    }
-    checked_size(payload_len, HEADER_BYTES)
+    let query_refs: Vec<Vec<EncryptedQueryRef<'_, PROTOCOL_MODULUS>>> = entries
+        .iter()
+        .map(|entry| entry.queries.iter().map(EncryptedQueryRef::from).collect())
+        .collect();
+    let inputs: Vec<EvaluateEntryInput<'_>> = entries
+        .iter()
+        .zip(&query_refs)
+        .map(|(entry, queries)| EvaluateEntryInput {
+            matrix_id: entry.matrix_id,
+            queries,
+        })
+        .collect();
+    write_evaluate_views(writer, &inputs)
 }
 
 /// Writes the encrypted products of one evaluation request.
@@ -226,28 +164,33 @@ pub fn write_evaluate(
 ///
 /// # Errors
 ///
-/// Returns [`CodecError::DimensionOverflow`] if the message exceeds the
-/// wire length space, and [`CodecError::Io`] if the transport fails.
+/// Returns [`CodecError::CountMismatch`] when an answer's element count
+/// contradicts the entry shape, [`CodecError::DimensionOverflow`] if the
+/// message exceeds the wire length space, and [`CodecError::Io`] if the
+/// transport fails.
 pub fn write_products(
     writer: &mut impl Write,
     entries: &[ProductEntry],
 ) -> Result<u64, CodecError> {
-    let payload_len = products_payload_len(entries)?;
-    write_frame_header(writer, FrameKind::Products, payload_len)?;
-    write_u64(writer, wire_len(entries.len())?)?;
-    for entry in entries {
-        write_u64(writer, entry.matrix_id)?;
-        write_u64(writer, wire_len(entry.answers.len())?)?;
-        for answer in &entry.answers {
-            write_u128(writer, answer.instance_id())?;
-            write_u64(writer, answer.query_id())?;
-            write_u64(writer, wire_len(answer.rows())?)?;
-            write_u64(writer, wire_len(answer.blocks())?)?;
-            write_u64(writer, wire_len(answer.values().len())?)?;
-            write_field_slice(writer, answer.values())?;
-        }
-    }
-    checked_size(payload_len, HEADER_BYTES)
+    let answer_refs: Vec<Vec<AnswerRef<'_, PROTOCOL_MODULUS>>> = entries
+        .iter()
+        .map(|entry| entry.answers.iter().map(AnswerRef::from).collect())
+        .collect();
+    let inputs: Vec<ProductEntryInput<'_>> = entries
+        .iter()
+        .zip(&answer_refs)
+        .map(|(entry, answers)| ProductEntryInput {
+            matrix_id: entry.matrix_id,
+            instance_id: entry
+                .answers
+                .first()
+                .map_or(0, AnswerMatrix::instance_id),
+            rows: entry.answers.first().map_or(0, AnswerMatrix::rows),
+            blocks: entry.answers.first().map_or(0, AnswerMatrix::blocks),
+            answers,
+        })
+        .collect();
+    write_products_views(writer, &inputs)
 }
 
 /// Writes a structured rejection of a request.
@@ -263,87 +206,36 @@ pub fn write_error(
     code: ErrorCode,
     message: &str,
 ) -> Result<u64, CodecError> {
-    let payload_len = error_payload_len(message)?;
+    let text_bytes = wire_len(message.len())?;
+    let payload_len = checked_size(4 + 8, text_bytes)?;
     write_frame_header(writer, FrameKind::Error, payload_len)?;
     write_u32(writer, code.to_u32())?;
-    write_u64(writer, wire_len(message.len())?)?;
+    write_u64(writer, text_bytes)?;
     writer
         .write_all(message.as_bytes())
         .map_err(CodecError::Io)?;
     checked_size(payload_len, HEADER_BYTES)
 }
 
-/// Reads the matrix-set upload payload from an open frame.
+/// Reads the matrix-set upload payload from an open frame into freshly
+/// allocated owned records.
+///
+/// This is the allocating convenience form of the [`crate::v2`]
+/// pipeline; it reserves a fresh [`UploadWorkspace`], decodes, and copies
+/// the borrowed views into owned [`MatrixUpload`] records.
 ///
 /// # Errors
 ///
-/// Returns [`CodecError::CountMismatch`] when a record's element count
-/// contradicts its dimensions, [`CodecError::ValueOutOfRange`] when a wire
-/// dimension does not fit the host, and the framing errors of
-/// [`FrameReader`].
+/// Returns the errors of [`crate::v2::plan_upload`],
+/// [`crate::v2::decode_upload`], and each record's owned conversion.
 pub fn read_upload_matrices_payload<R: Read>(
     frame: &mut FrameReader<'_, R>,
 ) -> Result<Vec<MatrixUpload>, CodecError> {
-    let count = frame.read_u64()?;
-    let mut uploads = Vec::new();
-    for _ in 0..count {
-        let k = frame.read_u64()?;
-        let ell = frame.read_u64()?;
-        let b = frame.read_u64()?;
-        let lambda = frame.read_u32()?;
-        let instance_id = frame.read_u128()?;
-        let rows = frame.read_u64()?;
-        let columns = frame.read_u64()?;
-        let value_count = frame.read_u64()?;
-        let expected = rows
-            .checked_mul(columns)
-            .ok_or(CodecError::DimensionOverflow)?;
-        if expected != value_count {
-            return Err(CodecError::CountMismatch {
-                name: "matrix values",
-                expected,
-                actual: value_count,
-            });
-        }
-        if rows == 0 {
-            return Err(CodecError::InvalidDimensions {
-                name: "matrix rows",
-                value: 0,
-            });
-        }
-        if columns == 0 {
-            return Err(CodecError::InvalidDimensions {
-                name: "matrix columns",
-                value: 0,
-            });
-        }
-        let values = frame.read_field_slice(value_count)?;
-        // The dimension and length checks above are exactly the
-        // constructor's validation, so this arm is unreachable for any
-        // decoded record.
-        let Ok(matrix) = EncryptedMatrix::from_parts(
-            instance_id,
-            host_len("matrix rows", rows)?,
-            host_len("matrix columns", columns)?,
-            values,
-        ) else {
-            return Err(CodecError::CountMismatch {
-                name: "matrix values",
-                expected,
-                actual: value_count,
-            });
-        };
-        uploads.push(MatrixUpload {
-            params: EmvpParams {
-                k: host_len("parameter k", k)?,
-                ell: host_len("parameter ell", ell)?,
-                b: host_len("parameter b", b)?,
-                lambda,
-            },
-            matrix,
-        });
-    }
-    Ok(uploads)
+    let plan = plan_upload(frame)?;
+    let mut workspace = UploadWorkspace::new();
+    workspace.reserve(&plan)?;
+    let views = decode_upload(frame, &plan, &mut workspace)?;
+    views.iter().map(owned_upload).collect()
 }
 
 /// Reads the accepted-upload payload from an open frame.
@@ -355,109 +247,57 @@ pub fn read_upload_matrices_payload<R: Read>(
 ///
 /// # Errors
 ///
-/// Returns [`CodecError::InvalidDimensions`] for a zero identifier, and
-/// the framing errors of [`FrameReader`].
+/// Returns the errors of [`crate::v2::plan_upload_accepted`].
 pub fn read_upload_accepted_payload<R: Read>(
     frame: &mut FrameReader<'_, R>,
 ) -> Result<Vec<u64>, CodecError> {
-    let count = frame.read_u64()?;
-    let mut identifiers = Vec::new();
-    for _ in 0..count {
-        let identifier = frame.read_u64()?;
-        if identifier == 0 {
-            return Err(CodecError::InvalidDimensions {
-                name: "matrix identifier",
-                value: 0,
-            });
-        }
-        identifiers.push(identifier);
-    }
-    Ok(identifiers)
+    let plan = plan_upload_accepted(frame)?;
+    let mut workspace = UploadAcceptedWorkspace::new();
+    workspace.reserve(&plan)?;
+    let identifiers = decode_upload_accepted(frame, &plan, &mut workspace)?;
+    Ok(identifiers.to_vec())
 }
 
-/// Reads the evaluation payload from an open frame.
+/// Reads the evaluation payload from an open frame into freshly allocated
+/// owned records.
+///
+/// This is the allocating convenience form of the [`crate::v2`]
+/// pipeline; it reserves a fresh [`EvaluateWorkspace`], decodes, and
+/// copies the borrowed views into owned [`EvaluateEntry`] records.
 ///
 /// # Errors
 ///
-/// Returns the framing errors of [`FrameReader`].
+/// Returns the errors of [`crate::v2::plan_evaluate`],
+/// [`crate::v2::decode_evaluate`], and each record's owned conversion.
 pub fn read_evaluate_payload<R: Read>(
     frame: &mut FrameReader<'_, R>,
 ) -> Result<Vec<EvaluateEntry>, CodecError> {
-    let count = frame.read_u64()?;
-    let mut entries = Vec::new();
-    for _ in 0..count {
-        let matrix_id = frame.read_u64()?;
-        let query_count = frame.read_u64()?;
-        let mut queries = Vec::new();
-        for _ in 0..query_count {
-            let instance_id = frame.read_u128()?;
-            let query_id = frame.read_u64()?;
-            let value_count = frame.read_u64()?;
-            let values = frame.read_field_slice(value_count)?;
-            queries.push(EncryptedQuery::from_parts(instance_id, query_id, values));
-        }
-        entries.push(EvaluateEntry { matrix_id, queries });
-    }
-    Ok(entries)
+    let plan = plan_evaluate(frame)?;
+    let mut workspace = EvaluateWorkspace::new();
+    workspace.reserve(&plan)?;
+    let views = decode_evaluate(frame, &plan, &mut workspace)?;
+    Ok(views.iter().map(owned_entry).collect())
 }
 
-/// Reads the products payload from an open frame.
+/// Reads the products payload from an open frame into freshly allocated
+/// owned records.
+///
+/// This is the allocating convenience form of the [`crate::v2`]
+/// pipeline; it reserves a fresh [`ProductsWorkspace`], decodes, and
+/// copies the borrowed views into owned [`ProductEntry`] records.
 ///
 /// # Errors
 ///
-/// Returns [`CodecError::CountMismatch`] when an answer's element count
-/// contradicts its dimensions, [`CodecError::InvalidDimensions`] when an
-/// answer declares zero rows or zero blocks, and the framing errors of
-/// [`FrameReader`].
+/// Returns the errors of [`crate::v2::plan_products`],
+/// [`crate::v2::decode_products`], and each record's owned conversion.
 pub fn read_products_payload<R: Read>(
     frame: &mut FrameReader<'_, R>,
 ) -> Result<Vec<ProductEntry>, CodecError> {
-    let count = frame.read_u64()?;
-    let mut entries = Vec::new();
-    for _ in 0..count {
-        let matrix_id = frame.read_u64()?;
-        let answer_count = frame.read_u64()?;
-        let mut answers = Vec::new();
-        for _ in 0..answer_count {
-            let instance_id = frame.read_u128()?;
-            let query_id = frame.read_u64()?;
-            let rows = frame.read_u64()?;
-            let blocks = frame.read_u64()?;
-            let value_count = frame.read_u64()?;
-            let expected = rows
-                .checked_mul(blocks)
-                .ok_or(CodecError::DimensionOverflow)?;
-            if expected != value_count {
-                return Err(CodecError::CountMismatch {
-                    name: "answer values",
-                    expected,
-                    actual: value_count,
-                });
-            }
-            if rows == 0 {
-                return Err(CodecError::InvalidDimensions {
-                    name: "answer rows",
-                    value: 0,
-                });
-            }
-            if blocks == 0 {
-                return Err(CodecError::InvalidDimensions {
-                    name: "answer blocks",
-                    value: 0,
-                });
-            }
-            let values = frame.read_field_slice(value_count)?;
-            answers.push(AnswerMatrix::from_parts(
-                instance_id,
-                query_id,
-                values,
-                host_len("answer rows", rows)?,
-                host_len("answer blocks", blocks)?,
-            ));
-        }
-        entries.push(ProductEntry { matrix_id, answers });
-    }
-    Ok(entries)
+    let plan = plan_products(frame)?;
+    let mut workspace = ProductsWorkspace::new();
+    workspace.reserve(&plan)?;
+    let views = decode_products(frame, &plan, &mut workspace)?;
+    Ok(views.iter().map(owned_product).collect())
 }
 
 /// Reads the error payload from an open frame.
@@ -491,7 +331,7 @@ pub fn read_error_payload<R: Read>(
 /// # Errors
 ///
 /// Returns [`CodecError::UnexpectedFrame`] for any other frame kind, and
-/// the payload errors of [`Self::read_upload_matrices_payload`].
+/// the payload errors of [`read_upload_matrices_payload`].
 pub fn read_upload_matrices<R: Read>(
     reader: &mut R,
 ) -> Result<(Vec<MatrixUpload>, u64), CodecError> {
@@ -508,7 +348,7 @@ pub fn read_upload_matrices<R: Read>(
 /// # Errors
 ///
 /// Returns [`CodecError::UnexpectedFrame`] for any other frame kind, and
-/// the payload errors of [`Self::read_upload_accepted_payload`].
+/// the payload errors of [`read_upload_accepted_payload`].
 pub fn read_upload_accepted<R: Read>(reader: &mut R) -> Result<(Vec<u64>, u64), CodecError> {
     let (mut frame, payload_len) = open_frame(reader, FrameKind::UploadAccepted)?;
     let message = read_upload_accepted_payload(&mut frame)?;
@@ -523,7 +363,7 @@ pub fn read_upload_accepted<R: Read>(reader: &mut R) -> Result<(Vec<u64>, u64), 
 /// # Errors
 ///
 /// Returns [`CodecError::UnexpectedFrame`] for any other frame kind, and
-/// the payload errors of [`Self::read_evaluate_payload`].
+/// the payload errors of [`read_evaluate_payload`].
 pub fn read_evaluate<R: Read>(reader: &mut R) -> Result<(Vec<EvaluateEntry>, u64), CodecError> {
     let (mut frame, payload_len) = open_frame(reader, FrameKind::Evaluate)?;
     let message = read_evaluate_payload(&mut frame)?;
@@ -538,7 +378,7 @@ pub fn read_evaluate<R: Read>(reader: &mut R) -> Result<(Vec<EvaluateEntry>, u64
 /// # Errors
 ///
 /// Returns [`CodecError::UnexpectedFrame`] for any other frame kind, and
-/// the payload errors of [`Self::read_products_payload`].
+/// the payload errors of [`read_products_payload`].
 pub fn read_products<R: Read>(reader: &mut R) -> Result<(Vec<ProductEntry>, u64), CodecError> {
     let (mut frame, payload_len) = open_frame(reader, FrameKind::Products)?;
     let message = read_products_payload(&mut frame)?;
@@ -553,7 +393,7 @@ pub fn read_products<R: Read>(reader: &mut R) -> Result<(Vec<ProductEntry>, u64)
 /// # Errors
 ///
 /// Returns [`CodecError::UnexpectedFrame`] for any other frame kind, and
-/// the payload errors of [`Self::read_error_payload`].
+/// the payload errors of [`read_error_payload`].
 pub fn read_error<R: Read>(reader: &mut R) -> Result<(ErrorResponse, u64), CodecError> {
     let (mut frame, payload_len) = open_frame(reader, FrameKind::Error)?;
     let message = read_error_payload(&mut frame)?;
@@ -561,12 +401,90 @@ pub fn read_error<R: Read>(reader: &mut R) -> Result<(ErrorResponse, u64), Codec
     Ok((message, payload_len))
 }
 
+/// Converts one decoded matrix view into an owned upload record.
+fn owned_upload(view: UploadMatrixView<'_>) -> Result<MatrixUpload, CodecError> {
+    let matrix = owned_matrix(view.values, view.instance_id, view.rows, view.columns)?;
+    Ok(MatrixUpload {
+        params: view.params,
+        matrix,
+    })
+}
+
+/// Converts one decoded entry view into an owned evaluation entry.
+fn owned_entry(view: EvaluateEntryView<'_>) -> EvaluateEntry {
+    let queries: Vec<EncryptedQuery<PROTOCOL_MODULUS>> = view
+        .iter()
+        .map(|query| {
+            EncryptedQuery::from_parts(
+                query.instance_id(),
+                query.query_id(),
+                query.values().to_vec(),
+            )
+        })
+        .collect();
+    EvaluateEntry {
+        matrix_id: view.matrix_id(),
+        queries,
+    }
+}
+
+/// Converts one decoded product entry view into an owned product entry.
+fn owned_product(view: ProductEntryView<'_>) -> ProductEntry {
+    let rows = view.rows();
+    let blocks = view.blocks();
+    let answers: Vec<AnswerMatrix<PROTOCOL_MODULUS>> = view
+        .iter()
+        .map(|answer| {
+            AnswerMatrix::from_parts(
+                answer.instance_id(),
+                answer.query_id(),
+                answer.values().to_vec(),
+                rows,
+                blocks,
+            )
+        })
+        .collect();
+    ProductEntry {
+        matrix_id: view.matrix_id(),
+        answers,
+    }
+}
+
+/// Copies a decoded matrix's values into an owned encrypted matrix.
+///
+/// A validated decode satisfies the shape invariant exactly, so the error
+/// arm is unreachable for decoded records.
+fn owned_matrix(
+    values: &[Field],
+    instance_id: u128,
+    rows: usize,
+    columns: usize,
+) -> Result<EncryptedMatrix<PROTOCOL_MODULUS>, CodecError> {
+    match EncryptedMatrix::from_parts(instance_id, rows, columns, values.to_vec()) {
+        Ok(matrix) => Ok(matrix),
+        Err(_unreachable) => {
+            let expected = u64::try_from(
+                rows.checked_mul(columns)
+                    .ok_or(CodecError::DimensionOverflow)?,
+            )
+            .map_err(|_conversion| CodecError::DimensionOverflow)?;
+            let actual =
+                u64::try_from(values.len()).map_err(|_conversion| CodecError::DimensionOverflow)?;
+            Err(CodecError::CountMismatch {
+                name: "matrix values",
+                expected,
+                actual,
+            })
+        }
+    }
+}
+
 /// Reads a frame header and opens its payload, requiring one kind.
 fn open_frame<R: Read>(
     reader: &mut R,
     expected: FrameKind,
 ) -> Result<(FrameReader<'_, R>, u64), CodecError> {
-    let Some(header) = read_frame_header(reader)? else {
+    let Some(header) = crate::frame::read_frame_header(reader)? else {
         return Err(CodecError::TruncatedFrame);
     };
     if header.kind != expected {

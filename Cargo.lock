@@ -444,6 +444,7 @@ dependencies = [
 name = "emvp-network"
 version = "0.1.0"
 dependencies = [
+ "allocation-counter",
  "criterion",
  "emvp",
  "prime-field-layer",

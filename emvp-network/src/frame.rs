@@ -24,7 +24,10 @@ pub type Field = FieldElement<PROTOCOL_MODULUS>;
 pub const PROTOCOL_MODULUS: u32 = 998_244_353;
 
 /// The protocol version the handshake must match exactly.
-pub const PROTOCOL_VERSION: u16 = 1;
+///
+/// Version 2 replaces the v1 per-record fixed prefixes with
+/// descriptor-table-first layouts; there is no v1 compatibility.
+pub const PROTOCOL_VERSION: u16 = 2;
 
 /// The handshake magic preceding every client hello.
 pub const MAGIC: [u8; 4] = *b"EMVP";
@@ -261,26 +264,51 @@ impl<'a, R: Read> FrameReader<'a, R> {
         values
             .try_reserve_exact(count)
             .map_err(|_reserve| CodecError::AllocationFailed)?;
+        let zero = PrimeField::<PROTOCOL_MODULUS>::new().element_u32(0);
+        values.resize(count, zero);
+        self.read_field_slice_into(&mut values)?;
+        Ok(values)
+    }
+
+    /// Reads exactly `values.len()` canonical field elements into `values`
+    /// in bounded chunks.
+    ///
+    /// This is the allocation-free form of [`Self::read_field_slice`]: the
+    /// destination is caller-provided, so decoding only stages bytes
+    /// through a fixed stack chunk. The frame's remaining length is checked
+    /// before any byte is read.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CodecError::TruncatedFrame`] when the payload cannot hold
+    /// `values.len()` elements, [`CodecError::NonCanonicalField`] for an
+    /// encoded integer at or above the modulus, and [`CodecError::Io`] for
+    /// transport failures.
+    pub fn read_field_slice_into(&mut self, values: &mut [Field]) -> Result<(), CodecError> {
+        let count =
+            u64::try_from(values.len()).map_err(|_conversion| CodecError::DimensionOverflow)?;
+        let field_bytes = field_byte_len(count)?;
+        if field_bytes > self.remaining {
+            return Err(CodecError::TruncatedFrame);
+        }
         let field = PrimeField::<PROTOCOL_MODULUS>::new();
         let mut buffer = [0_u8; CHUNK_BYTES];
-        let mut left = count;
-        while left > 0 {
-            let take = left.min(CHUNK_FIELDS);
+        let mut done = 0_usize;
+        while done < values.len() {
+            let take = (values.len() - done).min(CHUNK_FIELDS);
             let take_bytes = take * FIELD_ELEMENT_ENCODED_SIZE;
             self.read_exact_checked(&mut buffer[..take_bytes])?;
             let (words, _tail) = buffer[..take_bytes].as_chunks::<FIELD_ELEMENT_ENCODED_SIZE>();
-            for word in words {
-                values.push(
-                    field
-                        .from_canonical_le_bytes(*word)
-                        .map_err(|noncanonical| CodecError::NonCanonicalField {
-                            value: noncanonical.value(),
-                        })?,
-                );
+            for (slot, word) in values[done..done + take].iter_mut().zip(words) {
+                *slot = field
+                    .from_canonical_le_bytes(*word)
+                    .map_err(|noncanonical| CodecError::NonCanonicalField {
+                        value: noncanonical.value(),
+                    })?;
             }
-            left -= take;
+            done += take;
         }
-        Ok(values)
+        Ok(())
     }
 
     /// Asserts the whole payload was consumed by exactly one message.
@@ -288,7 +316,7 @@ impl<'a, R: Read> FrameReader<'a, R> {
     /// # Errors
     ///
     /// Returns [`CodecError::TrailingFrameBytes`] if payload bytes remain.
-    pub const fn finish(self) -> Result<(), CodecError> {
+    pub const fn finish(&mut self) -> Result<(), CodecError> {
         if self.remaining == 0 {
             Ok(())
         } else {

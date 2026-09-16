@@ -11,6 +11,7 @@ emvp = { path = "../emvp" }
 prime-field-layer = { path = "../prime-field-layer" }
 
 [dev-dependencies]
+allocation-counter = { workspace = true }
 criterion = { workspace = true }
 proptest = { workspace = true }
 

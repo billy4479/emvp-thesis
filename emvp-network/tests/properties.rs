@@ -194,76 +194,120 @@ proptest! {
     }
 
     #[test]
-    fn inflated_query_counts_truncate(matrix_id in any::<u64>(), claimed in 2_u64..=5_u64) {
+    fn inflated_query_counts_contradict_the_summary(
+        matrix_id in any::<u64>(),
+        claimed in 2_u64..=5_u64,
+    ) {
         let mut buffer = Vec::new();
         write_evaluate(&mut buffer, &[one_query_entry(matrix_id)]).unwrap();
-        // The query count of the first entry trails the header, the list
-        // count, and the matrix identifier.
-        let query_count_offset = HEADER_BYTES as usize + 8 + 8;
+        // The entry's query count trails the header, the list count, the
+        // total query count, and the matrix identifier. The inflated count
+        // still fits the descriptor table, so the summary cross-check is
+        // what rejects it.
+        let query_count_offset = HEADER_BYTES as usize + 8 + 8 + 8;
         buffer[query_count_offset..query_count_offset + 8].copy_from_slice(&claimed.to_le_bytes());
         prop_assert!(
             matches!(
                 read_evaluate(&mut Cursor::new(&buffer)),
-                Err(CodecError::TruncatedFrame)
+                Err(CodecError::CountMismatch {
+                    name: "query count",
+                    expected: 1,
+                    actual
+                }) if actual == claimed
             ),
-            "an inflated query count must truncate"
+            "an inflated query count must contradict the summary total"
         );
     }
 
     #[test]
-    fn inflated_answer_counts_truncate(matrix_id in any::<u64>(), claimed in 2_u64..=5_u64) {
+    fn inflated_answer_counts_contradict_the_summary(
+        matrix_id in any::<u64>(),
+        claimed in 2_u64..=5_u64,
+    ) {
         let mut buffer = Vec::new();
         write_products(&mut buffer, &[one_answer_entry(matrix_id)]).unwrap();
-        let answer_count_offset = HEADER_BYTES as usize + 8 + 8;
+        // The entry's answer count trails the header, the list count, the
+        // total answer count, the matrix identifier, the instance
+        // identifier, rows, and blocks.
+        let answer_count_offset = HEADER_BYTES as usize + 8 + 8 + 8 + 16 + 8 + 8;
         buffer[answer_count_offset..answer_count_offset + 8].copy_from_slice(&claimed.to_le_bytes());
         prop_assert!(
             matches!(
                 read_products(&mut Cursor::new(&buffer)),
-                Err(CodecError::TruncatedFrame)
+                Err(CodecError::CountMismatch {
+                    name: "answer count",
+                    expected: 1,
+                    actual
+                }) if actual == claimed
             ),
-            "an inflated answer count must truncate"
+            "an inflated answer count must contradict the summary total"
         );
     }
 
     #[test]
-    fn mismatched_upload_value_counts_are_rejected(extra in 1_u64..=4_u64) {
+    fn inflated_summary_query_counts_contradict_the_entries(
+        matrix_id in any::<u64>(),
+        claimed in 2_u64..=5_u64,
+    ) {
+        let mut buffer = Vec::new();
+        write_evaluate(&mut buffer, &[one_query_entry(matrix_id)]).unwrap();
+        // Inflating the summary total instead contradicts the unchanged
+        // per-entry count; the larger query table still fits the payload.
+        let total_offset = HEADER_BYTES as usize + 8;
+        buffer[total_offset..total_offset + 8].copy_from_slice(&claimed.to_le_bytes());
+        prop_assert!(
+            matches!(
+                read_evaluate(&mut Cursor::new(&buffer)),
+                Err(CodecError::CountMismatch {
+                    name: "query count",
+                    expected,
+                    actual: 1
+                }) if expected == claimed
+            ),
+            "an inflated summary total must contradict the entries"
+        );
+    }
+
+    #[test]
+    fn inflated_upload_dimensions_break_the_value_budget(extra in 1_u64..=4_u64) {
         let mut buffer = Vec::new();
         write_upload_matrices(&mut buffer, &[small_upload()]).unwrap();
         // One record: k, ell, b (8 each), lambda (4), instance id (16),
-        // rows, columns (8 each), then the value count.
-        let value_count_offset = HEADER_BYTES as usize + 8 + 8 + 8 + 8 + 4 + 16 + 8 + 8;
+        // then rows and columns (8 each). There is no declared value count
+        // in v2: inflating the rows grows the derived value region beyond
+        // the declared payload, which the plan must reject.
+        let rows_offset = HEADER_BYTES as usize + 8 + 28 + 16;
         let declared = u64::from_le_bytes(
-            buffer[value_count_offset..value_count_offset + 8].try_into().unwrap(),
+            buffer[rows_offset..rows_offset + 8].try_into().unwrap(),
         );
-        buffer[value_count_offset..value_count_offset + 8]
-            .copy_from_slice(&(declared + extra).to_le_bytes());
+        buffer[rows_offset..rows_offset + 8].copy_from_slice(&(declared + extra).to_le_bytes());
         prop_assert!(
             matches!(
                 read_upload_matrices(&mut Cursor::new(&buffer)),
-                Err(CodecError::CountMismatch { name: "matrix values", .. })
+                Err(CodecError::TruncatedFrame)
             ),
-            "a mismatched matrix value count must be rejected"
+            "an inflated matrix dimension must break the value budget"
         );
     }
 
     #[test]
-    fn mismatched_answer_value_counts_are_rejected(extra in 1_u64..=4_u64) {
+    fn inflated_answer_dimensions_break_the_value_budget(extra in 1_u64..=4_u64) {
         let mut buffer = Vec::new();
         write_products(&mut buffer, &[one_answer_entry(7)]).unwrap();
-        // Per answer: instance id (16), query id (8), rows (8), blocks
-        // (8), then the value count.
-        let value_count_offset = HEADER_BYTES as usize + 8 + 8 + 8 + 16 + 8 + 8 + 8;
+        // Per entry: matrix id (8), instance id (16), then rows (8). An
+        // inflated row count grows every answer of the entry beyond the
+        // declared payload.
+        let rows_offset = HEADER_BYTES as usize + 8 + 8 + 8 + 16;
         let declared = u64::from_le_bytes(
-            buffer[value_count_offset..value_count_offset + 8].try_into().unwrap(),
+            buffer[rows_offset..rows_offset + 8].try_into().unwrap(),
         );
-        buffer[value_count_offset..value_count_offset + 8]
-            .copy_from_slice(&(declared + extra).to_le_bytes());
+        buffer[rows_offset..rows_offset + 8].copy_from_slice(&(declared + extra).to_le_bytes());
         prop_assert!(
             matches!(
                 read_products(&mut Cursor::new(&buffer)),
-                Err(CodecError::CountMismatch { name: "answer values", .. })
+                Err(CodecError::TruncatedFrame)
             ),
-            "a mismatched answer value count must be rejected"
+            "an inflated answer dimension must break the value budget"
         );
     }
 
@@ -272,8 +316,8 @@ proptest! {
         let mut buffer = Vec::new();
         write_upload_matrices(&mut buffer, &[small_upload()]).unwrap();
         // The first encoded element trails the header, the list count,
-        // and the 68-byte record prefix.
-        let first_element = HEADER_BYTES as usize + 8 + 68;
+        // and the 60-byte descriptor.
+        let first_element = HEADER_BYTES as usize + 8 + 60;
         buffer[first_element..first_element + 4].copy_from_slice(&word.to_le_bytes());
         prop_assert!(
             matches!(
@@ -300,7 +344,7 @@ proptest! {
             }],
         )
         .unwrap();
-        let first_element = HEADER_BYTES as usize + 8 + 8 + 8 + 16 + 8 + 8;
+        let first_element = HEADER_BYTES as usize + 16 + 24 + 24;
         buffer[first_element..first_element + 4].copy_from_slice(&word.to_le_bytes());
         prop_assert!(
             matches!(
@@ -323,6 +367,20 @@ proptest! {
         );
         prop_assert_eq!(FrameKind::from_u8(kind), None);
     }
+}
+
+#[test]
+fn deflated_upload_dimensions_leave_trailing_bytes() {
+    let mut buffer = Vec::new();
+    write_upload_matrices(&mut buffer, &[upload_2x2()]).unwrap();
+    // Deflating the rows from 2 to 1 halves the derived value region from
+    // 16 payload bytes to 8, leaving 8 trailing.
+    let rows_offset = HEADER_BYTES as usize + 8 + 28 + 16;
+    buffer[rows_offset..rows_offset + 8].copy_from_slice(&1_u64.to_le_bytes());
+    assert!(matches!(
+        read_upload_matrices(&mut Cursor::new(&buffer)),
+        Err(CodecError::TrailingFrameBytes { extra: 8 })
+    ));
 }
 
 /// Every proper prefix of `frame` must fail `read`, without panicking.
@@ -399,53 +457,79 @@ fn small_upload() -> MatrixUpload {
     }
 }
 
+/// One 2x2 upload, for value-budget arithmetic with headroom to deflate.
+fn upload_2x2() -> MatrixUpload {
+    MatrixUpload {
+        params: EmvpParams {
+            k: 4,
+            ell: 4,
+            b: 2,
+            lambda: 7,
+        },
+        matrix: EncryptedMatrix::from_parts(42, 2, 2, values(4)).unwrap(),
+    }
+}
+
 /// The server only ever acknowledges one-based identifiers.
 fn accepted_identifiers_strategy() -> impl Strategy<Value = Vec<u64>> {
     prop::collection::vec(1_u64..=u64::MAX, 0..=4)
 }
 
+/// v2 gives one entry descriptor a single `query_width`, so every query
+/// of an entry carries exactly that many coordinates (and a zero-width
+/// entry carries none at all).
 fn evaluate_entries_strategy() -> impl Strategy<Value = Vec<EvaluateEntry>> {
     prop::collection::vec(
-        (
-            any::<u64>(),
-            prop::collection::vec(
-                (
-                    any::<u128>(),
-                    any::<u64>(),
-                    prop::collection::vec(field_strategy(), 0..=8),
-                )
-                    .prop_map(|(instance_id, query_id, values)| {
-                        EncryptedQuery::from_parts(instance_id, query_id, values)
-                    }),
-                0..=2,
-            ),
-        )
-            .prop_map(|(matrix_id, queries)| EvaluateEntry { matrix_id, queries }),
-        0..=2,
-    )
-}
-
-fn products_strategy() -> impl Strategy<Value = Vec<ProductEntry>> {
-    prop::collection::vec(
-        any::<u64>().prop_flat_map(|matrix_id| {
-            prop::collection::vec(answer_strategy(), 1..=2)
-                .prop_map(move |answers| ProductEntry { matrix_id, answers })
+        (any::<u64>(), 0_usize..=8).prop_flat_map(|(matrix_id, query_width)| {
+            (
+                Just(matrix_id),
+                prop::collection::vec(
+                    (
+                        any::<u128>(),
+                        any::<u64>(),
+                        prop::collection::vec(field_strategy(), query_width),
+                    )
+                        .prop_map(move |(instance_id, query_id, values)| {
+                            EncryptedQuery::from_parts(instance_id, query_id, values)
+                        }),
+                    if query_width == 0 { 0..=0_usize } else { 0..=2_usize },
+                ),
+            )
+                .prop_map(move |(matrix_id, queries)| EvaluateEntry { matrix_id, queries })
         }),
         0..=2,
     )
 }
 
-fn answer_strategy() -> impl Strategy<Value = AnswerMatrix<PROTOCOL_MODULUS>> {
-    (1_usize..=4, 1_usize..=4).prop_flat_map(|(rows, blocks)| {
-        (
-            any::<u128>(),
-            any::<u64>(),
-            prop::collection::vec(field_strategy(), rows * blocks),
-        )
-            .prop_map(move |(instance_id, query_id, values)| {
-                AnswerMatrix::from_parts(instance_id, query_id, values, rows, blocks)
-            })
-    })
+/// v2 carries a single instance identifier per products entry, so every
+/// answer of an entry shares it; only the query identifiers vary.
+fn products_strategy() -> impl Strategy<Value = Vec<ProductEntry>> {
+    prop::collection::vec(
+        (any::<u64>(), 1_usize..=4, 1_usize..=4, any::<u128>()).prop_flat_map(
+            move |(matrix_id, rows, blocks, instance_id)| {
+                prop::collection::vec(
+                    (any::<u64>(), Just(rows * blocks)).prop_flat_map(
+                        move |(query_id, words)| {
+                            prop::collection::vec(field_strategy(), words).prop_map(
+                                move |values| {
+                                    AnswerMatrix::from_parts(
+                                        instance_id,
+                                        query_id,
+                                        values,
+                                        rows,
+                                        blocks,
+                                    )
+                                },
+                            )
+                        },
+                    ),
+                    1..=2,
+                )
+                .prop_map(move |answers| ProductEntry { matrix_id, answers })
+            },
+        ),
+        0..=2,
+    )
 }
 
 fn diagnostic_strategy() -> impl Strategy<Value = String> {
@@ -460,7 +544,7 @@ fn error_code_strategy() -> impl Strategy<Value = ErrorCode> {
 fn one_query_entry(matrix_id: u64) -> EvaluateEntry {
     EvaluateEntry {
         matrix_id,
-        queries: vec![EncryptedQuery::from_parts(42, 0, values(4))],
+        queries: vec![EncryptedQuery::from_parts(42, 0, values(40))],
     }
 }
 

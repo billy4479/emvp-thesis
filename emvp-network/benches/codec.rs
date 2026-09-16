@@ -3,7 +3,10 @@
     reason = "benchmarks use fixed valid fixtures and keep setup beside measurements"
 )]
 
-//! Canonical wire codec throughput at protocol-representative sizes.
+//! Canonical wire codec throughput at protocol-representative sizes,
+//! driven through the protocol v2 pipeline: encoders take borrowed views,
+//! decoders run plan → reserve → decode into a reused workspace, so the
+//! steady-state decode performs no allocations.
 //!
 //! All fixtures share one `EmvpParams` so every count is semantically
 //! consistent: the upload matrix is the encrypted `rows x n` matrix the
@@ -17,11 +20,14 @@ use std::io::Cursor;
 use std::time::Duration;
 
 use criterion::{Criterion, Throughput, criterion_group, criterion_main};
-use emvp::{AnswerMatrix, EmvpParams, EncryptedMatrix, EncryptedQuery};
-use emvp_network::{
-    EvaluateEntry, Field, MatrixUpload, PROTOCOL_MODULUS, ProductEntry, read_evaluate,
-    read_products, read_upload_matrices, write_evaluate, write_products, write_upload_matrices,
+use emvp::{AnswerMatrix, AnswerRef, EmvpParams, EncryptedMatrix, EncryptedQuery, EncryptedQueryRef};
+use emvp_network::v2::{
+    EvaluateEntryInput, EvaluateWorkspace, ProductEntryInput, ProductsWorkspace,
+    UploadMatrixView, UploadWorkspace, decode_evaluate, decode_products, decode_upload,
+    plan_evaluate, plan_products, plan_upload, write_evaluate, write_products,
+    write_upload_matrices,
 };
+use emvp_network::{FrameReader, HEADER_BYTES, PROTOCOL_MODULUS, read_frame_header};
 use prime_field_layer::PrimeField;
 
 /// Matrix shape for the upload fixture: `4096 x n` field elements, the
@@ -55,40 +61,32 @@ const PARAMS: EmvpParams = EmvpParams {
 /// The field cardinality minus one, in host arithmetic, for value cycling.
 const VALUE_CYCLE: usize = (PROTOCOL_MODULUS - 1) as usize;
 
-fn field_values(count: usize) -> Vec<Field> {
+fn field_values(count: usize) -> Vec<emvp_network::Field> {
     let field = PrimeField::<PROTOCOL_MODULUS>::new();
     (0..count)
         .map(|index| field.element_u32((index % VALUE_CYCLE) as u32))
         .collect()
 }
 
-fn upload_fixture() -> MatrixUpload {
+fn upload_fixture() -> EncryptedMatrix<PROTOCOL_MODULUS> {
     let values = field_values(UPLOAD_ROWS * UPLOAD_COLUMNS);
-    let matrix = EncryptedMatrix::from_parts(
+    EncryptedMatrix::from_parts(
         0x1234_5678_9abc_def0_u128,
         UPLOAD_ROWS,
         UPLOAD_COLUMNS,
         values,
     )
-    .unwrap();
-    MatrixUpload {
-        params: PARAMS,
-        matrix,
-    }
+    .unwrap()
 }
 
-fn evaluate_fixture() -> Vec<EvaluateEntry> {
-    let queries = (0..EVALUATE_QUERIES)
+fn evaluate_fixture() -> Vec<EncryptedQuery<PROTOCOL_MODULUS>> {
+    (0..EVALUATE_QUERIES)
         .map(|index| EncryptedQuery::from_parts(1, index as u64, field_values(QUERY_WIDTH)))
-        .collect();
-    vec![EvaluateEntry {
-        matrix_id: 1,
-        queries,
-    }]
+        .collect()
 }
 
-fn products_fixture() -> Vec<ProductEntry> {
-    let answers = (0..PRODUCT_ENTRIES_ANSWERS)
+fn products_fixture() -> Vec<AnswerMatrix<PROTOCOL_MODULUS>> {
+    (0..PRODUCT_ENTRIES_ANSWERS)
         .map(|index| {
             AnswerMatrix::from_parts(
                 1,
@@ -98,30 +96,101 @@ fn products_fixture() -> Vec<ProductEntry> {
                 ANSWER_BLOCKS,
             )
         })
-        .collect();
-    vec![ProductEntry {
-        matrix_id: 1,
-        answers,
-    }]
+        .collect()
 }
 
-fn encoded_upload() -> Vec<u8> {
-    let mut buffer = Vec::with_capacity(UPLOAD_ROWS * UPLOAD_COLUMNS * 4 + 128);
-    write_upload_matrices(&mut buffer, &[upload_fixture()]).unwrap();
-    buffer
+fn bench_upload(
+    group: &mut criterion::BenchmarkGroup<'_, criterion::measurement::WallTime>,
+    upload_views: &[UploadMatrixView<'_>],
+) {
+    let bytes = {
+        let mut buffer = Vec::with_capacity(UPLOAD_ROWS * UPLOAD_COLUMNS * 4 + 128);
+        write_upload_matrices(&mut buffer, upload_views).unwrap();
+        buffer
+    };
+    group.throughput(Throughput::Bytes(bytes.len() as u64));
+    group.bench_function("encode-matrix-upload", |bencher| {
+        bencher.iter(|| {
+            let mut sink = Vec::with_capacity(bytes.len());
+            write_upload_matrices(&mut sink, upload_views).unwrap();
+            sink
+        });
+    });
+    let mut workspace = UploadWorkspace::new();
+    group.bench_function("decode-matrix-upload", |bencher| {
+        bencher.iter(|| {
+            let mut cursor = Cursor::new(bytes.as_slice());
+            read_frame_header(&mut cursor).unwrap().unwrap();
+            let mut frame = FrameReader::new(&mut cursor, bytes.len() as u64 - HEADER_BYTES);
+            let plan = plan_upload(&mut frame).unwrap();
+            workspace.reserve(&plan).unwrap();
+            let views = decode_upload(&mut frame, &plan, &mut workspace).unwrap();
+            std::hint::black_box(views.len())
+        });
+    });
 }
 
-fn encoded_evaluate() -> Vec<u8> {
-    let mut buffer = Vec::with_capacity(EVALUATE_QUERIES * QUERY_WIDTH * 4 + 128);
-    write_evaluate(&mut buffer, &evaluate_fixture()).unwrap();
-    buffer
+fn bench_evaluate(
+    group: &mut criterion::BenchmarkGroup<'_, criterion::measurement::WallTime>,
+    evaluate_views: &[EvaluateEntryInput<'_>],
+) {
+    let bytes = {
+        let mut buffer = Vec::with_capacity(EVALUATE_QUERIES * QUERY_WIDTH * 4 + 128);
+        write_evaluate(&mut buffer, evaluate_views).unwrap();
+        buffer
+    };
+    group.throughput(Throughput::Bytes(bytes.len() as u64));
+    group.bench_function("encode-evaluate", |bencher| {
+        bencher.iter(|| {
+            let mut sink = Vec::with_capacity(bytes.len());
+            write_evaluate(&mut sink, evaluate_views).unwrap();
+            sink
+        });
+    });
+    let mut workspace = EvaluateWorkspace::new();
+    group.bench_function("decode-evaluate", |bencher| {
+        bencher.iter(|| {
+            let mut cursor = Cursor::new(bytes.as_slice());
+            read_frame_header(&mut cursor).unwrap().unwrap();
+            let mut frame = FrameReader::new(&mut cursor, bytes.len() as u64 - HEADER_BYTES);
+            let plan = plan_evaluate(&mut frame).unwrap();
+            workspace.reserve(&plan).unwrap();
+            let views = decode_evaluate(&mut frame, &plan, &mut workspace).unwrap();
+            std::hint::black_box(views.len())
+        });
+    });
 }
 
-fn encoded_products() -> Vec<u8> {
-    let mut buffer =
-        Vec::with_capacity(PRODUCT_ENTRIES_ANSWERS * ANSWER_ROWS * ANSWER_BLOCKS * 4 + 128);
-    write_products(&mut buffer, &products_fixture()).unwrap();
-    buffer
+fn bench_products(
+    group: &mut criterion::BenchmarkGroup<'_, criterion::measurement::WallTime>,
+    products_views: &[ProductEntryInput<'_>],
+) {
+    let bytes = {
+        let mut buffer =
+            Vec::with_capacity(PRODUCT_ENTRIES_ANSWERS * ANSWER_ROWS * ANSWER_BLOCKS * 4 + 128);
+        write_products(&mut buffer, products_views).unwrap();
+        buffer
+    };
+    group.throughput(Throughput::Bytes(bytes.len() as u64));
+    group.bench_function("encode-products", |bencher| {
+        bencher.iter(|| {
+            let mut sink = Vec::with_capacity(bytes.len());
+            write_products(&mut sink, products_views).unwrap();
+            sink
+        });
+    });
+    let mut workspace = ProductsWorkspace::new();
+    group.bench_function("decode-products", |bencher| {
+        bencher.iter(|| {
+            let mut cursor = Cursor::new(bytes.as_slice());
+            read_frame_header(&mut cursor).unwrap().unwrap();
+            let mut frame = FrameReader::new(&mut cursor, bytes.len() as u64 - HEADER_BYTES);
+            let plan = plan_products(&mut frame).unwrap();
+            workspace.reserve(&plan).unwrap();
+            let views = decode_products(&mut frame, &plan, &mut workspace).unwrap();
+            std::hint::black_box(views.len())
+        });
+    });
 }
 
 fn bench_codec(criterion: &mut Criterion) {
@@ -133,56 +202,36 @@ fn bench_codec(criterion: &mut Criterion) {
     group.warm_up_time(Duration::from_millis(500));
     group.measurement_time(Duration::from_secs(2));
 
+    // Borrowed encode inputs over the owned fixtures, built once.
     let upload = upload_fixture();
-    let evaluate = evaluate_fixture();
-    let products = products_fixture();
-    let upload_bytes = encoded_upload();
-    group.throughput(Throughput::Bytes(upload_bytes.len() as u64));
-    group.bench_function("encode-matrix-upload", |bencher| {
-        bencher.iter(|| {
-            let mut sink = Vec::with_capacity(upload_bytes.len());
-            write_upload_matrices(&mut sink, std::slice::from_ref(&upload)).unwrap();
-            sink
-        });
-    });
-    group.bench_function("decode-matrix-upload", |bencher| {
-        bencher.iter(|| {
-            let mut cursor = Cursor::new(upload_bytes.as_slice());
-            read_upload_matrices(&mut cursor).unwrap()
-        });
-    });
+    let upload_views = [UploadMatrixView {
+        params: PARAMS,
+        instance_id: upload.instance_id(),
+        rows: upload.rows(),
+        columns: upload.columns(),
+        values: upload.values(),
+    }];
+    let queries = evaluate_fixture();
+    let query_refs: Vec<EncryptedQueryRef<'_, PROTOCOL_MODULUS>> =
+        queries.iter().map(EncryptedQueryRef::from).collect();
+    let evaluate_views = [EvaluateEntryInput {
+        matrix_id: 1,
+        queries: &query_refs,
+    }];
+    let answers = products_fixture();
+    let answer_refs: Vec<AnswerRef<'_, PROTOCOL_MODULUS>> =
+        answers.iter().map(AnswerRef::from).collect();
+    let products_views = [ProductEntryInput {
+        matrix_id: 1,
+        instance_id: 1,
+        rows: ANSWER_ROWS,
+        blocks: ANSWER_BLOCKS,
+        answers: &answer_refs,
+    }];
 
-    let evaluate_bytes = encoded_evaluate();
-    group.throughput(Throughput::Bytes(evaluate_bytes.len() as u64));
-    group.bench_function("encode-evaluate", |bencher| {
-        bencher.iter(|| {
-            let mut sink = Vec::with_capacity(evaluate_bytes.len());
-            write_evaluate(&mut sink, &evaluate).unwrap();
-            sink
-        });
-    });
-    group.bench_function("decode-evaluate", |bencher| {
-        bencher.iter(|| {
-            let mut cursor = Cursor::new(evaluate_bytes.as_slice());
-            read_evaluate(&mut cursor).unwrap()
-        });
-    });
-
-    let products_bytes = encoded_products();
-    group.throughput(Throughput::Bytes(products_bytes.len() as u64));
-    group.bench_function("encode-products", |bencher| {
-        bencher.iter(|| {
-            let mut sink = Vec::with_capacity(products_bytes.len());
-            write_products(&mut sink, &products).unwrap();
-            sink
-        });
-    });
-    group.bench_function("decode-products", |bencher| {
-        bencher.iter(|| {
-            let mut cursor = Cursor::new(products_bytes.as_slice());
-            read_products(&mut cursor).unwrap()
-        });
-    });
+    bench_upload(&mut group, &upload_views);
+    bench_evaluate(&mut group, &evaluate_views);
+    bench_products(&mut group, &products_views);
 
     group.finish();
 }

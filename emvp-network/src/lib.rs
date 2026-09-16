@@ -42,6 +42,18 @@
 //! the declared frame length, so a truncated stream surfaces as an error
 //! rather than a silently wrong message or an unbounded allocation.
 //!
+//! # Protocol v2 wire codec
+//!
+//! The message layouts are descriptor-table-first: each message carries a
+//! fixed summary, a table of per-record descriptors, and one contiguous
+//! value region. The [`v2`] module decodes them through a
+//! plan → reserve → decode pipeline that derives every reservation bound
+//! from the declared payload length before allocating, grows a reusable
+//! workspace exactly once, and yields borrowed views over that workspace
+//! with zero managed allocations on the decode and encode happy paths.
+//! The `read_*`/`write_*` functions of [`messages`] are allocating
+//! convenience adapters over that pipeline.
+//!
 //! # Experimental
 //!
 //! This is research plumbing for a POC deployment. The protocol performs
@@ -55,6 +67,7 @@ pub mod error;
 pub mod frame;
 pub mod handshake;
 pub mod messages;
+pub mod v2;
 
 pub use error::{CodecError, ErrorCode, HandshakeError};
 pub use frame::{
