@@ -60,6 +60,6 @@ harness = false
 required-features = ["gpu"]
 
 [[bench]]
-name = "multi_matrix"
+name = "answer_throughput"
 harness = false
 required-features = ["gpu"]
