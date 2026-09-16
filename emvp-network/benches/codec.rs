@@ -20,15 +20,13 @@ use std::io::Cursor;
 use std::time::Duration;
 
 use criterion::{Criterion, Throughput, criterion_group, criterion_main};
-use emvp::{
-    AnswerMatrix, AnswerRef, EmvpParams, EncryptedMatrix, EncryptedQuery, EncryptedQueryRef,
-};
+use emvp::{AnswerRef, EmvpParams, EncryptedQueryRef};
 use emvp_network::v2::{
     EvaluateEntryInput, EvaluateWorkspace, ProductEntryInput, ProductsWorkspace, UploadMatrixView,
     UploadWorkspace, decode_evaluate, decode_products, decode_upload, plan_evaluate, plan_products,
     plan_upload, write_evaluate, write_products, write_upload_matrices,
 };
-use emvp_network::{FrameReader, HEADER_BYTES, PROTOCOL_MODULUS, read_frame_header};
+use emvp_network::{Field, FrameReader, HEADER_BYTES, PROTOCOL_MODULUS, read_frame_header};
 use prime_field_layer::PrimeField;
 
 /// Matrix shape for the upload fixture: `4096 x n` field elements, the
@@ -62,41 +60,31 @@ const PARAMS: EmvpParams = EmvpParams {
 /// The field cardinality minus one, in host arithmetic, for value cycling.
 const VALUE_CYCLE: usize = (PROTOCOL_MODULUS - 1) as usize;
 
-fn field_values(count: usize) -> Vec<emvp_network::Field> {
+fn field_values(count: usize) -> Vec<Field> {
     let field = PrimeField::<PROTOCOL_MODULUS>::new();
     (0..count)
         .map(|index| field.element_u32((index % VALUE_CYCLE) as u32))
         .collect()
 }
 
-fn upload_fixture() -> EncryptedMatrix<PROTOCOL_MODULUS> {
-    let values = field_values(UPLOAD_ROWS * UPLOAD_COLUMNS);
-    EncryptedMatrix::from_parts(
-        0x1234_5678_9abc_def0_u128,
-        UPLOAD_ROWS,
-        UPLOAD_COLUMNS,
-        values,
-    )
-    .unwrap()
+/// The upload fixture's plain value arena, built once and viewed on
+/// demand: `UPLOAD_ROWS x UPLOAD_COLUMNS` field elements.
+fn upload_fixture() -> Vec<Field> {
+    field_values(UPLOAD_ROWS * UPLOAD_COLUMNS)
 }
 
-fn evaluate_fixture() -> Vec<EncryptedQuery<PROTOCOL_MODULUS>> {
+/// One encrypted query coordinate arena per evaluation fixture query.
+fn query_fixtures() -> Vec<Vec<Field>> {
     (0..EVALUATE_QUERIES)
-        .map(|index| EncryptedQuery::from_parts(1, index as u64, field_values(QUERY_WIDTH)))
+        .map(|_| field_values(QUERY_WIDTH))
         .collect()
 }
 
-fn products_fixture() -> Vec<AnswerMatrix<PROTOCOL_MODULUS>> {
+/// One answer value arena per products fixture answer, each holding
+/// `ANSWER_ROWS * ANSWER_BLOCKS` field elements.
+fn answer_fixtures() -> Vec<Vec<Field>> {
     (0..PRODUCT_ENTRIES_ANSWERS)
-        .map(|index| {
-            AnswerMatrix::from_parts(
-                1,
-                index as u64,
-                field_values(ANSWER_ROWS * ANSWER_BLOCKS),
-                ANSWER_ROWS,
-                ANSWER_BLOCKS,
-            )
-        })
+        .map(|_| field_values(ANSWER_ROWS * ANSWER_BLOCKS))
         .collect()
 }
 
@@ -203,25 +191,34 @@ fn bench_codec(criterion: &mut Criterion) {
     group.warm_up_time(Duration::from_millis(500));
     group.measurement_time(Duration::from_secs(2));
 
-    // Borrowed encode inputs over the owned fixtures, built once.
-    let upload = upload_fixture();
+    // Borrowed encode inputs over the plain value arenas, built once and
+    // kept alive for the whole bench run.
+    let upload_values = upload_fixture();
     let upload_views = [UploadMatrixView {
         params: PARAMS,
-        instance_id: upload.instance_id(),
-        rows: upload.rows(),
-        columns: upload.columns(),
-        values: upload.values(),
+        instance_id: 0x1234_5678_9abc_def0_u128,
+        rows: UPLOAD_ROWS,
+        columns: UPLOAD_COLUMNS,
+        values: &upload_values,
     }];
-    let queries = evaluate_fixture();
-    let query_refs: Vec<EncryptedQueryRef<'_, PROTOCOL_MODULUS>> =
-        queries.iter().map(EncryptedQueryRef::from).collect();
+    let query_values = query_fixtures();
+    let query_refs: Vec<EncryptedQueryRef<'_, PROTOCOL_MODULUS>> = query_values
+        .iter()
+        .enumerate()
+        .map(|(index, values)| EncryptedQueryRef::new(1, index as u64, values).unwrap())
+        .collect();
     let evaluate_views = [EvaluateEntryInput {
         matrix_id: 1,
         queries: &query_refs,
     }];
-    let answers = products_fixture();
-    let answer_refs: Vec<AnswerRef<'_, PROTOCOL_MODULUS>> =
-        answers.iter().map(AnswerRef::from).collect();
+    let answer_values = answer_fixtures();
+    let answer_refs: Vec<AnswerRef<'_, PROTOCOL_MODULUS>> = answer_values
+        .iter()
+        .enumerate()
+        .map(|(index, values)| {
+            AnswerRef::new(1, index as u64, values, ANSWER_ROWS, ANSWER_BLOCKS).unwrap()
+        })
+        .collect();
     let products_views = [ProductEntryInput {
         matrix_id: 1,
         instance_id: 1,

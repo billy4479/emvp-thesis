@@ -225,16 +225,33 @@ mod tests {
     use std::net::TcpListener;
     use std::thread;
 
-    use emvp_network::{
-        FrameKind, FrameReader, ProductEntry, read_evaluate_payload, read_frame_header,
-        read_upload_matrices_payload, server_handshake, write_products, write_upload_accepted,
+    use emvp::{AnswerRef, EmvpParams, EncryptedMatrix, EncryptedQuery, answer_into};
+    use emvp_network::v2::{
+        EvaluateWorkspace, ProductEntryInput, UploadWorkspace, decode_evaluate, decode_upload,
+        plan_evaluate, plan_upload, write_products,
     };
+    use emvp_network::{
+        FrameKind, FrameReader, read_frame_header, server_handshake, write_upload_accepted,
+    };
+    use prime_field_layer::PrimeField;
     use trapdoor_matrices::ToeplitzFastProduct;
 
-    use crate::demo::{CONTEXT_TOEPLITZ, PROTOCOL_MODULUS, master_seed_from_u64, select_params};
+    use crate::demo::{
+        CONTEXT_TOEPLITZ, Field, PROTOCOL_MODULUS, master_seed_from_u64, select_params,
+    };
     use crate::session::Config;
 
     use super::{connect_and_run, toeplitz_builder};
+
+    /// One computed products entry: its identifiers and shape plus the
+    /// `(query id, values)` pair of every answer.
+    struct ComputedAnswers {
+        matrix_id: u64,
+        instance_id: u128,
+        rows: usize,
+        blocks: usize,
+        answers: Vec<(u64, Vec<Field>)>,
+    }
 
     /// Serves one connection the way the server binary does, computing
     /// products on the CPU. It asserts that the first post-handshake
@@ -247,10 +264,28 @@ mod tests {
         let header = read_frame_header(&mut stream).unwrap().unwrap();
         assert_eq!(header.kind, FrameKind::UploadMatrices);
         let mut frame = FrameReader::new(&mut stream, header.payload_len);
-        let uploads = read_upload_matrices_payload(&mut frame).unwrap();
+        let upload_plan = plan_upload(&mut frame).unwrap();
+        let mut upload_ws = UploadWorkspace::new();
+        upload_ws.reserve(&upload_plan).unwrap();
+        let uploads = decode_upload(&mut frame, &upload_plan, &mut upload_ws).unwrap();
         frame.finish().unwrap();
+        let stored: Vec<(EmvpParams, EncryptedMatrix<PROTOCOL_MODULUS>)> = uploads
+            .iter()
+            .map(|view| {
+                (
+                    view.params,
+                    EncryptedMatrix::from_parts(
+                        view.instance_id,
+                        view.rows,
+                        view.columns,
+                        view.values.to_vec(),
+                    )
+                    .unwrap(),
+                )
+            })
+            .collect();
 
-        let identifiers: Vec<u64> = (1..=uploads.len() as u64).collect();
+        let identifiers: Vec<u64> = (1..=stored.len() as u64).collect();
         write_upload_accepted(&mut stream, &identifiers).unwrap();
 
         loop {
@@ -259,19 +294,71 @@ mod tests {
             };
             assert_eq!(header.kind, FrameKind::Evaluate);
             let mut frame = FrameReader::new(&mut stream, header.payload_len);
-            let entries = read_evaluate_payload(&mut frame).unwrap();
+            let plan = plan_evaluate(&mut frame).unwrap();
+            let mut workspace = EvaluateWorkspace::new();
+            workspace.reserve(&plan).unwrap();
+            let views = decode_evaluate(&mut frame, &plan, &mut workspace).unwrap();
             frame.finish().unwrap();
 
-            let products: Vec<ProductEntry> = entries
+            // Compute every answer as plain values first, then borrow the
+            // pairs for the products frame; tests may allocate.
+            let computed: Vec<ComputedAnswers> = views
                 .iter()
                 .map(|entry| {
-                    let upload = &uploads[(entry.matrix_id - 1) as usize];
-                    let answers =
-                        emvp::answer_batch(&upload.params, &upload.matrix, &entry.queries).unwrap();
-                    ProductEntry {
-                        matrix_id: entry.matrix_id,
+                    let (params, matrix) = &stored[(entry.matrix_id() - 1) as usize];
+                    let rows = matrix.rows();
+                    let blocks = params.blocks().unwrap();
+                    let zero = PrimeField::<PROTOCOL_MODULUS>::new().element_u32(0);
+                    let answers: Vec<(u64, Vec<Field>)> = entry
+                        .iter()
+                        .map(|query| {
+                            let owned = EncryptedQuery::from_parts(
+                                query.instance_id(),
+                                query.query_id(),
+                                query.values().to_vec(),
+                            );
+                            let mut values = vec![zero; rows * blocks];
+                            answer_into(params, matrix, &owned, &mut values).unwrap();
+                            (query.query_id(), values)
+                        })
+                        .collect();
+                    ComputedAnswers {
+                        matrix_id: entry.matrix_id(),
+                        instance_id: matrix.instance_id(),
+                        rows,
+                        blocks,
                         answers,
                     }
+                })
+                .collect();
+            let answer_refs: Vec<Vec<AnswerRef<'_, PROTOCOL_MODULUS>>> = computed
+                .iter()
+                .map(|entry| {
+                    entry
+                        .answers
+                        .iter()
+                        .map(|(query_id, values)| {
+                            AnswerRef::new(
+                                entry.instance_id,
+                                *query_id,
+                                values,
+                                entry.rows,
+                                entry.blocks,
+                            )
+                            .unwrap()
+                        })
+                        .collect()
+                })
+                .collect();
+            let products: Vec<ProductEntryInput<'_>> = computed
+                .iter()
+                .zip(&answer_refs)
+                .map(|(entry, answers)| ProductEntryInput {
+                    matrix_id: entry.matrix_id,
+                    instance_id: entry.instance_id,
+                    rows: entry.rows,
+                    blocks: entry.blocks,
+                    answers,
                 })
                 .collect();
             write_products(&mut stream, &products).unwrap();

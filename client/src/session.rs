@@ -282,7 +282,11 @@ impl<'a, 'q, S: std::io::Read + std::io::Write> Session<'a, 'q, S> {
             FrameKind::UploadAccepted => {
                 let plan = plan_upload_accepted(&mut frame)?;
                 self.ack_ids.reserve(&plan)?;
-                Ok(decode_upload_accepted(&mut frame, &plan, &mut self.ack_ids)?)
+                Ok(decode_upload_accepted(
+                    &mut frame,
+                    &plan,
+                    &mut self.ack_ids,
+                )?)
             }
             FrameKind::Error => {
                 let error = read_error_payload(&mut frame)?;
@@ -623,19 +627,24 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use std::thread;
 
-    use emvp::{AnswerRef, EmvpParams, EncryptedMatrix, answer_batch, answer_into};
-    use prime_field_layer::PrimeField;
-    use emvp_network::{
-        EvaluateEntry, FrameKind, FrameReader, MatrixUpload, ProductEntry, PROTOCOL_VERSION,
-        read_evaluate_payload, read_frame_header, read_upload_matrices_payload, server_handshake,
-        write_client_hello, write_evaluate, write_products, write_upload_accepted,
-        write_upload_matrices,
+    use emvp::{
+        AnswerRef, EmvpParams, EncryptedMatrix, EncryptedQuery, EncryptedQueryRef, answer_into,
     };
+    use emvp_network::v2::{
+        EvaluateEntryInput, EvaluateViews, EvaluateWorkspace, ProductEntryInput, UploadMatrixView,
+        UploadWorkspace, decode_evaluate, decode_upload, plan_evaluate, plan_upload,
+        write_products,
+    };
+    use emvp_network::{
+        FrameKind, FrameReader, PROTOCOL_VERSION, read_frame_header, server_handshake,
+        write_client_hello, write_evaluate, write_upload_accepted, write_upload_matrices,
+    };
+    use prime_field_layer::PrimeField;
     use trapdoor_matrices::ToeplitzFastProduct;
 
     use super::{Config, Instance, Session, derive_instance, run, verify_answer};
     use crate::demo::{
-        CONTEXT_TOEPLITZ, PROTOCOL_MODULUS, master_seed_from_u64, random_master_seed,
+        CONTEXT_TOEPLITZ, Field, PROTOCOL_MODULUS, master_seed_from_u64, random_master_seed,
     };
     use crate::error::RunError;
 
@@ -669,37 +678,40 @@ mod tests {
         WrongQueryId,
     }
 
-    /// Rewrites one matrix's first answer in place, sabotaged by `kind`.
-    fn sabotage_answer(kind: Sabotage, answers: &mut [emvp::AnswerMatrix<PROTOCOL_MODULUS>]) {
-        let answer = &answers[0];
-        answers[0] = match kind {
-            Sabotage::CorruptValues => {
-                let field = prime_field_layer::PrimeField::<PROTOCOL_MODULUS>::new();
-                let mut values = answer.values().to_vec();
-                values[0] -= field.element_u32(1);
-                emvp::AnswerMatrix::from_parts(
-                    answer.instance_id(),
-                    answer.query_id(),
-                    values,
-                    answer.rows(),
-                    answer.blocks(),
-                )
-            }
-            Sabotage::WrongQueryId => emvp::AnswerMatrix::from_parts(
-                answer.instance_id(),
-                answer.query_id() + 1,
-                answer.values().to_vec(),
-                answer.rows(),
-                answer.blocks(),
-            ),
-            Sabotage::None => emvp::AnswerMatrix::from_parts(
-                answer.instance_id(),
-                answer.query_id(),
-                answer.values().to_vec(),
-                answer.rows(),
-                answer.blocks(),
-            ),
-        };
+    /// Rewrites one computed answer in place, sabotaged by `kind`. The
+    /// answer travels as its query identifier plus its value vector until
+    /// the products frame is built, so the sabotage edits the pair
+    /// directly.
+    fn sabotage_answer(kind: Sabotage, answer: &mut (u64, Vec<Field>)) {
+        let field = prime_field_layer::PrimeField::<PROTOCOL_MODULUS>::new();
+        let (query_id, values) = answer;
+        match kind {
+            Sabotage::None => {}
+            Sabotage::CorruptValues => values[0] -= field.element_u32(1),
+            Sabotage::WrongQueryId => *query_id += 1,
+        }
+    }
+
+    /// One computed products entry: its identifiers and shape plus the
+    /// `(query id, values)` pair of every answer.
+    struct ComputedAnswers {
+        matrix_id: u64,
+        instance_id: u128,
+        rows: usize,
+        blocks: usize,
+        answers: Vec<(u64, Vec<Field>)>,
+    }
+
+    /// Copies a decoded query ref into the owned record `answer_into`
+    /// consumes; tests may allocate.
+    fn owned_query(
+        query: &EncryptedQueryRef<'_, PROTOCOL_MODULUS>,
+    ) -> EncryptedQuery<PROTOCOL_MODULUS> {
+        EncryptedQuery::from_parts(
+            query.instance_id(),
+            query.query_id(),
+            query.values().to_vec(),
+        )
     }
 
     /// Serves one session the way the server binary does, except products
@@ -711,14 +723,22 @@ mod tests {
         let header = read_frame_header(stream).unwrap().unwrap();
         assert_eq!(header.kind, FrameKind::UploadMatrices);
         let mut frame = FrameReader::new(stream, header.payload_len);
-        let uploads: Vec<MatrixUpload> = read_upload_matrices_payload(&mut frame).unwrap();
+        let upload_plan = plan_upload(&mut frame).unwrap();
+        let mut workspace = UploadWorkspace::new();
+        workspace.reserve(&upload_plan).unwrap();
+        let uploads = decode_upload(&mut frame, &upload_plan, &mut workspace).unwrap();
         frame.finish().unwrap();
-
         let stored: Vec<StoredUpload> = uploads
-            .into_iter()
-            .map(|upload| StoredUpload {
-                params: upload.params,
-                matrix: upload.matrix,
+            .iter()
+            .map(|view| StoredUpload {
+                params: view.params,
+                matrix: EncryptedMatrix::from_parts(
+                    view.instance_id,
+                    view.rows,
+                    view.columns,
+                    view.values.to_vec(),
+                )
+                .unwrap(),
             })
             .collect();
         let identifiers = acknowledged.unwrap_or_else(|| (1..=stored.len() as u64).collect());
@@ -730,25 +750,103 @@ mod tests {
             };
             assert_eq!(header.kind, FrameKind::Evaluate);
             let mut frame = FrameReader::new(stream, header.payload_len);
-            let entries: Vec<EvaluateEntry> = read_evaluate_payload(&mut frame).unwrap();
+            let plan = plan_evaluate(&mut frame).unwrap();
+            let mut workspace = EvaluateWorkspace::new();
+            workspace.reserve(&plan).unwrap();
+            let views = decode_evaluate(&mut frame, &plan, &mut workspace).unwrap();
             frame.finish().unwrap();
 
-            let mut products = Vec::with_capacity(entries.len());
-            for entry in entries {
-                let stored_matrix = &stored[(entry.matrix_id - 1) as usize];
-                let mut answers =
-                    answer_batch(&stored_matrix.params, &stored_matrix.matrix, &entry.queries)
-                        .unwrap();
-                if !matches!(sabotage, Sabotage::None) {
-                    sabotage_answer(sabotage, &mut answers);
-                }
-                products.push(ProductEntry {
-                    matrix_id: entry.matrix_id,
-                    answers,
-                });
-            }
-            write_products(stream, &products).unwrap();
+            let computed = compute_answers(views, &stored, sabotage);
+            let answer_refs = answer_refs_for(&computed);
+            write_products(stream, &product_inputs(&computed, &answer_refs)).unwrap();
         }
+    }
+
+    /// Computes one evaluate frame's answers on the CPU as plain values,
+    /// one entry per decoded entry, applying `sabotage` to each matrix's
+    /// first answer. Tests may allocate.
+    fn compute_answers(
+        views: EvaluateViews<'_>,
+        stored: &[StoredUpload],
+        sabotage: Sabotage,
+    ) -> Vec<ComputedAnswers> {
+        views
+            .iter()
+            .map(|entry| {
+                let stored_matrix = &stored[(entry.matrix_id() - 1) as usize];
+                let rows = stored_matrix.matrix.rows();
+                let blocks = stored_matrix.params.blocks().unwrap();
+                let zero = PrimeField::<PROTOCOL_MODULUS>::new().element_u32(0);
+                let answers: Vec<(u64, Vec<Field>)> = entry
+                    .iter()
+                    .map(|query| {
+                        let owned = owned_query(&query);
+                        let mut values = vec![zero; rows * blocks];
+                        answer_into(
+                            &stored_matrix.params,
+                            &stored_matrix.matrix,
+                            &owned,
+                            &mut values,
+                        )
+                        .unwrap();
+                        let mut answer = (query.query_id(), values);
+                        if !matches!(sabotage, Sabotage::None) {
+                            sabotage_answer(sabotage, &mut answer);
+                        }
+                        answer
+                    })
+                    .collect();
+                ComputedAnswers {
+                    matrix_id: entry.matrix_id(),
+                    instance_id: stored_matrix.matrix.instance_id(),
+                    rows,
+                    blocks,
+                    answers,
+                }
+            })
+            .collect()
+    }
+
+    /// Materializes the computed answers as borrowed refs, in entry
+    /// order; the result must outlive the inputs built over it.
+    fn answer_refs_for(computed: &[ComputedAnswers]) -> Vec<Vec<AnswerRef<'_, PROTOCOL_MODULUS>>> {
+        computed
+            .iter()
+            .map(|entry| {
+                entry
+                    .answers
+                    .iter()
+                    .map(|(query_id, values)| {
+                        AnswerRef::new(
+                            entry.instance_id,
+                            *query_id,
+                            values,
+                            entry.rows,
+                            entry.blocks,
+                        )
+                        .unwrap()
+                    })
+                    .collect()
+            })
+            .collect()
+    }
+
+    /// Borrows the computed answers for one products frame.
+    fn product_inputs<'a>(
+        computed: &'a [ComputedAnswers],
+        answer_refs: &'a [Vec<AnswerRef<'_, PROTOCOL_MODULUS>>],
+    ) -> Vec<ProductEntryInput<'a>> {
+        computed
+            .iter()
+            .zip(answer_refs)
+            .map(|(entry, answers)| ProductEntryInput {
+                matrix_id: entry.matrix_id,
+                instance_id: entry.instance_id,
+                rows: entry.rows,
+                blocks: entry.blocks,
+                answers,
+            })
+            .collect()
     }
 
     fn config() -> Config {
@@ -879,7 +977,9 @@ mod tests {
         let mut session = Session::new(&mut client_stream).unwrap();
         assert!(session.upload(&instances, config.params).unwrap() > 0);
 
-        let first = session.evaluate_and_verify(&instances, config.params).unwrap();
+        let first = session
+            .evaluate_and_verify(&instances, config.params)
+            .unwrap();
         let second = session
             .evaluate_and_verify(&instances, config.params)
             .unwrap();
@@ -924,7 +1024,7 @@ mod tests {
     }
 
     #[test]
-    fn send_path_frames_match_the_owned_wrapper_bytes() {
+    fn send_path_frames_match_the_view_writer_bytes() {
         let (client_stream, server_stream) = UnixStream::pair().unwrap();
         let server = thread::spawn(move || {
             let mut server_stream = server_stream;
@@ -940,25 +1040,36 @@ mod tests {
         let config = config();
         let instances = derive_instances(&config);
 
-        // The golden byte sequence, built from the owned wrappers the
-        // previous implementation sent through: hello, upload, evaluate.
+        // The golden byte sequence, built from the same v2 view writers
+        // the session sends through: hello, upload, evaluate.
         let mut expected = Vec::new();
         write_client_hello(&mut expected, PROTOCOL_VERSION, PROTOCOL_MODULUS).unwrap();
-        let uploads: Vec<MatrixUpload> = instances
+        let uploads: Vec<UploadMatrixView<'_>> = instances
             .iter()
-            .map(|instance| MatrixUpload {
+            .map(|instance| UploadMatrixView {
                 params: config.params,
-                matrix: instance.encrypted.clone(),
+                instance_id: instance.encrypted.instance_id(),
+                rows: instance.encrypted.rows(),
+                columns: instance.encrypted.columns(),
+                values: instance.encrypted.values(),
             })
             .collect();
         write_upload_matrices(&mut expected, &uploads).unwrap();
-        let entries: Vec<EvaluateEntry> = instances
+        let query_refs: Vec<Vec<EncryptedQueryRef<'_, PROTOCOL_MODULUS>>> = instances
+            .iter()
+            .map(|instance| {
+                instance
+                    .queries
+                    .iter()
+                    .map(EncryptedQueryRef::from)
+                    .collect()
+            })
+            .collect();
+        let entries: Vec<EvaluateEntryInput<'_>> = instances
             .iter()
             .zip(1_u64..)
-            .map(|(instance, matrix_id)| EvaluateEntry {
-                matrix_id,
-                queries: instance.queries.clone(),
-            })
+            .zip(&query_refs)
+            .map(|((_, matrix_id), queries)| EvaluateEntryInput { matrix_id, queries })
             .collect();
         write_evaluate(&mut expected, &entries).unwrap();
 
@@ -1016,7 +1127,13 @@ mod tests {
         let blocks = params.blocks().unwrap();
         let field = PrimeField::<PROTOCOL_MODULUS>::new();
         let mut answer_values = vec![field.element_u32(0); rows * blocks];
-        answer_into(&params, &instance.encrypted, encrypted_query, &mut answer_values).unwrap();
+        answer_into(
+            &params,
+            &instance.encrypted,
+            encrypted_query,
+            &mut answer_values,
+        )
+        .unwrap();
         let answer = AnswerRef::new(
             instance.encrypted.instance_id(),
             encrypted_query.query_id(),

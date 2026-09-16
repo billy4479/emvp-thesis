@@ -48,8 +48,6 @@ use emvp::{
     AnswerEngine, AnswerEngineError, AnswerJob, EmvpParams, EngineAnswers, EnginePlan,
     EngineWorkspace, PrepareError, PrepareMatrixError, PrepareWorkspace, PreparedMatrix, UploadRef,
 };
-#[cfg(test)]
-use emvp_network::MatrixUpload;
 use emvp_network::v2::{
     EvaluateViews, EvaluateWorkspace, ProductEntryInput, UploadAcceptedPlan,
     UploadAcceptedWorkspace, UploadViews, UploadWorkspace, decode_evaluate, decode_upload,
@@ -657,44 +655,16 @@ fn log_report(
     }
 }
 
-/// Validates one matrix set for upload and totals its GPU byte footprint.
+/// Validates a decoded upload set and totals its GPU byte footprint.
 ///
 /// The set must be nonempty and is validated in full before any engine
-/// work, so a rejection cannot leave a partial upload behind. The server
-/// path applies the same contract to decoded views through
-/// [`validate_upload_views`]; this owned form is the directly testable
-/// expression of the contract.
+/// work, so a rejection cannot leave a partial upload behind.
 ///
 /// # Errors
 ///
 /// Returns the first structural problem: an empty set, malformed
 /// parameters, a matrix whose width disagrees with its parameters, or
 /// arithmetic overflow while totaling the footprint.
-#[cfg(test)]
-pub fn validate_uploads(uploads: &[MatrixUpload]) -> Result<u64, RequestFailure> {
-    if uploads.is_empty() {
-        return Err(RequestFailure::EmptyRequest);
-    }
-    let mut total_bytes = 0_u64;
-    for upload in uploads {
-        validate_upload_shape(
-            &upload.params,
-            upload.matrix.rows(),
-            upload.matrix.columns(),
-            &mut total_bytes,
-        )?;
-    }
-    Ok(total_bytes)
-}
-
-/// Validates a decoded upload set and totals its GPU byte footprint.
-///
-/// The same contract as [`validate_uploads`], applied to the borrowed
-/// views of the v2 decode workspace.
-///
-/// # Errors
-///
-/// Returns the first structural problem, exactly as [`validate_uploads`].
 fn validate_upload_views(views: UploadViews<'_>) -> Result<u64, RequestFailure> {
     if views.is_empty() {
         return Err(RequestFailure::EmptyRequest);
@@ -853,17 +823,19 @@ mod tests {
     use std::thread;
 
     use emvp::{
-        AnswerEngine, AnswerMatrix, DecodingKey, DerivedState, EmvpParams, EncryptedQuery,
-        EncryptedQueryRef, MaskContextId, ProtocolError, SecretKey, encrypt, query,
+        AnswerEngine, AnswerRef, DecodingKey, DerivedState, EmvpParams, EncryptedMatrix,
+        EncryptedQuery, EncryptedQueryRef, MaskContextId, ProtocolError, SecretKey, encrypt, query,
     };
     use emvp_network::v2::{
-        EvaluateEntryInput, EvaluateWorkspace, decode_evaluate, plan_evaluate,
-        write_evaluate as write_evaluate_v2,
+        EvaluateEntryInput, EvaluateViews, EvaluateWorkspace, ProductEntryInput, ProductsViews,
+        ProductsWorkspace, UploadMatrixView, UploadViews, UploadWorkspace, decode_evaluate,
+        decode_products, decode_upload, plan_evaluate, plan_products, plan_upload, write_products,
+        write_upload_matrices,
     };
     use emvp_network::{
-        ErrorCode, EvaluateEntry, FrameKind, FrameReader, MatrixUpload, PROTOCOL_MODULUS,
-        ProductEntry, client_handshake, read_error, read_frame_header, read_products,
-        read_upload_accepted, write_evaluate, write_upload_matrices,
+        CodecError, ErrorCode, FrameKind, FrameReader, HEADER_BYTES, PROTOCOL_MODULUS,
+        client_handshake, read_error, read_frame_header, read_upload_accepted, write_evaluate,
+        write_frame_header,
     };
     use prime_field_layer::{FieldElement, PrimeField};
     use rand_chacha::ChaCha20Rng;
@@ -872,7 +844,7 @@ mod tests {
 
     use super::{
         EvaluatedEntry, MatrixInfo, RequestFailure, SessionError, prepare_evaluate,
-        serve_connection, validate_uploads,
+        serve_connection, validate_upload_views,
     };
 
     const PARAMS: EmvpParams = EmvpParams {
@@ -901,15 +873,29 @@ mod tests {
         Ok(ToeplitzFastProduct::sample(2 * PARAMS.k, stream)?)
     }
 
-    fn upload(
-        rows: usize,
-        key: u8,
-        seed: u64,
-    ) -> (
-        MatrixUpload,
-        DerivedState<PROTOCOL_MODULUS, ToeplitzFastProduct<PROTOCOL_MODULUS>>,
-        Vec<FieldElement<PROTOCOL_MODULUS>>,
-    ) {
+    /// One derived, encrypted matrix plus everything needed to derive
+    /// queries against it and check its answers.
+    struct Uploaded {
+        params: EmvpParams,
+        matrix: EncryptedMatrix<PROTOCOL_MODULUS>,
+        state: DerivedState<PROTOCOL_MODULUS, ToeplitzFastProduct<PROTOCOL_MODULUS>>,
+        plaintext: Vec<FieldElement<PROTOCOL_MODULUS>>,
+    }
+
+    impl Uploaded {
+        /// The borrowed upload view the v2 writer consumes.
+        fn view(&self) -> UploadMatrixView<'_> {
+            UploadMatrixView {
+                params: self.params,
+                instance_id: self.matrix.instance_id(),
+                rows: self.matrix.rows(),
+                columns: self.matrix.columns(),
+                values: self.matrix.values(),
+            }
+        }
+    }
+
+    fn upload(rows: usize, key: u8, seed: u64) -> Uploaded {
         let mut rng = ChaCha20Rng::seed_from_u64(seed);
         let mut state = SecretKey::<PROTOCOL_MODULUS>::new_insecure(PARAMS, [key; 32])
             .unwrap()
@@ -917,80 +903,125 @@ mod tests {
             .unwrap();
         let plaintext = values(rows * PARAMS.ell, seed ^ 0xFF);
         let matrix = encrypt(&mut state, &plaintext).unwrap();
-        (
-            MatrixUpload {
-                params: PARAMS,
-                matrix,
-            },
+        Uploaded {
+            params: PARAMS,
+            matrix,
             state,
             plaintext,
-        )
+        }
+    }
+
+    /// Encodes `uploads` with the v2 writer and decodes them through the
+    /// v2 pipeline, mirroring the server's per-frame path, then hands the
+    /// decoded views to `consume`.
+    fn with_decoded_uploads<T>(
+        uploads: &[UploadMatrixView<'_>],
+        consume: impl FnOnce(UploadViews<'_>) -> T,
+    ) -> T {
+        let mut bytes = Vec::new();
+        write_upload_matrices(&mut bytes, uploads).unwrap();
+        let mut reader = &bytes[..];
+        let header = read_frame_header(&mut reader).unwrap().unwrap();
+        assert_eq!(header.kind, FrameKind::UploadMatrices);
+        let mut frame = FrameReader::new(&mut reader, header.payload_len);
+        let plan = plan_upload(&mut frame).unwrap();
+        let mut workspace = UploadWorkspace::new();
+        workspace.reserve(&plan).unwrap();
+        let views = decode_upload(&mut frame, &plan, &mut workspace).unwrap();
+        consume(views)
     }
 
     #[test]
     fn uploads_validate_and_total_their_footprint() {
-        let (small, _, _) = upload(3, 1, 1);
-        let (tall, _, _) = upload(35, 2, 2);
-        let bytes = validate_uploads(&[small, tall]).unwrap();
+        let small = upload(3, 1, 1);
+        let tall = upload(35, 2, 2);
+        let bytes =
+            with_decoded_uploads(&[small.view(), tall.view()], validate_upload_views).unwrap();
         assert_eq!(bytes, (3 * 16 + 35 * 16) * 4);
     }
 
     #[test]
     fn uploads_reject_malformed_dimensions() {
-        let (mut malformed, _, _) = upload(3, 1, 3);
-        malformed.params.b = 3;
-        assert!(matches!(
-            validate_uploads(&[malformed]),
-            Err(RequestFailure::Params(_))
-        ));
+        let good = upload(3, 1, 4);
+        // `b = 3` does not divide `n = 16`: structurally invalid parameters.
+        let malformed = UploadMatrixView {
+            params: EmvpParams {
+                b: 3,
+                ..good.params
+            },
+            instance_id: good.matrix.instance_id(),
+            rows: good.matrix.rows(),
+            columns: good.matrix.columns(),
+            values: good.matrix.values(),
+        };
+        let failure = with_decoded_uploads(&[malformed], validate_upload_views).unwrap_err();
+        assert!(matches!(failure, RequestFailure::Params(_)));
 
-        let (good, _, _) = upload(3, 1, 4);
         let matrix = emvp::EncryptedMatrix::from_parts(1, 3, 15, values(45, 5)).unwrap();
-        let uploads = [MatrixUpload {
+        let mismatched = UploadMatrixView {
             params: good.params,
-            matrix,
-        }];
+            instance_id: 1,
+            rows: 3,
+            columns: 15,
+            values: matrix.values(),
+        };
+        let failure = with_decoded_uploads(&[mismatched], validate_upload_views).unwrap_err();
         assert!(matches!(
-            validate_uploads(&uploads),
-            Err(RequestFailure::ColumnsMismatch {
+            failure,
+            RequestFailure::ColumnsMismatch {
                 expected: 16,
                 actual: 15
-            })
+            }
         ));
     }
 
     #[test]
-    fn validate_uploads_rejects_an_empty_set() {
-        assert!(matches!(
-            validate_uploads(&[]),
-            Err(RequestFailure::EmptyRequest)
-        ));
+    fn an_empty_upload_set_is_rejected_by_the_validator() {
+        let failure = with_decoded_uploads(&[], validate_upload_views).unwrap_err();
+        assert!(matches!(failure, RequestFailure::EmptyRequest));
+    }
+
+    /// One evaluation request fixture: a matrix identifier plus its owned
+    /// queries.
+    struct EntryFixture {
+        matrix_id: u64,
+        queries: Vec<EncryptedQuery<PROTOCOL_MODULUS>>,
+    }
+
+    fn entry(matrix_id: u64, queries: Vec<EncryptedQuery<PROTOCOL_MODULUS>>) -> EntryFixture {
+        EntryFixture { matrix_id, queries }
     }
 
     /// Encodes `entries` with the v2 writer and decodes them through the
     /// v2 pipeline, mirroring the server's per-frame path, then hands the
     /// decoded views and an empty query-ref scratch to `consume`.
     fn with_decoded_entries<T>(
-        entries: &[EvaluateEntry],
+        entries: &[EntryFixture],
         consume: impl for<'v> FnOnce(
-            emvp_network::v2::EvaluateViews<'v>,
+            EvaluateViews<'v>,
             &mut Vec<EncryptedQueryRef<'v, PROTOCOL_MODULUS>>,
         ) -> T,
     ) -> T {
         let query_refs: Vec<Vec<EncryptedQueryRef<'_, PROTOCOL_MODULUS>>> = entries
             .iter()
-            .map(|entry| entry.queries.iter().map(EncryptedQueryRef::from).collect())
+            .map(|fixture| {
+                fixture
+                    .queries
+                    .iter()
+                    .map(EncryptedQueryRef::from)
+                    .collect()
+            })
             .collect();
         let inputs: Vec<EvaluateEntryInput<'_>> = entries
             .iter()
             .zip(&query_refs)
-            .map(|(entry, queries)| EvaluateEntryInput {
-                matrix_id: entry.matrix_id,
+            .map(|(fixture, queries)| EvaluateEntryInput {
+                matrix_id: fixture.matrix_id,
                 queries,
             })
             .collect();
         let mut bytes = Vec::new();
-        write_evaluate_v2(&mut bytes, &inputs).unwrap();
+        write_evaluate(&mut bytes, &inputs).unwrap();
         let mut reader = &bytes[..];
         let header = read_frame_header(&mut reader).unwrap().unwrap();
         assert_eq!(header.kind, FrameKind::Evaluate);
@@ -1003,11 +1034,11 @@ mod tests {
         consume(views, &mut query_refs)
     }
 
-    /// Runs the session's evaluation validator over an owned request.
+    /// Runs the session's evaluation validator over a fixture request.
     /// Returns one `(matrix id, query count)` pair per entry, in request
     /// order.
     fn prepared_evaluate(
-        entries: &[EvaluateEntry],
+        entries: &[EntryFixture],
         lookup: &mut dyn FnMut(u64) -> Option<MatrixInfo>,
     ) -> Result<Vec<(u64, usize)>, RequestFailure> {
         with_decoded_entries(entries, |views, query_refs| {
@@ -1040,9 +1071,6 @@ mod tests {
             } else {
                 None
             }
-        };
-        let entry = |matrix_id: u64, queries: Vec<emvp::EncryptedQuery<PROTOCOL_MODULUS>>| {
-            EvaluateEntry { matrix_id, queries }
         };
         let make_query = |query_id: u64, width: usize, instance_id: u128| {
             emvp::EncryptedQuery::from_parts(instance_id, query_id, values(width, query_id))
@@ -1152,12 +1180,28 @@ mod tests {
     }
 
     fn decoded(
-        answer: &AnswerMatrix<PROTOCOL_MODULUS>,
+        answer: &AnswerRef<PROTOCOL_MODULUS>,
         key: &DecodingKey<PROTOCOL_MODULUS>,
     ) -> Vec<FieldElement<PROTOCOL_MODULUS>> {
         let mut output = vec![field().element_u32(0); answer.rows()];
         emvp::decode_into(answer, key, &mut output).unwrap();
         output
+    }
+
+    /// Reads the server's products answer into a fresh decode workspace
+    /// and hands the views to `consume`; tests may allocate.
+    fn read_products<T>(
+        client: &mut UnixStream,
+        consume: impl FnOnce(ProductsViews<'_>) -> T,
+    ) -> T {
+        let header = read_frame_header(client).unwrap().unwrap();
+        assert_eq!(header.kind, FrameKind::Products);
+        let mut frame = FrameReader::new(client, header.payload_len);
+        let plan = plan_products(&mut frame).unwrap();
+        let mut workspace = ProductsWorkspace::new();
+        workspace.reserve(&plan).unwrap();
+        let views = decode_products(&mut frame, &plan, &mut workspace).unwrap();
+        consume(views)
     }
 
     #[test]
@@ -1167,53 +1211,65 @@ mod tests {
         let server = spawn_server(server_stream, engine);
         client_handshake(&mut client).unwrap();
 
-        let (upload_a, mut state_a, plaintext_a) = upload(5, 0x11, 100);
-        let (upload_b, mut state_b, plaintext_b) = upload(21, 0x22, 101);
-        write_upload_matrices(&mut client, &[upload_a, upload_b]).unwrap();
+        let mut loaded_a = upload(5, 0x11, 100);
+        let mut loaded_b = upload(21, 0x22, 101);
+        write_upload_matrices(&mut client, &[loaded_a.view(), loaded_b.view()]).unwrap();
         let (ids, _) = read_upload_accepted(&mut client).unwrap();
         assert_eq!(ids, vec![1, 2]);
 
-        let (query_a0, key_a0, plain_a0) = random_query(&mut state_a, 200);
-        let (query_a1, key_a1, plain_a1) = random_query(&mut state_a, 201);
-        let (query_of_b, key_of_b, plain_b) = random_query(&mut state_b, 202);
-        let entries = vec![
-            EvaluateEntry {
+        let (query_a0, key_a0, plain_a0) = random_query(&mut loaded_a.state, 200);
+        let (query_a1, key_a1, plain_a1) = random_query(&mut loaded_a.state, 201);
+        let (query_of_b, key_of_b, plain_b) = random_query(&mut loaded_b.state, 202);
+        let queries_a: Vec<EncryptedQueryRef<'_, PROTOCOL_MODULUS>> = [&query_a0, &query_a1]
+            .into_iter()
+            .map(EncryptedQueryRef::from)
+            .collect();
+        let queries_b: Vec<EncryptedQueryRef<'_, PROTOCOL_MODULUS>> = std::iter::once(&query_of_b)
+            .map(EncryptedQueryRef::from)
+            .collect();
+        let entries = [
+            EvaluateEntryInput {
                 matrix_id: ids[0],
-                queries: vec![query_a0, query_a1],
+                queries: &queries_a,
             },
-            EvaluateEntry {
+            EvaluateEntryInput {
                 matrix_id: ids[1],
-                queries: vec![query_of_b],
+                queries: &queries_b,
             },
         ];
         write_evaluate(&mut client, &entries).unwrap();
-        let (products, _) = read_products(&mut client).unwrap();
-        assert_eq!(products.len(), 2);
+        read_products(&mut client, |products| {
+            assert_eq!(products.len(), 2);
 
-        let ProductEntry { matrix_id, answers } = &products[0];
-        assert_eq!(*matrix_id, ids[0]);
-        assert_eq!(answers.len(), 2);
-        for ((answer, key), plaintext_query) in answers
-            .iter()
-            .zip([&key_a0, &key_a1])
-            .zip([&plain_a0, &plain_a1])
-        {
-            assert_eq!(answer.instance_id(), state_a.instance_id());
-            assert_eq!(answer.query_id(), key.query_id());
-            assert_eq!(answer.rows(), 5);
-            assert_eq!(answer.blocks(), 8);
-            let decoded_product = decoded(answer, key);
+            let first = products.get(0).unwrap();
+            assert_eq!(first.matrix_id(), ids[0]);
+            assert_eq!(first.len(), 2);
+            for ((answer, key), plaintext_query) in first
+                .iter()
+                .zip([&key_a0, &key_a1])
+                .zip([&plain_a0, &plain_a1])
+            {
+                assert_eq!(answer.instance_id(), loaded_a.matrix.instance_id());
+                assert_eq!(answer.query_id(), key.query_id());
+                assert_eq!(answer.rows(), 5);
+                assert_eq!(answer.blocks(), 8);
+                let decoded_product = decoded(&answer, key);
+                assert_eq!(
+                    decoded_product,
+                    naive_product(&loaded_a.plaintext, plaintext_query, 5)
+                );
+            }
+            let second = products.get(1).unwrap();
+            assert_eq!(second.matrix_id(), ids[1]);
+            assert_eq!(second.len(), 1);
+            assert_eq!(second.rows(), 21);
+            let answer = second.answer(0).unwrap();
+            let decoded_product = decoded(&answer, &key_of_b);
             assert_eq!(
                 decoded_product,
-                naive_product(&plaintext_a, plaintext_query, 5)
+                naive_product(&loaded_b.plaintext, &plain_b, 21)
             );
-        }
-        let ProductEntry { matrix_id, answers } = &products[1];
-        assert_eq!(*matrix_id, ids[1]);
-        assert_eq!(answers.len(), 1);
-        assert_eq!(answers[0].rows(), 21);
-        let decoded_product = decoded(&answers[0], &key_of_b);
-        assert_eq!(decoded_product, naive_product(&plaintext_b, &plain_b, 21));
+        });
 
         drop(client);
         server.join().unwrap().unwrap();
@@ -1229,54 +1285,63 @@ mod tests {
         let server = spawn_server(server_stream, engine);
         client_handshake(&mut client).unwrap();
 
-        let (upload_a, mut state_a, plaintext_a) = upload(5, 0x11, 110);
-        let (upload_b, mut state_b, plaintext_b) = upload(21, 0x22, 111);
-        write_upload_matrices(&mut client, &[upload_a, upload_b]).unwrap();
+        let mut loaded_a = upload(5, 0x11, 110);
+        let mut loaded_b = upload(21, 0x22, 111);
+        write_upload_matrices(&mut client, &[loaded_a.view(), loaded_b.view()]).unwrap();
         let (ids, _) = read_upload_accepted(&mut client).unwrap();
         assert_eq!(ids, vec![1, 2]);
 
         for round in 0_u64..2 {
-            let (query_a0, key_a0, plain_a0) = random_query(&mut state_a, 200 + round);
-            let (query_a1, key_a1, plain_a1) = random_query(&mut state_a, 210 + round);
-            let (query_of_b, key_of_b, plain_b) = random_query(&mut state_b, 220 + round);
-            let entries = vec![
-                EvaluateEntry {
+            let (query_a0, key_a0, plain_a0) = random_query(&mut loaded_a.state, 200 + round);
+            let (query_a1, key_a1, plain_a1) = random_query(&mut loaded_a.state, 210 + round);
+            let (query_of_b, key_of_b, plain_b) = random_query(&mut loaded_b.state, 220 + round);
+            let queries_a: Vec<EncryptedQueryRef<'_, PROTOCOL_MODULUS>> = [&query_a0, &query_a1]
+                .into_iter()
+                .map(EncryptedQueryRef::from)
+                .collect();
+            let queries_b: Vec<EncryptedQueryRef<'_, PROTOCOL_MODULUS>> =
+                std::iter::once(&query_of_b)
+                    .map(EncryptedQueryRef::from)
+                    .collect();
+            let entries = [
+                EvaluateEntryInput {
                     matrix_id: ids[0],
-                    queries: vec![query_a0, query_a1],
+                    queries: &queries_a,
                 },
-                EvaluateEntry {
+                EvaluateEntryInput {
                     matrix_id: ids[1],
-                    queries: vec![query_of_b],
+                    queries: &queries_b,
                 },
             ];
             write_evaluate(&mut client, &entries).unwrap();
-            let (products, _) = read_products(&mut client).unwrap();
-            assert_eq!(products.len(), 2);
+            read_products(&mut client, |products| {
+                assert_eq!(products.len(), 2);
 
-            let ProductEntry { matrix_id, answers } = &products[0];
-            assert_eq!(*matrix_id, ids[0]);
-            assert_eq!(answers.len(), 2);
-            for ((answer, key), plaintext_query) in answers
-                .iter()
-                .zip([&key_a0, &key_a1])
-                .zip([&plain_a0, &plain_a1])
-            {
-                assert_eq!(answer.instance_id(), state_a.instance_id());
-                assert_eq!(answer.query_id(), key.query_id());
-                assert_eq!(answer.rows(), 5);
-                assert_eq!(answer.blocks(), 8);
+                let first = products.get(0).unwrap();
+                assert_eq!(first.matrix_id(), ids[0]);
+                assert_eq!(first.len(), 2);
+                for ((answer, key), plaintext_query) in first
+                    .iter()
+                    .zip([&key_a0, &key_a1])
+                    .zip([&plain_a0, &plain_a1])
+                {
+                    assert_eq!(answer.instance_id(), loaded_a.matrix.instance_id());
+                    assert_eq!(answer.query_id(), key.query_id());
+                    assert_eq!(answer.rows(), 5);
+                    assert_eq!(answer.blocks(), 8);
+                    assert_eq!(
+                        decoded(&answer, key),
+                        naive_product(&loaded_a.plaintext, plaintext_query, 5)
+                    );
+                }
+                let second = products.get(1).unwrap();
+                assert_eq!(second.matrix_id(), ids[1]);
+                assert_eq!(second.len(), 1);
                 assert_eq!(
-                    decoded(answer, key),
-                    naive_product(&plaintext_a, plaintext_query, 5)
+                    decoded(&second.answer(0).unwrap(), &key_of_b),
+                    naive_product(&loaded_b.plaintext, &plain_b, 21)
                 );
-            }
-            let ProductEntry { matrix_id, answers } = &products[1];
-            assert_eq!(*matrix_id, ids[1]);
-            assert_eq!(answers.len(), 1);
-            assert_eq!(
-                decoded(&answers[0], &key_of_b),
-                naive_product(&plaintext_b, &plain_b, 21)
-            );
+            });
         }
 
         drop(client);
@@ -1293,47 +1358,63 @@ mod tests {
         let server = spawn_server(server_stream, engine);
         client_handshake(&mut client).unwrap();
 
-        let (upload, mut state, plaintext) = upload(5, 0x11, 120);
-        write_upload_matrices(&mut client, &[upload]).unwrap();
+        let mut loaded = upload(5, 0x11, 120);
+        write_upload_matrices(&mut client, &[loaded.view()]).unwrap();
         let (ids, _) = read_upload_accepted(&mut client).unwrap();
         assert_eq!(ids, vec![1]);
 
         // The larger frame: three queries in one entry.
         let larger: Vec<_> = (0_u64..3)
-            .map(|index| random_query(&mut state, 300 + index))
+            .map(|index| random_query(&mut loaded.state, 300 + index))
             .collect();
-        let entries = vec![EvaluateEntry {
+        let query_refs: Vec<EncryptedQueryRef<'_, PROTOCOL_MODULUS>> = larger
+            .iter()
+            .map(|(query, _, _)| EncryptedQueryRef::from(query))
+            .collect();
+        let entries = [EvaluateEntryInput {
             matrix_id: ids[0],
-            queries: larger.iter().map(|(query, _, _)| query.clone()).collect(),
+            queries: &query_refs,
         }];
         write_evaluate(&mut client, &entries).unwrap();
-        let (products, _) = read_products(&mut client).unwrap();
-        assert_eq!(products.len(), 1);
-        assert_eq!(products[0].answers.len(), 3);
-        for ((answer, key), plain) in products[0]
-            .answers
-            .iter()
-            .zip(larger.iter().map(|(_, key, _)| key))
-            .zip(larger.iter().map(|(_, _, plain)| plain))
-        {
-            assert_eq!(answer.query_id(), key.query_id());
-            assert_eq!(decoded(answer, key), naive_product(&plaintext, plain, 5));
-        }
+        read_products(&mut client, |products| {
+            assert_eq!(products.len(), 1);
+            let entry = products.get(0).unwrap();
+            assert_eq!(entry.len(), 3);
+            for ((answer, key), plain) in entry
+                .iter()
+                .zip(larger.iter().map(|(_, key, _)| key))
+                .zip(larger.iter().map(|(_, _, plain)| plain))
+            {
+                assert_eq!(answer.query_id(), key.query_id());
+                assert_eq!(
+                    decoded(&answer, key),
+                    naive_product(&loaded.plaintext, plain, 5)
+                );
+            }
+        });
 
         // The smaller frame: one query, answered through the same
         // workspaces without shrinking them.
-        let (query, key, plain) = random_query(&mut state, 310);
-        let entries = vec![EvaluateEntry {
+        let (query, key, plain) = random_query(&mut loaded.state, 310);
+        let query_refs: Vec<EncryptedQueryRef<'_, PROTOCOL_MODULUS>> = std::iter::once(&query)
+            .map(EncryptedQueryRef::from)
+            .collect();
+        let entries = [EvaluateEntryInput {
             matrix_id: ids[0],
-            queries: vec![query],
+            queries: &query_refs,
         }];
         write_evaluate(&mut client, &entries).unwrap();
-        let (products, _) = read_products(&mut client).unwrap();
-        assert_eq!(products.len(), 1);
-        assert_eq!(products[0].answers.len(), 1);
-        let answer = &products[0].answers[0];
-        assert_eq!(answer.query_id(), key.query_id());
-        assert_eq!(decoded(answer, &key), naive_product(&plaintext, &plain, 5));
+        read_products(&mut client, |products| {
+            assert_eq!(products.len(), 1);
+            let entry = products.get(0).unwrap();
+            assert_eq!(entry.len(), 1);
+            let answer = entry.answer(0).unwrap();
+            assert_eq!(answer.query_id(), key.query_id());
+            assert_eq!(
+                decoded(&answer, &key),
+                naive_product(&loaded.plaintext, &plain, 5)
+            );
+        });
 
         drop(client);
         server.join().unwrap().unwrap();
@@ -1349,16 +1430,19 @@ mod tests {
         let server = spawn_server(server_stream, engine);
         client_handshake(&mut client).unwrap();
 
-        let (upload, mut state, _) = upload(5, 0x11, 130);
-        write_upload_matrices(&mut client, &[upload]).unwrap();
+        let mut loaded = upload(5, 0x11, 130);
+        write_upload_matrices(&mut client, &[loaded.view()]).unwrap();
         let (ids, _) = read_upload_accepted(&mut client).unwrap();
 
         // A well-formed frame, then corrupted on the wire: the final value
         // word becomes `u32::MAX`, which is at or above the modulus.
-        let (query, _, _) = random_query(&mut state, 320);
-        let entries = vec![EvaluateEntry {
+        let (query, _, _) = random_query(&mut loaded.state, 320);
+        let query_refs: Vec<EncryptedQueryRef<'_, PROTOCOL_MODULUS>> = std::iter::once(&query)
+            .map(EncryptedQueryRef::from)
+            .collect();
+        let entries = [EvaluateEntryInput {
             matrix_id: ids[0],
-            queries: vec![query],
+            queries: &query_refs,
         }];
         let mut frame_bytes = Vec::new();
         write_evaluate(&mut frame_bytes, &entries).unwrap();
@@ -1374,7 +1458,7 @@ mod tests {
         assert!(matches!(
             outcome,
             Err(SessionError::Transport(
-                emvp_network::CodecError::NonCanonicalField { .. }
+                CodecError::NonCanonicalField { .. }
             ))
         ));
     }
@@ -1387,13 +1471,16 @@ mod tests {
         client_handshake(&mut client).unwrap();
 
         // `b = 3` does not divide `n = 16`: structurally invalid parameters.
-        let (upload_a, _, _) = upload(5, 0x11, 400);
-        let malformed = MatrixUpload {
+        let uploaded = upload(5, 0x11, 400);
+        let malformed = UploadMatrixView {
             params: EmvpParams {
                 b: 3,
-                ..upload_a.params
+                ..uploaded.params
             },
-            matrix: upload_a.matrix,
+            instance_id: uploaded.matrix.instance_id(),
+            rows: uploaded.matrix.rows(),
+            columns: uploaded.matrix.columns(),
+            values: uploaded.matrix.values(),
         };
         write_upload_matrices(&mut client, &[malformed]).unwrap();
         let (error, _) = read_error(&mut client).unwrap();
@@ -1416,13 +1503,16 @@ mod tests {
         let (mut client, server_stream) = UnixStream::pair().unwrap();
         let server = spawn_server(server_stream, Arc::clone(&engine));
         client_handshake(&mut client).unwrap();
-        let (upload_a, _, _) = upload(5, 0x11, 400);
-        let malformed = MatrixUpload {
+        let uploaded = upload(5, 0x11, 400);
+        let malformed = UploadMatrixView {
             params: EmvpParams {
                 b: 3,
-                ..upload_a.params
+                ..uploaded.params
             },
-            matrix: upload_a.matrix,
+            instance_id: uploaded.matrix.instance_id(),
+            rows: uploaded.matrix.rows(),
+            columns: uploaded.matrix.columns(),
+            values: uploaded.matrix.values(),
         };
         write_upload_matrices(&mut client, &[malformed]).unwrap();
         let (error, _) = read_error(&mut client).unwrap();
@@ -1435,22 +1525,27 @@ mod tests {
         let (mut client, server_stream) = UnixStream::pair().unwrap();
         let server = spawn_server(server_stream, engine);
         client_handshake(&mut client).unwrap();
-        let (upload, mut state, plaintext) = upload(5, 0x22, 401);
-        write_upload_matrices(&mut client, &[upload]).unwrap();
+        let mut loaded = upload(5, 0x22, 401);
+        write_upload_matrices(&mut client, &[loaded.view()]).unwrap();
         let (ids, _) = read_upload_accepted(&mut client).unwrap();
         assert_eq!(ids, vec![1]);
-        let (query, key, plain) = random_query(&mut state, 402);
-        let entries = vec![EvaluateEntry {
+        let (query, key, plain) = random_query(&mut loaded.state, 402);
+        let query_refs: Vec<EncryptedQueryRef<'_, PROTOCOL_MODULUS>> = std::iter::once(&query)
+            .map(EncryptedQueryRef::from)
+            .collect();
+        let entries = [EvaluateEntryInput {
             matrix_id: ids[0],
-            queries: vec![query],
+            queries: &query_refs,
         }];
         write_evaluate(&mut client, &entries).unwrap();
-        let (products, _) = read_products(&mut client).unwrap();
-        assert_eq!(products[0].answers.len(), 1);
-        assert_eq!(
-            decoded(&products[0].answers[0], &key),
-            naive_product(&plaintext, &plain, 5)
-        );
+        read_products(&mut client, |products| {
+            let entry = products.get(0).unwrap();
+            assert_eq!(entry.len(), 1);
+            assert_eq!(
+                decoded(&entry.answer(0).unwrap(), &key),
+                naive_product(&loaded.plaintext, &plain, 5)
+            );
+        });
 
         drop(client);
         server.join().unwrap().unwrap();
@@ -1463,8 +1558,8 @@ mod tests {
         let server = spawn_server(server_stream, engine);
         client_handshake(&mut client).unwrap();
 
-        let (upload_a, _, _) = upload(5, 0x11, 300);
-        write_upload_matrices(&mut client, &[upload_a]).unwrap();
+        let first = upload(5, 0x11, 300);
+        write_upload_matrices(&mut client, &[first.view()]).unwrap();
         let (ids, _) = read_upload_accepted(&mut client).unwrap();
         assert_eq!(ids, vec![1]);
 
@@ -1472,16 +1567,10 @@ mod tests {
         // the second payload is never read or drained. The client sends
         // only the frame header, so the close carries no unread data and
         // the error frame is delivered deterministically.
-        let (upload_b, _, _) = upload(7, 0x33, 301);
-        let payload_len = emvp_network::write_upload_matrices(&mut Vec::new(), &[upload_b])
-            .unwrap()
-            - emvp_network::HEADER_BYTES;
-        emvp_network::write_frame_header(
-            &mut client,
-            emvp_network::FrameKind::UploadMatrices,
-            payload_len,
-        )
-        .unwrap();
+        let second = upload(7, 0x33, 301);
+        let payload_len =
+            write_upload_matrices(&mut Vec::new(), &[second.view()]).unwrap() - HEADER_BYTES;
+        write_frame_header(&mut client, FrameKind::UploadMatrices, payload_len).unwrap();
         let (error, _) = read_error(&mut client).unwrap();
         assert_eq!(error.code(), Some(ErrorCode::AlreadyLoaded));
         assert!(read_frame_header(&mut client).unwrap().is_none());
@@ -1511,21 +1600,16 @@ mod tests {
         let server = spawn_server(server_stream, engine);
         client_handshake(&mut client).unwrap();
 
-        let entry = EvaluateEntry {
+        let query_values = values(16, 600);
+        let queries = [EncryptedQueryRef::new(1, 0, &query_values).unwrap()];
+        let entries = [EvaluateEntryInput {
             matrix_id: 1,
-            queries: vec![emvp::EncryptedQuery::from_parts(1, 0, values(16, 600))],
-        };
+            queries: &queries,
+        }];
         // The client sends only the frame header, so the session closes
         // with no unread data and the error frame is delivered cleanly.
-        let payload_len =
-            emvp_network::write_evaluate(&mut Vec::new(), std::slice::from_ref(&entry)).unwrap()
-                - emvp_network::HEADER_BYTES;
-        emvp_network::write_frame_header(
-            &mut client,
-            emvp_network::FrameKind::Evaluate,
-            payload_len,
-        )
-        .unwrap();
+        let payload_len = write_evaluate(&mut Vec::new(), &entries).unwrap() - HEADER_BYTES;
+        write_frame_header(&mut client, FrameKind::Evaluate, payload_len).unwrap();
         let (error, _) = read_error(&mut client).unwrap();
         assert_eq!(error.code(), Some(ErrorCode::NotLoaded));
 
@@ -1545,21 +1629,18 @@ mod tests {
         // A client must never send server-to-client frames. The client sends
         // only the frame header, so the session closes with no unread data
         // and the error frame is delivered deterministically.
+        let answer_values = values(8, 700);
+        let answer = AnswerRef::new(1, 0, &answer_values, 4, 2).unwrap();
+        let products = [ProductEntryInput {
+            matrix_id: 1,
+            instance_id: 1,
+            rows: 4,
+            blocks: 2,
+            answers: std::slice::from_ref(&answer),
+        }];
         let mut buffer = Vec::new();
-        let written = emvp_network::write_products(
-            &mut buffer,
-            &[ProductEntry {
-                matrix_id: 1,
-                answers: vec![AnswerMatrix::from_parts(1, 0, values(8, 700), 4, 2)],
-            }],
-        )
-        .unwrap();
-        emvp_network::write_frame_header(
-            &mut client,
-            emvp_network::FrameKind::Products,
-            written - emvp_network::HEADER_BYTES,
-        )
-        .unwrap();
+        let written = write_products(&mut buffer, &products).unwrap();
+        write_frame_header(&mut client, FrameKind::Products, written - HEADER_BYTES).unwrap();
         let (error, _) = read_error(&mut client).unwrap();
         assert_eq!(error.code(), Some(ErrorCode::UnexpectedFrame));
 
@@ -1568,9 +1649,7 @@ mod tests {
         let outcome = server.join().unwrap();
         assert!(matches!(
             outcome,
-            Err(SessionError::Transport(
-                emvp_network::CodecError::UnexpectedFrame { .. }
-            ))
+            Err(SessionError::Transport(CodecError::UnexpectedFrame { .. }))
         ));
     }
 
@@ -1591,9 +1670,9 @@ mod tests {
         let outcome = server.join().unwrap();
         assert!(matches!(
             outcome,
-            Err(SessionError::Transport(
-                emvp_network::CodecError::UnknownFrameKind { kind: 0x2A }
-            ))
+            Err(SessionError::Transport(CodecError::UnknownFrameKind {
+                kind: 0x2A
+            }))
         ));
     }
 }

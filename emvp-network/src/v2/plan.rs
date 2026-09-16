@@ -123,7 +123,7 @@ pub struct EvaluatePlan {
 
 /// Validated descriptor metadata of one products entry.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct ProductEntryMeta {
+pub struct ProductsEntryMeta {
     /// The server identifier of the answered matrix.
     pub matrix_id: u64,
     /// The public matrix-instance identifier shared by every answer.
@@ -144,7 +144,7 @@ pub struct ProductEntryMeta {
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct ProductsPlan {
     /// One metadata record per entry, in wire order.
-    pub entries: Vec<ProductEntryMeta>,
+    pub entries: Vec<ProductsEntryMeta>,
     /// The query identifier of every answer, in entry order then answer
     /// order.
     pub query_ids: Vec<u64>,
@@ -449,7 +449,7 @@ pub fn plan_products<R: Read>(frame: &mut FrameReader<'_, R>) -> Result<Products
         value_fields = value_fields
             .checked_add(entry_fields)
             .ok_or(CodecError::DimensionOverflow)?;
-        entries.push(ProductEntryMeta {
+        entries.push(ProductsEntryMeta {
             matrix_id,
             instance_id,
             rows,

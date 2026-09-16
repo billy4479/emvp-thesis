@@ -51,8 +51,10 @@
 //! from the declared payload length before allocating, grows a reusable
 //! workspace exactly once, and yields borrowed views over that workspace
 //! with zero managed allocations on the decode and encode happy paths.
-//! The `read_*`/`write_*` functions of [`messages`] are allocating
-//! convenience adapters over that pipeline.
+//! That pipeline is the crate's public surface for the bulk messages and
+//! is re-exported at the crate root; only the error frame and the
+//! `UploadAccepted` acknowledgment keep owned convenience codecs in
+//! [`messages`].
 //!
 //! # Experimental
 //!
@@ -79,9 +81,18 @@ pub use handshake::{
     server_handshake, write_client_hello, write_server_hello,
 };
 pub use messages::{
-    ErrorResponse, EvaluateEntry, MatrixUpload, ProductEntry, read_error, read_error_payload,
-    read_evaluate, read_evaluate_payload, read_products, read_products_payload,
-    read_upload_accepted, read_upload_accepted_payload, read_upload_matrices,
-    read_upload_matrices_payload, write_error, write_evaluate, write_products,
-    write_upload_accepted, write_upload_matrices,
+    ErrorResponse, read_error, read_error_payload, read_upload_accepted,
+    read_upload_accepted_payload, write_error, write_upload_accepted,
+};
+pub use v2::{
+    EVALUATE_ENTRY_DESCRIPTOR_BYTES, EVALUATE_QUERY_DESCRIPTOR_BYTES, EVALUATE_SUMMARY_BYTES,
+    EvaluateEntryInput, EvaluateEntryMeta, EvaluateEntryView, EvaluatePlan, EvaluateQueryIter,
+    EvaluateQueryMeta, EvaluateViews, EvaluateWorkspace, PRODUCTS_ANSWER_DESCRIPTOR_BYTES,
+    PRODUCTS_ENTRY_DESCRIPTOR_BYTES, PRODUCTS_SUMMARY_BYTES, ProductEntryInput, ProductEntryView,
+    ProductsEntryMeta, ProductsPlan, ProductsViews, ProductsWorkspace, UPLOAD_DESCRIPTOR_BYTES,
+    UPLOAD_SUMMARY_BYTES, UploadAcceptedIds, UploadAcceptedPlan, UploadAcceptedWorkspace,
+    UploadMatrixMeta, UploadMatrixView, UploadMatrixViewIter, UploadPlan, UploadViews,
+    UploadWorkspace, decode_evaluate, decode_products, decode_upload, decode_upload_accepted,
+    plan_evaluate, plan_products, plan_upload, plan_upload_accepted, write_evaluate,
+    write_products, write_upload_matrices,
 };

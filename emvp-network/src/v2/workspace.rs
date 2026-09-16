@@ -14,7 +14,7 @@ use prime_field_layer::PrimeField;
 use crate::error::CodecError;
 use crate::frame::{Field, PROTOCOL_MODULUS};
 use crate::v2::plan::{
-    EvaluateEntryMeta, EvaluatePlan, EvaluateQueryMeta, ProductEntryMeta, ProductsPlan,
+    EvaluateEntryMeta, EvaluatePlan, EvaluateQueryMeta, ProductsEntryMeta, ProductsPlan,
     UploadAcceptedPlan, UploadMatrixMeta, UploadPlan,
 };
 use crate::v2::views::{EvaluateViews, ProductsViews, UploadAcceptedIds, UploadViews};
@@ -226,7 +226,7 @@ impl EvaluateWorkspace {
 #[derive(Debug, Default)]
 pub struct ProductsWorkspace {
     pub(crate) arena: Vec<Field>,
-    pub(crate) entries: Vec<ProductEntryMeta>,
+    pub(crate) entries: Vec<ProductsEntryMeta>,
     pub(crate) query_ids: Vec<u64>,
 }
 

@@ -10,25 +10,34 @@
 
 use std::io::Cursor;
 
-use emvp::{
-    AnswerMatrix, AnswerRef, EmvpParams, EncryptedMatrix, EncryptedQuery, EncryptedQueryRef,
-};
-use emvp_network::v2::{
-    EvaluateEntryInput, EvaluateWorkspace, ProductEntryInput, ProductsWorkspace,
-    UploadAcceptedWorkspace, UploadMatrixView, UploadWorkspace, decode_evaluate, decode_products,
-    decode_upload, plan_evaluate, plan_products, plan_upload,
-    write_evaluate as write_evaluate_views, write_products as write_products_views,
-    write_upload_matrices as write_upload_views,
-};
+use emvp::{AnswerRef, EmvpParams, EncryptedQueryRef};
 use emvp_network::{
-    ClientHello, CodecError, ErrorCode, ErrorResponse, EvaluateEntry, FrameKind, FrameReader,
-    HandshakeError, MatrixUpload, PROTOCOL_MODULUS, PROTOCOL_VERSION, ProductEntry,
-    read_client_hello, read_error, read_evaluate, read_frame_header, read_products,
-    read_server_hello, read_upload_accepted, read_upload_matrices, server_handshake,
-    write_client_hello, write_error, write_evaluate, write_frame_header, write_products,
-    write_upload_accepted, write_upload_matrices,
+    ClientHello, CodecError, ErrorCode, ErrorResponse, EvaluateEntryInput, EvaluateWorkspace,
+    FrameKind, FrameReader, HandshakeError, PROTOCOL_MODULUS, PROTOCOL_VERSION, ProductEntryInput,
+    ProductsWorkspace, UploadAcceptedWorkspace, UploadWorkspace, decode_evaluate, decode_products,
+    decode_upload, decode_upload_accepted, plan_evaluate, plan_products, plan_upload,
+    plan_upload_accepted, read_client_hello, read_error, read_frame_header, read_server_hello,
+    read_upload_accepted, server_handshake, write_client_hello, write_error, write_evaluate,
+    write_frame_header, write_products, write_upload_accepted, write_upload_matrices,
 };
 use prime_field_layer::{FieldElement, PrimeField};
+
+mod common;
+use common::{
+    AnswerFixture, EvaluateFixture, ProductFixture, QueryFixture, UploadFixture, encode_evaluate,
+    encode_products, encode_upload, evaluate_inputs, open_frame, product_inputs,
+    read_evaluate_frame, read_products_frame, read_upload_frame,
+};
+
+/// Decodes one upload into `workspace`, for the workspace-reuse tests
+/// that feed many frames through the same reservation.
+fn decode_upload_into(bytes: &[u8], workspace: &mut UploadWorkspace) {
+    let mut cursor = Cursor::new(bytes);
+    let (mut frame, _) = open_frame(&mut cursor, FrameKind::UploadMatrices).unwrap();
+    let plan = plan_upload(&mut frame).unwrap();
+    workspace.reserve(&plan).unwrap();
+    decode_upload(&mut frame, &plan, workspace).unwrap();
+}
 
 const PARAMS: EmvpParams = EmvpParams {
     k: 8,
@@ -48,146 +57,45 @@ fn values(count: usize) -> Vec<FieldElement<PROTOCOL_MODULUS>> {
         .collect()
 }
 
-fn upload(rows: usize, columns: usize) -> MatrixUpload {
-    MatrixUpload {
+fn upload(rows: usize, columns: usize) -> UploadFixture {
+    UploadFixture {
         params: PARAMS,
-        matrix: EncryptedMatrix::from_parts(42, rows, columns, values(rows * columns)).unwrap(),
+        instance_id: 42,
+        rows,
+        columns,
+        values: values(rows * columns),
     }
 }
 
-fn evaluate_entry() -> EvaluateEntry {
-    EvaluateEntry {
+fn evaluate_entry() -> EvaluateFixture {
+    EvaluateFixture {
         matrix_id: 7,
         queries: vec![
-            EncryptedQuery::from_parts(42, 0, values(16)),
-            EncryptedQuery::from_parts(42, 1, values(16)),
+            QueryFixture {
+                instance_id: 42,
+                query_id: 0,
+                values: values(16),
+            },
+            QueryFixture {
+                instance_id: 42,
+                query_id: 1,
+                values: values(16),
+            },
         ],
     }
 }
 
-fn product_entry() -> ProductEntry {
-    ProductEntry {
+fn product_entry() -> ProductFixture {
+    ProductFixture {
         matrix_id: 7,
-        answers: vec![AnswerMatrix::from_parts(42, 3, values(8), 4, 2)],
+        answers: vec![AnswerFixture {
+            instance_id: 42,
+            query_id: 3,
+            rows: 4,
+            blocks: 2,
+            values: values(8),
+        }],
     }
-}
-
-fn evaluate_inputs(entry: &EvaluateEntry) -> [EvaluateEntryInput<'_>; 1] {
-    let refs: Vec<EncryptedQueryRef<'_, PROTOCOL_MODULUS>> =
-        entry.queries.iter().map(EncryptedQueryRef::from).collect();
-    // The boxed slice leaks one test fixture per call; tests are small and
-    // finite.
-    [EvaluateEntryInput {
-        matrix_id: entry.matrix_id,
-        queries: refs.leak(),
-    }]
-}
-
-fn product_inputs(entry: &ProductEntry) -> [ProductEntryInput<'_>; 1] {
-    let refs: Vec<AnswerRef<'_, PROTOCOL_MODULUS>> =
-        entry.answers.iter().map(AnswerRef::from).collect();
-    let first = entry.answers.first();
-    [ProductEntryInput {
-        matrix_id: entry.matrix_id,
-        instance_id: first.map_or(0, AnswerMatrix::instance_id),
-        rows: first.map_or(0, AnswerMatrix::rows),
-        blocks: first.map_or(0, AnswerMatrix::blocks),
-        answers: refs.leak(),
-    }]
-}
-
-/// Encodes one upload frame through the v2 view writer.
-fn encode_upload(uploads: &[MatrixUpload]) -> Vec<u8> {
-    let views: Vec<UploadMatrixView<'_>> = uploads.iter().map(UploadMatrixView::from).collect();
-    let mut buffer = Vec::new();
-    write_upload_views(&mut buffer, &views).unwrap();
-    buffer
-}
-
-/// Encodes one evaluate frame holding all `entries`, through the v2 view
-/// writer.
-fn encode_evaluate(entries: &[&EvaluateEntry]) -> Vec<u8> {
-    let inputs: Vec<EvaluateEntryInput<'_>> = entries
-        .iter()
-        .map(|entry| {
-            let refs: Vec<EncryptedQueryRef<'_, PROTOCOL_MODULUS>> =
-                entry.queries.iter().map(EncryptedQueryRef::from).collect();
-            EvaluateEntryInput {
-                matrix_id: entry.matrix_id,
-                queries: refs.leak(),
-            }
-        })
-        .collect();
-    let mut buffer = Vec::new();
-    write_evaluate_views(&mut buffer, &inputs).unwrap();
-    buffer
-}
-
-/// Encodes one products frame holding all `entries`, through the v2 view
-/// writer.
-fn encode_products(entries: &[&ProductEntry]) -> Vec<u8> {
-    let inputs: Vec<ProductEntryInput<'_>> = entries
-        .iter()
-        .map(|entry| {
-            let refs: Vec<AnswerRef<'_, PROTOCOL_MODULUS>> =
-                entry.answers.iter().map(AnswerRef::from).collect();
-            let first = entry.answers.first();
-            ProductEntryInput {
-                matrix_id: entry.matrix_id,
-                instance_id: first.map_or(0, AnswerMatrix::instance_id),
-                rows: first.map_or(0, AnswerMatrix::rows),
-                blocks: first.map_or(0, AnswerMatrix::blocks),
-                answers: refs.leak(),
-            }
-        })
-        .collect();
-    let mut buffer = Vec::new();
-    write_products_views(&mut buffer, &inputs).unwrap();
-    buffer
-}
-
-/// Runs the v2 upload pipeline over `bytes` into a fresh workspace.
-fn decode_upload_frame(bytes: &[u8]) -> UploadWorkspace {
-    let mut workspace = UploadWorkspace::new();
-    decode_upload_into(bytes, &mut workspace);
-    workspace
-}
-
-/// Runs the v2 upload pipeline over `bytes` into `workspace`.
-fn decode_upload_into(bytes: &[u8], workspace: &mut UploadWorkspace) {
-    let mut cursor = Cursor::new(bytes);
-    let header = read_frame_header(&mut cursor).unwrap().unwrap();
-    assert_eq!(header.kind, FrameKind::UploadMatrices);
-    let mut frame = FrameReader::new(&mut cursor, header.payload_len);
-    let plan = plan_upload(&mut frame).unwrap();
-    workspace.reserve(&plan).unwrap();
-    decode_upload(&mut frame, &plan, workspace).unwrap();
-}
-
-/// Runs the v2 evaluate pipeline over `bytes` into a fresh workspace.
-fn decode_evaluate_frame(bytes: &[u8]) -> EvaluateWorkspace {
-    let mut cursor = Cursor::new(bytes);
-    let header = read_frame_header(&mut cursor).unwrap().unwrap();
-    assert_eq!(header.kind, FrameKind::Evaluate);
-    let mut frame = FrameReader::new(&mut cursor, header.payload_len);
-    let plan = plan_evaluate(&mut frame).unwrap();
-    let mut workspace = EvaluateWorkspace::new();
-    workspace.reserve(&plan).unwrap();
-    decode_evaluate(&mut frame, &plan, &mut workspace).unwrap();
-    workspace
-}
-
-/// Runs the v2 products pipeline over `bytes` into a fresh workspace.
-fn decode_products_frame(bytes: &[u8]) -> ProductsWorkspace {
-    let mut cursor = Cursor::new(bytes);
-    let header = read_frame_header(&mut cursor).unwrap().unwrap();
-    assert_eq!(header.kind, FrameKind::Products);
-    let mut frame = FrameReader::new(&mut cursor, header.payload_len);
-    let plan = plan_products(&mut frame).unwrap();
-    let mut workspace = ProductsWorkspace::new();
-    workspace.reserve(&plan).unwrap();
-    decode_products(&mut frame, &plan, &mut workspace).unwrap();
-    workspace
 }
 
 fn le32(value: u32) -> Vec<u8> {
@@ -299,21 +207,18 @@ fn handshake_as_client<S: std::io::Read + std::io::Write>(
 #[test]
 fn upload_matrices_has_golden_v2_bytes() {
     let field = field();
-    let upload = MatrixUpload {
+    let upload = UploadFixture {
         params: PARAMS,
-        matrix: EncryptedMatrix::from_parts(
-            42,
-            2,
-            2,
-            vec![1, 2, 3, 4]
-                .into_iter()
-                .map(|value| field.element_u32(value))
-                .collect(),
-        )
-        .unwrap(),
+        instance_id: 42,
+        rows: 2,
+        columns: 2,
+        values: vec![1, 2, 3, 4]
+            .into_iter()
+            .map(|value| field.element_u32(value))
+            .collect(),
     };
     let mut buffer = Vec::new();
-    write_upload_views(&mut buffer, &[UploadMatrixView::from(&upload)]).unwrap();
+    write_upload_matrices(&mut buffer, &[upload.view()]).unwrap();
 
     // Header, list count, the 60-byte descriptor
     // {k, ell, b, lambda, instance_id, rows, columns}, then the four
@@ -335,7 +240,8 @@ fn upload_matrices_has_golden_v2_bytes() {
     assert_eq!(buffer, expected);
     assert_eq!(buffer.len(), 9 + 84);
 
-    let workspace = decode_upload_frame(&buffer);
+    let (workspace, payload_len) = read_upload_frame(&buffer).unwrap();
+    assert_eq!(payload_len, 84);
     let views = workspace.views();
     assert_eq!(views.len(), 1);
     let view = views.get(0).unwrap();
@@ -353,26 +259,23 @@ fn upload_matrices_has_golden_v2_bytes() {
 fn upload_matrices_round_trips_through_views() {
     let uploads = vec![upload(3, 4), upload(1, 16)];
     let buffer = encode_upload(&uploads);
-    let workspace = decode_upload_frame(&buffer);
+    let (workspace, payload_len) = read_upload_frame(&buffer).unwrap();
+    assert_eq!(payload_len, buffer.len() as u64 - 9);
     let views = workspace.views();
     assert_eq!(views.len(), uploads.len());
     for (index, expected) in uploads.iter().enumerate() {
         let view = views.get(index).unwrap();
         assert_eq!(view.params, expected.params);
-        assert_eq!(view.instance_id, expected.matrix.instance_id());
-        assert_eq!(view.rows, expected.matrix.rows());
-        assert_eq!(view.columns, expected.matrix.columns());
-        assert_eq!(view.values, expected.matrix.values());
+        assert_eq!(view.instance_id, expected.instance_id);
+        assert_eq!(view.rows, expected.rows);
+        assert_eq!(view.columns, expected.columns);
+        assert_eq!(view.values, expected.values.as_slice());
         assert_eq!(
             view.matrix().unwrap().values(),
-            expected.matrix.values(),
-            "the borrowed matrix ref matches the owned matrix"
+            expected.values.as_slice(),
+            "the borrowed matrix ref matches the fixture values"
         );
     }
-    // The owned adapter decodes the same frame to equal owned records.
-    let (decoded, payload_len) = read_upload_matrices(&mut Cursor::new(&buffer)).unwrap();
-    assert_eq!(decoded, uploads);
-    assert_eq!(payload_len, buffer.len() as u64 - 9);
 }
 
 #[test]
@@ -396,24 +299,24 @@ fn upload_accepted_has_golden_bytes_and_round_trips() {
 #[test]
 fn evaluate_has_golden_v2_bytes() {
     let field = field();
-    let entry = EvaluateEntry {
+    let entry = EvaluateFixture {
         matrix_id: 7,
         queries: vec![
-            EncryptedQuery::from_parts(
-                42,
-                0,
-                [10_u32, 11].map(|value| field.element_u32(value)).to_vec(),
-            ),
-            EncryptedQuery::from_parts(
-                42,
-                1,
-                [12_u32, 13].map(|value| field.element_u32(value)).to_vec(),
-            ),
+            QueryFixture {
+                instance_id: 42,
+                query_id: 0,
+                values: [10_u32, 11].map(|value| field.element_u32(value)).to_vec(),
+            },
+            QueryFixture {
+                instance_id: 42,
+                query_id: 1,
+                values: [12_u32, 13].map(|value| field.element_u32(value)).to_vec(),
+            },
         ],
     };
     let inputs = evaluate_inputs(&entry);
     let mut buffer = Vec::new();
-    write_evaluate_views(&mut buffer, &inputs).unwrap();
+    write_evaluate(&mut buffer, &inputs).unwrap();
 
     // Header, {entry count, total query count}, one entry descriptor
     // {matrix_id, query_count, query_width}, two query descriptors
@@ -436,7 +339,8 @@ fn evaluate_has_golden_v2_bytes() {
     assert_eq!(buffer, expected);
     assert_eq!(buffer.len(), 9 + 104);
 
-    let workspace = decode_evaluate_frame(&buffer);
+    let (workspace, payload_len) = read_evaluate_frame(&buffer).unwrap();
+    assert_eq!(payload_len, 104);
     let views = workspace.views();
     assert_eq!(views.len(), 1);
     let decoded = views.get(0).unwrap();
@@ -461,8 +365,9 @@ fn evaluate_round_trips_through_views() {
         second.queries.clear();
         second
     }];
-    let buffer = encode_evaluate(&entries.iter().collect::<Vec<_>>());
-    let workspace = decode_evaluate_frame(&buffer);
+    let buffer = encode_evaluate(&entries);
+    let (workspace, payload_len) = read_evaluate_frame(&buffer).unwrap();
+    assert_eq!(payload_len, buffer.len() as u64 - 9);
     let views = workspace.views();
     assert_eq!(views.len(), entries.len());
     let first = views.get(0).unwrap();
@@ -471,11 +376,11 @@ fn evaluate_round_trips_through_views() {
     assert_eq!(first.len(), 2);
     assert_eq!(
         first.query(0).unwrap().values(),
-        entries[0].queries[0].values()
+        entries[0].queries[0].values.as_slice()
     );
     assert_eq!(
         first.query(1).unwrap().values(),
-        entries[0].queries[1].values()
+        entries[0].queries[1].values.as_slice()
     );
     assert!(first.query(2).is_none());
     let second = views.get(1).unwrap();
@@ -483,31 +388,26 @@ fn evaluate_round_trips_through_views() {
     assert_eq!(second.query_width(), 0);
     assert_eq!(second.len(), 0);
     assert!(second.is_empty());
-
-    // The owned adapter decodes the same frame to equal owned records.
-    let (decoded, payload_len) = read_evaluate(&mut Cursor::new(&buffer)).unwrap();
-    assert_eq!(decoded, entries);
-    assert_eq!(payload_len, buffer.len() as u64 - 9);
 }
 
 #[test]
 fn products_has_golden_v2_bytes() {
     let field = field();
-    let entry = ProductEntry {
+    let entry = ProductFixture {
         matrix_id: 7,
-        answers: vec![AnswerMatrix::from_parts(
-            42,
-            3,
-            [5_u32, 6, 7, 8]
+        answers: vec![AnswerFixture {
+            instance_id: 42,
+            query_id: 3,
+            rows: 2,
+            blocks: 2,
+            values: [5_u32, 6, 7, 8]
                 .map(|value| field.element_u32(value))
                 .to_vec(),
-            2,
-            2,
-        )],
+        }],
     };
     let inputs = product_inputs(&entry);
     let mut buffer = Vec::new();
-    write_products_views(&mut buffer, &inputs).unwrap();
+    write_products(&mut buffer, &inputs).unwrap();
 
     // Header, {entry count, total answer count}, one 48-byte entry
     // descriptor {matrix_id, instance_id, rows, blocks, answer_count},
@@ -529,7 +429,8 @@ fn products_has_golden_v2_bytes() {
     assert_eq!(buffer, expected);
     assert_eq!(buffer.len(), 9 + 88);
 
-    let workspace = decode_products_frame(&buffer);
+    let (workspace, payload_len) = read_products_frame(&buffer).unwrap();
+    assert_eq!(payload_len, 88);
     let views = workspace.views();
     assert_eq!(views.len(), 1);
     let decoded = views.get(0).unwrap();
@@ -554,14 +455,17 @@ fn products_round_trips_through_views() {
     let entries = vec![product_entry(), {
         let mut second = product_entry();
         second.matrix_id = 9;
-        second
-            .answers
-            .push(AnswerMatrix::from_parts(42, 4, values(8), 4, 2));
+        second.answers.push(AnswerFixture {
+            instance_id: 42,
+            query_id: 4,
+            rows: 4,
+            blocks: 2,
+            values: values(8),
+        });
         second
     }];
-    let borrowed: Vec<&ProductEntry> = entries.iter().collect();
-    let buffer = encode_products(&borrowed);
-    let workspace = decode_products_frame(&buffer);
+    let buffer = encode_products(&entries);
+    let (workspace, _) = read_products_frame(&buffer).unwrap();
     let views = workspace.views();
     assert_eq!(views.len(), entries.len());
     for (index, entry) in views.iter().enumerate() {
@@ -569,15 +473,11 @@ fn products_round_trips_through_views() {
         assert_eq!(entry.len(), entries[index].answers.len());
         for (answer_index, answer) in entry.iter().enumerate() {
             let expected = &entries[index].answers[answer_index];
-            assert_eq!(answer.query_id(), expected.query_id());
-            assert_eq!(answer.instance_id(), expected.instance_id());
-            assert_eq!(answer.values(), expected.values());
+            assert_eq!(answer.query_id(), expected.query_id);
+            assert_eq!(answer.instance_id(), expected.instance_id);
+            assert_eq!(answer.values(), expected.values.as_slice());
         }
     }
-
-    // The owned adapter decodes the same frame to equal owned records.
-    let (decoded, _) = read_products(&mut Cursor::new(&buffer)).unwrap();
-    assert_eq!(decoded, entries);
 }
 
 #[test]
@@ -625,8 +525,7 @@ fn upload_accepted_rejects_zero_identifiers() {
 
 #[test]
 fn zero_answer_dimensions_are_rejected() {
-    let mut buffer = Vec::new();
-    write_products(&mut buffer, &[product_entry()]).unwrap();
+    let mut buffer = encode_products(&[product_entry()]);
     // Entry descriptor: matrix_id (8), instance_id (16), then rows at
     // 9 + 8 + 8 + 8 + 16 = 49, blocks at 57, answer_count at 65.
     let rows_offset = 9 + 8 + 8 + 8 + 16;
@@ -634,20 +533,19 @@ fn zero_answer_dimensions_are_rejected() {
     buffer[rows_offset + 8..rows_offset + 16].copy_from_slice(&0_u64.to_le_bytes());
     buffer[rows_offset + 16..rows_offset + 24].copy_from_slice(&0_u64.to_le_bytes());
     assert!(matches!(
-        read_products(&mut Cursor::new(&buffer)),
+        read_products_frame(&buffer),
         Err(CodecError::InvalidDimensions {
             name: "answer rows",
             value: 0
         })
     ));
 
-    let mut blocks_only = Vec::new();
-    write_products(&mut blocks_only, &[product_entry()]).unwrap();
+    let mut blocks_only = encode_products(&[product_entry()]);
     blocks_only[rows_offset..rows_offset + 8].copy_from_slice(&1_u64.to_le_bytes());
     blocks_only[rows_offset + 8..rows_offset + 16].copy_from_slice(&0_u64.to_le_bytes());
     blocks_only[rows_offset + 16..rows_offset + 24].copy_from_slice(&0_u64.to_le_bytes());
     assert!(matches!(
-        read_products(&mut Cursor::new(&blocks_only)),
+        read_products_frame(&blocks_only),
         Err(CodecError::InvalidDimensions {
             name: "answer blocks",
             value: 0
@@ -657,26 +555,24 @@ fn zero_answer_dimensions_are_rejected() {
 
 #[test]
 fn zero_matrix_dimensions_are_rejected() {
-    let mut buffer = Vec::new();
-    write_upload_matrices(&mut buffer, &[upload(2, 4)]).unwrap();
+    let mut buffer = encode_upload(&[upload(2, 4)]);
     // Descriptor: k, ell, b (8 each), lambda (4), instance_id (16), so
     // rows sit at 9 + 8 + 28 + 16 = 61 and columns trail by 8.
     let rows_offset = 9 + 8 + 28 + 16;
     buffer[rows_offset..rows_offset + 8].copy_from_slice(&0_u64.to_le_bytes());
     assert!(matches!(
-        read_upload_matrices(&mut Cursor::new(&buffer)),
+        read_upload_frame(&buffer),
         Err(CodecError::InvalidDimensions {
             name: "matrix rows",
             value: 0
         })
     ));
 
-    let mut columns_only = Vec::new();
-    write_upload_matrices(&mut columns_only, &[upload(2, 4)]).unwrap();
+    let mut columns_only = encode_upload(&[upload(2, 4)]);
     columns_only[rows_offset..rows_offset + 8].copy_from_slice(&1_u64.to_le_bytes());
     columns_only[rows_offset + 8..rows_offset + 16].copy_from_slice(&0_u64.to_le_bytes());
     assert!(matches!(
-        read_upload_matrices(&mut Cursor::new(&columns_only)),
+        read_upload_frame(&columns_only),
         Err(CodecError::InvalidDimensions {
             name: "matrix columns",
             value: 0
@@ -687,10 +583,8 @@ fn zero_matrix_dimensions_are_rejected() {
 #[test]
 fn empty_message_lists_round_trip() {
     let buffer = encode_upload(&[]);
-    let workspace = decode_upload_frame(&buffer);
+    let (workspace, _) = read_upload_frame(&buffer).unwrap();
     assert!(workspace.views().is_empty());
-    let (decoded, _) = read_upload_matrices(&mut Cursor::new(&buffer)).unwrap();
-    assert!(decoded.is_empty());
 
     let mut accepted = Vec::new();
     write_upload_accepted(&mut accepted, &[]).unwrap();
@@ -719,12 +613,11 @@ fn partial_header_is_truncated() {
 
 #[test]
 fn truncated_payload_is_detected_before_the_next_frame() {
-    let mut buffer = Vec::new();
-    write_evaluate(&mut buffer, &[evaluate_entry()]).unwrap();
+    let mut buffer = encode_evaluate(&[evaluate_entry()]);
     buffer.pop();
     buffer.pop();
     assert!(matches!(
-        read_evaluate(&mut Cursor::new(&buffer)),
+        read_evaluate_frame(&buffer),
         Err(CodecError::TruncatedFrame)
     ));
 }
@@ -745,14 +638,13 @@ fn trailing_payload_bytes_are_detected() {
 
 #[test]
 fn noncanonical_field_elements_are_rejected() {
-    let mut buffer = Vec::new();
-    write_upload_matrices(&mut buffer, &[upload(1, 4)]).unwrap();
+    let mut buffer = encode_upload(&[upload(1, 4)]);
     // The first element's canonical bytes sit at 9 + 8 + 60: the v2
     // descriptor table replaces v1's fixed prefix.
     let first_element = 9 + 8 + 60;
     buffer[first_element..first_element + 4].copy_from_slice(&u32::MAX.to_le_bytes());
     assert!(matches!(
-        read_upload_matrices(&mut Cursor::new(&buffer)),
+        read_upload_frame(&buffer),
         Err(CodecError::NonCanonicalField { value: u32::MAX })
     ));
 }
@@ -761,21 +653,19 @@ fn noncanonical_field_elements_are_rejected() {
 fn derived_value_lengths_must_match_the_payload_exactly() {
     // Inflating a matrix's rows grows the derived value region beyond the
     // declared payload: a truncation, caught at plan time.
-    let mut inflated = Vec::new();
-    write_upload_matrices(&mut inflated, &[upload(2, 4)]).unwrap();
+    let mut inflated = encode_upload(&[upload(2, 4)]);
     let rows_offset = 9 + 8 + 28 + 16;
     inflated[rows_offset..rows_offset + 8].copy_from_slice(&3_u64.to_le_bytes());
     assert!(matches!(
-        read_upload_matrices(&mut Cursor::new(&inflated)),
+        read_upload_frame(&inflated),
         Err(CodecError::TruncatedFrame)
     ));
 
     // Deflating them leaves payload bytes unconsumed: trailing bytes.
-    let mut deflated = Vec::new();
-    write_upload_matrices(&mut deflated, &[upload(2, 4)]).unwrap();
+    let mut deflated = encode_upload(&[upload(2, 4)]);
     deflated[rows_offset..rows_offset + 8].copy_from_slice(&1_u64.to_le_bytes());
     assert!(matches!(
-        read_upload_matrices(&mut Cursor::new(&deflated)),
+        read_upload_frame(&deflated),
         Err(CodecError::TrailingFrameBytes { extra: 16 })
     ));
 }
@@ -784,12 +674,11 @@ fn derived_value_lengths_must_match_the_payload_exactly() {
 fn summary_counts_must_match_descriptor_tables() {
     // Inflating the evaluate summary's total query count contradicts the
     // single per-entry count.
-    let mut evaluate = Vec::new();
-    write_evaluate(&mut evaluate, &[evaluate_entry()]).unwrap();
+    let mut evaluate = encode_evaluate(&[evaluate_entry()]);
     let total_offset = 9 + 8;
     evaluate[total_offset..total_offset + 8].copy_from_slice(&3_u64.to_le_bytes());
     assert!(matches!(
-        read_evaluate(&mut Cursor::new(&evaluate)),
+        read_evaluate_frame(&evaluate),
         Err(CodecError::CountMismatch {
             name: "query count",
             expected: 3,
@@ -798,11 +687,10 @@ fn summary_counts_must_match_descriptor_tables() {
     ));
 
     // The same for products' total answer count.
-    let mut products = Vec::new();
-    write_products(&mut products, &[product_entry()]).unwrap();
+    let mut products = encode_products(&[product_entry()]);
     products[total_offset..total_offset + 8].copy_from_slice(&2_u64.to_le_bytes());
     assert!(matches!(
-        read_products(&mut Cursor::new(&products)),
+        read_products_frame(&products),
         Err(CodecError::CountMismatch {
             name: "answer count",
             expected: 2,
@@ -919,7 +807,7 @@ fn wrong_frame_kinds_are_unexpected() {
     let mut buffer = Vec::new();
     write_upload_accepted(&mut buffer, &[1]).unwrap();
     assert!(matches!(
-        read_upload_matrices(&mut Cursor::new(&buffer)),
+        read_upload_frame(&buffer),
         Err(CodecError::UnexpectedFrame {
             expected: FrameKind::UploadMatrices,
             actual: 2
@@ -971,20 +859,13 @@ fn error_codes_map_to_themselves() {
 }
 
 #[test]
-fn read_field_slice_into_matches_read_field_slice() {
+fn read_field_slice_into_round_trips_canonical_words() {
     use emvp_network::write_field_slice;
 
     for count in [1, 10, 4095, 4096, 4097, 5000] {
         let source = values(count);
         let mut encoded = Vec::new();
         write_field_slice(&mut encoded, &source).unwrap();
-
-        let mut cursor = Cursor::new(&encoded);
-        let mut frame = FrameReader::new(&mut cursor, encoded.len() as u64);
-        let allocated = frame
-            .read_field_slice(u64::try_from(count).unwrap())
-            .unwrap();
-        assert_eq!(allocated, source);
 
         let zero = PrimeField::<PROTOCOL_MODULUS>::new().element_u32(0);
         let mut destination = vec![zero; count];
@@ -1032,13 +913,12 @@ fn workspaces_reuse_capacity_across_frames() {
     let two_queries = evaluate_entry();
     let mut one_query = evaluate_entry();
     one_query.queries.pop();
-    let big = encode_evaluate(&[&two_queries]);
-    let small = encode_evaluate(&[&one_query]);
+    let big = encode_evaluate(&[two_queries]);
+    let small = encode_evaluate(&[one_query]);
     let mut workspace = EvaluateWorkspace::new();
     let decode = |bytes: &[u8], workspace: &mut EvaluateWorkspace| {
         let mut cursor = Cursor::new(bytes);
-        let header = read_frame_header(&mut cursor).unwrap().unwrap();
-        let mut frame = FrameReader::new(&mut cursor, header.payload_len);
+        let (mut frame, _) = open_frame(&mut cursor, FrameKind::Evaluate).unwrap();
         let plan = plan_evaluate(&mut frame).unwrap();
         workspace.reserve(&plan).unwrap();
         decode_evaluate(&mut frame, &plan, workspace).unwrap();
@@ -1063,16 +943,19 @@ fn workspaces_reuse_capacity_across_frames() {
     // Products: one answer, then two.
     let one_answer = product_entry();
     let mut two_answers = product_entry();
-    two_answers
-        .answers
-        .push(AnswerMatrix::from_parts(42, 4, values(8), 4, 2));
-    let small = encode_products(&[&one_answer]);
-    let big = encode_products(&[&two_answers]);
+    two_answers.answers.push(AnswerFixture {
+        instance_id: 42,
+        query_id: 4,
+        rows: 4,
+        blocks: 2,
+        values: values(8),
+    });
+    let small = encode_products(&[one_answer]);
+    let big = encode_products(&[two_answers]);
     let mut workspace = ProductsWorkspace::new();
     let decode = |bytes: &[u8], workspace: &mut ProductsWorkspace| {
         let mut cursor = Cursor::new(bytes);
-        let header = read_frame_header(&mut cursor).unwrap().unwrap();
-        let mut frame = FrameReader::new(&mut cursor, header.payload_len);
+        let (mut frame, _) = open_frame(&mut cursor, FrameKind::Products).unwrap();
         let plan = plan_products(&mut frame).unwrap();
         workspace.reserve(&plan).unwrap();
         decode_products(&mut frame, &plan, workspace).unwrap();
@@ -1126,7 +1009,7 @@ fn second_upload_cycle_is_allocation_free() {
         workspace.reserve(&plan).unwrap();
         let views = decode_upload(&mut frame, &plan, &mut workspace).unwrap();
         let view = views.get(0).unwrap();
-        write_upload_views(sink, &[view]).unwrap();
+        write_upload_matrices(sink, &[view]).unwrap();
     });
     assert_eq!(info.count_total, 0);
     assert_eq!(sink.len(), buffer.len());
@@ -1139,7 +1022,7 @@ fn second_evaluate_cycle_is_allocation_free() {
     let mut buffer = Vec::new();
     {
         let inputs = evaluate_inputs(&entry);
-        write_evaluate_views(&mut buffer, &inputs).unwrap();
+        write_evaluate(&mut buffer, &inputs).unwrap();
     }
     let payload_len = buffer.len() as u64 - 9;
 
@@ -1168,7 +1051,7 @@ fn second_evaluate_cycle_is_allocation_free() {
             matrix_id: decoded.matrix_id(),
             queries: &queries,
         }];
-        write_evaluate_views(sink, &inputs).unwrap();
+        write_evaluate(sink, &inputs).unwrap();
     });
     assert_eq!(info.count_total, 0);
     assert_eq!(sink.len(), buffer.len());
@@ -1181,7 +1064,7 @@ fn second_products_cycle_is_allocation_free() {
     let mut buffer = Vec::new();
     {
         let inputs = product_inputs(&entry);
-        write_products_views(&mut buffer, &inputs).unwrap();
+        write_products(&mut buffer, &inputs).unwrap();
     }
     let payload_len = buffer.len() as u64 - 9;
 
@@ -1212,7 +1095,7 @@ fn second_products_cycle_is_allocation_free() {
             blocks: decoded.blocks(),
             answers: &answers,
         }];
-        write_products_views(sink, &inputs).unwrap();
+        write_products(sink, &inputs).unwrap();
     });
     assert_eq!(info.count_total, 0);
     assert_eq!(sink.len(), buffer.len());
@@ -1227,10 +1110,10 @@ fn upload_accepted_workspace_round_trips() {
     let header = read_frame_header(&mut cursor).unwrap().unwrap();
     assert_eq!(header.kind, FrameKind::UploadAccepted);
     let mut frame = FrameReader::new(&mut cursor, header.payload_len);
-    let plan = emvp_network::v2::plan_upload_accepted(&mut frame).unwrap();
+    let plan = plan_upload_accepted(&mut frame).unwrap();
     let mut workspace = UploadAcceptedWorkspace::new();
     workspace.reserve(&plan).unwrap();
-    let identifiers = emvp_network::v2::decode_upload_accepted(&mut frame, &plan, &mut workspace);
+    let identifiers = decode_upload_accepted(&mut frame, &plan, &mut workspace);
     assert_eq!(identifiers.unwrap(), &[5, 6]);
     assert_eq!(workspace.identifiers(), &[5, 6]);
 }

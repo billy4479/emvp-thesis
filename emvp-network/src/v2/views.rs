@@ -11,8 +11,7 @@
 use emvp::{AnswerRef, EmvpParams, EncryptedMatrixRef, EncryptedQueryRef, ProtocolError};
 
 use crate::frame::{Field, PROTOCOL_MODULUS};
-use crate::messages::MatrixUpload;
-use crate::v2::plan::{EvaluateEntryMeta, EvaluateQueryMeta, ProductEntryMeta, UploadMatrixMeta};
+use crate::v2::plan::{EvaluateEntryMeta, EvaluateQueryMeta, ProductsEntryMeta, UploadMatrixMeta};
 use crate::v2::workspace::{EvaluateWorkspace, ProductsWorkspace, UploadWorkspace};
 
 /// One uploaded encrypted matrix, viewed generically.
@@ -44,18 +43,6 @@ impl<'a> UploadMatrixView<'a> {
     /// by a validated decode never triggers.
     pub fn matrix(&self) -> Result<EncryptedMatrixRef<'a, PROTOCOL_MODULUS>, ProtocolError> {
         EncryptedMatrixRef::new(self.instance_id, self.rows, self.columns, self.values)
-    }
-}
-
-impl<'a> From<&'a MatrixUpload> for UploadMatrixView<'a> {
-    fn from(upload: &'a MatrixUpload) -> Self {
-        Self {
-            params: upload.params,
-            instance_id: upload.matrix.instance_id(),
-            rows: upload.matrix.rows(),
-            columns: upload.matrix.columns(),
-            values: upload.matrix.values(),
-        }
     }
 }
 
@@ -424,8 +411,8 @@ impl<'a> ProductsViews<'a> {
 
     /// Iterates the entries in wire order.
     #[must_use]
-    pub const fn iter(&self) -> ProductEntryIter<'a> {
-        ProductEntryIter {
+    pub const fn iter(&self) -> ProductsEntryIter<'a> {
+        ProductsEntryIter {
             views: *self,
             index: 0,
         }
@@ -434,7 +421,7 @@ impl<'a> ProductsViews<'a> {
 
 impl<'a> IntoIterator for ProductsViews<'a> {
     type Item = ProductEntryView<'a>;
-    type IntoIter = ProductEntryIter<'a>;
+    type IntoIter = ProductsEntryIter<'a>;
 
     fn into_iter(self) -> Self::IntoIter {
         self.iter()
@@ -443,7 +430,7 @@ impl<'a> IntoIterator for ProductsViews<'a> {
 
 impl<'a> IntoIterator for &ProductsViews<'a> {
     type Item = ProductEntryView<'a>;
-    type IntoIter = ProductEntryIter<'a>;
+    type IntoIter = ProductsEntryIter<'a>;
 
     fn into_iter(self) -> Self::IntoIter {
         self.iter()
@@ -452,12 +439,12 @@ impl<'a> IntoIterator for &ProductsViews<'a> {
 
 /// An owning iterator over [`ProductsViews`].
 #[derive(Clone, Debug)]
-pub struct ProductEntryIter<'a> {
+pub struct ProductsEntryIter<'a> {
     views: ProductsViews<'a>,
     index: usize,
 }
 
-impl<'a> Iterator for ProductEntryIter<'a> {
+impl<'a> Iterator for ProductsEntryIter<'a> {
     type Item = ProductEntryView<'a>;
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -472,14 +459,14 @@ impl<'a> Iterator for ProductEntryIter<'a> {
     }
 }
 
-impl ExactSizeIterator for ProductEntryIter<'_> {}
+impl ExactSizeIterator for ProductsEntryIter<'_> {}
 
 /// One decoded product entry, borrowing the workspace arena. Answer refs
 /// are constructed lazily on access and paired positionally with the
 /// entry's query-id descriptors.
 #[derive(Clone, Copy, Debug)]
 pub struct ProductEntryView<'a> {
-    meta: &'a ProductEntryMeta,
+    meta: &'a ProductsEntryMeta,
     query_ids: &'a [u64],
     arena: &'a [Field],
 }

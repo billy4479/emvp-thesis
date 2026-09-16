@@ -240,43 +240,13 @@ impl<'a, R: Read> FrameReader<'a, R> {
         Ok(u128::from_le_bytes(buffer))
     }
 
-    /// Reads `count` canonical field elements in bounded chunks.
-    ///
-    /// The frame's remaining length is checked before any allocation, so a
-    /// declared element count the payload cannot hold is rejected without
-    /// reserving memory; a count the payload claims to hold but the host
-    /// cannot buffer surfaces as [`CodecError::AllocationFailed`].
-    ///
-    /// # Errors
-    ///
-    /// Returns [`CodecError::TruncatedFrame`] when the payload cannot hold
-    /// `count` elements, [`CodecError::AllocationFailed`] when the buffer
-    /// cannot be reserved, [`CodecError::NonCanonicalField`] for an encoded
-    /// integer at or above the modulus, and [`CodecError::Io`] for
-    /// transport failures.
-    pub fn read_field_slice(&mut self, count: u64) -> Result<Vec<Field>, CodecError> {
-        let field_bytes = field_byte_len(count)?;
-        if field_bytes > self.remaining {
-            return Err(CodecError::TruncatedFrame);
-        }
-        let count = usize::try_from(count).map_err(|_conversion| CodecError::AllocationFailed)?;
-        let mut values = Vec::new();
-        values
-            .try_reserve_exact(count)
-            .map_err(|_reserve| CodecError::AllocationFailed)?;
-        let zero = PrimeField::<PROTOCOL_MODULUS>::new().element_u32(0);
-        values.resize(count, zero);
-        self.read_field_slice_into(&mut values)?;
-        Ok(values)
-    }
-
     /// Reads exactly `values.len()` canonical field elements into `values`
     /// in bounded chunks.
     ///
-    /// This is the allocation-free form of [`Self::read_field_slice`]: the
-    /// destination is caller-provided, so decoding only stages bytes
-    /// through a fixed stack chunk. The frame's remaining length is checked
-    /// before any byte is read.
+    /// The destination is caller-provided, so decoding only stages bytes
+    /// through a fixed stack chunk and the reservation is the caller's,
+    /// made ahead of the decode through a workspace `reserve` step. The
+    /// frame's remaining length is checked before any byte is read.
     ///
     /// # Errors
     ///
