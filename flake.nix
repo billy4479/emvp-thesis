@@ -80,14 +80,17 @@
         # assertion fails the build. The raw handout directory is used as
         # source since cleanTypstSource only keeps files reachable from the
         # handout entry point.
-        bibliographyTestsDrv = typixLib.buildTypstProject ((builtins.removeAttrs handoutArgs [
-          "src"
-        ]) // {
-          src = ./handout;
-          pname = "bibliography-tests";
-          typstSource = "lib/bibliography-tests.typ";
-          typstOutput = "bibliography-tests.pdf";
-        });
+        bibliographyTestsDrv = typixLib.buildTypstProject (
+          (builtins.removeAttrs handoutArgs [
+            "src"
+          ])
+          // {
+            src = ./handout;
+            pname = "bibliography-tests";
+            typstSource = "lib/bibliography-tests.typ";
+            typstOutput = "bibliography-tests.pdf";
+          }
+        );
       in
       {
         packages = rec {
@@ -137,6 +140,8 @@
               tinymist
               typst
               handoutWatchScript
+
+              svgo
             ];
 
             # Cargo-built binaries dlopen libvulkan.so.1 at runtime, so the
