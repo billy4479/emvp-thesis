@@ -63,3 +63,8 @@ required-features = ["gpu"]
 name = "answer_throughput"
 harness = false
 required-features = ["gpu"]
+
+[[bench]]
+name = "gpu_phase_sweep"
+harness = false
+required-features = ["gpu"]
