@@ -10,8 +10,8 @@ use criterion::{
     measurement::WallTime,
 };
 use emvp::{
-    AnswerMatrix, EmvpParams, SecretKey, answer_batch, answer_into, decode_into, encrypt, query,
-    query_batch, search,
+    AnswerMatrix, AnswerPlan, AnswerWorkspace, EmvpParams, SecretKey, answer_into, decode_into,
+    encrypt, execute_answer_batch, query, query_batch, search,
 };
 use prime_field_layer::{FieldElement, PrimeField};
 use rayon::{ThreadPool, prelude::*};
@@ -235,8 +235,11 @@ fn bench_answer(
 }
 
 // The batched server answer answers `batch` queries against one encrypted
-// matrix, allocating one output arena per iteration and parallelizing the
-// flattened (query, row) grid internally.
+// matrix through the plan-reserve-execute path: the plan fixes the CPU
+// tier from a snapshot of the pinned pool, the workspace is reserved once
+// per case, and every iteration executes the plan into the reused
+// workspace, parallelizing the flattened (query, row) grid internally
+// without allocating.
 fn bench_answer_batch(
     group: &mut BenchmarkGroup<'_, WallTime>,
     tag: &str,
@@ -246,19 +249,17 @@ fn bench_answer_batch(
     pool: &ThreadPool,
 ) {
     let (encrypted, queries, _decoding_keys) = protocol_fixtures_batch(params, rows, batch);
+    let plan = pool.install(|| AnswerPlan::plan(&params, &encrypted, &queries).unwrap());
+    let mut workspace = AnswerWorkspace::new();
+    workspace.reserve(&plan).unwrap();
     group.throughput(elements(batch * rows * params.n().unwrap()));
     group.bench_function(
         BenchmarkId::new(format!("batch{batch}"), bench_parameter(tag, rows)),
         |b| {
             b.iter(|| {
                 pool.install(|| {
-                    answer_batch(
-                        black_box(&params),
-                        black_box(&encrypted),
-                        black_box(&queries),
-                    )
-                })
-                .unwrap();
+                    execute_answer_batch(black_box(&plan), &mut workspace).unwrap();
+                });
             });
         },
     );

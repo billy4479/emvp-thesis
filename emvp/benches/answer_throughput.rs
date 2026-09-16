@@ -17,26 +17,34 @@
 //! on one [`AnswerEngine`] with the same `search(4096, 128)` protocol
 //! parameters the `gpu` and `dispatch` suites use, so the codeword width
 //! `n = 2k` is shared across the three suites. The preparation, the
-//! maximum query set of 2048 encrypted queries, and the device upload all
-//! happen strictly outside timing. Every measured iteration is exactly one
-//! [`AnswerEngine::answer_many`] call with exactly one [`AnswerJob`]
-//! holding `queries[..batch]`, sweeping the batch size over the powers of
-//! two 1..=2048: the many-products-against-one-matrix serving pattern.
+//! maximum query set of 2048 encrypted queries, the per-case plan
+//! ([`AnswerEngine::plan`]), and the workspace reservation
+//! ([`EngineWorkspace::reserve`]) all happen strictly outside timing.
+//! Every measured iteration is exactly one [`AnswerEngine::execute`] of
+//! that plan into the case's reused [`EngineWorkspace`]: the returned
+//! answers view is dropped each iteration while the arena stays reserved,
+//! which is the point — the steady-state plan-reserve-execute serving
+//! cycle. The batch size sweeps the powers of two 1..=2048, the
+//! many-products-against-one-matrix pattern.
 //!
 //! Every case clears [`MIN_GPU_MULTIPLICATIONS`] on its own (a single
 //! query against this matrix already costs `rows * n` estimated field
-//! multiplications), so the fixed dispatch policy sends every case to the
-//! device; this is asserted from the engine report before timing,
-//! together with the batch answer count. [`Throughput::Elements`] counts
-//! the batch, so Criterion's element/s figure is matrix-vector products
-//! per second, directly.
+//! multiplications), so the fixed dispatch policy plans every case on the
+//! device; this is asserted from the plan and the execute report before
+//! timing, together with the batch answer count. [`Throughput::Elements`]
+//! counts the batch, so Criterion's element/s figure is matrix-vector
+//! products per second, directly.
 //!
-//! Per case the gate call's packed byte accounting is printed: the packed
-//! query buffer, the packed output buffer, and the transient packed
+//! Per case the gate execution's packed byte accounting is printed: the
+//! packed query buffer, the packed output buffer, and the transient packed
 //! scratch, which is the output buffer plus its equal-sized readback
 //! staging copy, roughly `query + 2 * output` per call. The engine leases
 //! these buffers per call and keeps their capacity warm across
-//! iterations.
+//! iterations. The same gate execution doubles as the warm-up for a
+//! steady-state allocation spot check: one
+//! [`allocation_counter::measure`] instrumented execute whose total
+//! allocation count is printed per case (the counter is thread-local, so
+//! it covers the calling thread's allocator traffic).
 //!
 //! Under `--features bench-quick` only the Criterion timing shortens:
 //! the shapes and the batch sweep are pinned and cannot shrink. Without a
@@ -71,7 +79,7 @@ use criterion::{
     BenchmarkGroup, BenchmarkId, Criterion, criterion_group, criterion_main, measurement::WallTime,
 };
 use emvp::{
-    AnswerBackend, AnswerEngine, AnswerJob, EncryptedQuery, GpuAnswerer, GpuError,
+    AnswerBackend, AnswerEngine, AnswerJob, EncryptedQuery, EngineWorkspace, GpuAnswerer, GpuError,
     MIN_GPU_MULTIPLICATIONS, PreparedMatrix, search,
 };
 
@@ -176,23 +184,53 @@ fn setup() -> Option<SuiteContext> {
     })
 }
 
-/// Times one batch size: exactly one [`AnswerJob`] per iteration, after
-/// the report gate has passed.
+/// Plans one batch size, reserves the case workspace once, and times
+/// exactly one [`AnswerEngine::execute`] per iteration, after the report
+/// gate has passed.
 fn bench_case(group: &mut BenchmarkGroup<'_, WallTime>, context: &SuiteContext, batch: usize) {
     let n = context.n;
+    // The jobs slice, the plan, and the workspace are built once per case,
+    // strictly outside timing; the plan borrows them, so every measured
+    // iteration executes against exactly these inputs.
     let jobs = [AnswerJob {
         matrix: &context.prepared,
         queries: &context.queries[..batch],
     }];
-    // Report gate, strictly before timing: the engine must select the GPU
+    // Report gate, strictly before timing: the engine must plan the GPU
     // tier for the case and output one answer per query.
-    let (answers, report) = context.engine.answer_many_with_report(&jobs).unwrap();
-    assert_eq!(answers.len(), 1);
+    let plan = context.engine.plan(&jobs).unwrap();
+    assert_eq!(plan.len(), 1);
+    let entry = plan.entry(0).unwrap();
     assert_eq!(
-        answers[0].len(),
+        entry.backend(),
+        AnswerBackend::Gpu,
+        "the fixed dispatch policy must select the GPU tier for the case"
+    );
+    assert_eq!(
+        entry.shape().queries(),
         batch,
         "the engine must output one answer per query"
     );
+    assert_eq!(
+        entry.multiplications(),
+        batch * MATRIX_ROWS * n,
+        "engine work accounting diverges from the batch estimate"
+    );
+    // The case workspace: created and reserved once, then reused by every
+    // measured iteration. The gate execution below doubles as the warm-up
+    // that fills the workspace's scratch pool and the device buffer pool.
+    let mut workspace = EngineWorkspace::new();
+    workspace.reserve(&plan).unwrap();
+    let report = {
+        let (answers, report) = context.engine.execute(&plan, &mut workspace).unwrap();
+        assert_eq!(answers.len(), 1);
+        assert_eq!(
+            answers.entry_answers(0).unwrap().shape().queries(),
+            batch,
+            "the engine must output one answer per query"
+        );
+        report
+    };
     assert_eq!(
         report.gpu_entries, 1,
         "the fixed dispatch policy must select the GPU tier for the case"
@@ -201,20 +239,7 @@ fn bench_case(group: &mut BenchmarkGroup<'_, WallTime>, context: &SuiteContext, 
         report.cpu_entries, 0,
         "no case may fall back to the CPU tier"
     );
-    assert!(
-        report
-            .entries
-            .iter()
-            .all(|entry| entry.backend == AnswerBackend::Gpu),
-        "every entry must run on the device path"
-    );
-    assert_eq!(
-        report.multiplications,
-        batch * MATRIX_ROWS * n,
-        "engine work accounting diverges from the batch estimate"
-    );
-    drop(answers);
-    // Packed per-case byte accounting from the gate call (includes
+    // Packed per-case byte accounting from the gate execution (includes
     // alignment gaps): the packed query buffer, the packed output buffer,
     // and the transient scratch = output plus its equal-sized readback
     // staging copy.
@@ -231,10 +256,24 @@ fn bench_case(group: &mut BenchmarkGroup<'_, WallTime>, context: &SuiteContext, 
         transient_bytes,
         mib(transient_bytes),
     );
+    // Steady-state allocation spot check, after the warm-up: a planned
+    // execute into the reserved workspace should not allocate. The count
+    // is informational and printed once per case, outside timing.
+    let allocations = allocation_counter::measure(|| {
+        let _answers = context.engine.execute(&plan, &mut workspace).unwrap();
+    });
+    println!(
+        "case batch{batch}: steady-state execute allocations (count_total) = {}",
+        allocations.count_total
+    );
     // Elements counts matrix-vector products, so element/s is MVP/s.
     group.throughput(elements(batch));
     group.bench_function(BenchmarkId::new("batch", batch), |b| {
-        b.iter(|| context.engine.answer_many(&jobs).unwrap());
+        b.iter(|| {
+            // The answers view is dropped here; the workspace's arena
+            // stays reserved for the next iteration.
+            let _answers = context.engine.execute(&plan, &mut workspace).unwrap();
+        });
     });
 }
 

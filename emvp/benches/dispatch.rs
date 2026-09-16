@@ -11,9 +11,16 @@
 //!
 //! This suite calibrates the workload size (in field multiplications,
 //! `batch * rows * n` for the fixed parameter set) at which the device
-//! answer path starts beating the CPU `answer_batch`, so the result can
+//! answer path starts beating the CPU answer path, so the result can
 //! become the hard-coded `MIN_GPU_MULTIPLICATIONS` dispatch threshold.
-//! The fixed parameter set, shared fixture construction
+//! Both tiers run the plan → reserve → execute answer path with one
+//! case-owned workspace reserved before timing, so every measured
+//! iteration is the steady-state no-allocation cycle: the GPU tier through
+//! [`GpuAnswerer::answer_batch_plan`] plus
+//! [`GpuAnswerer::execute_answer_batch_into`], the CPU tier through
+//! [`AnswerPlan::plan`] (planned on the shared pinned pool, which fixes
+//! its serial-or-rayon tier) plus [`execute_answer_batch`]. The fixed
+//! parameter set, shared fixture construction
 //! (`benches/common::protocol_fixtures_batch`), and the shared pinned
 //! eight-thread CPU pool (`benches/common::benchmark_pool`) match
 //! `benches/gpu.rs` exactly, so CPU and GPU rows are directly comparable
@@ -21,8 +28,8 @@
 //! sweeping work from 2^16 up to 2^24 estimated field multiplications.
 //! Fixture construction (derive + encrypt + queries) and the one-time
 //! matrix upload happen before timing; every measured iteration is one
-//! full `answer_batch` on either path. Without a compute adapter the
-//! binary prints a notice and benchmarks nothing.
+//! full batch answer on either path. Without a compute adapter the binary
+//! prints a notice and benchmarks nothing.
 //!
 //! # Case IDs and filters
 //!
@@ -55,7 +62,7 @@
 use std::time::Duration;
 
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
-use emvp::{GpuAnswerer, GpuError, answer_batch, search};
+use emvp::{AnswerPlan, AnswerWorkspace, GpuAnswerer, GpuError, execute_answer_batch, search};
 
 mod common;
 
@@ -121,20 +128,44 @@ fn dispatch_benches(c: &mut Criterion) {
         let gpu_matrix = answerer.upload_matrix(&params, &encrypted).unwrap();
         let elements = u64::try_from(batch * rows * params.n().unwrap()).unwrap();
         group.throughput(Throughput::Elements(elements));
+        // GPU tier: plan once, reserve a case-owned workspace once, then
+        // execute into it every iteration. The host matrix plans the arena
+        // (the shape arithmetic is identical on both tiers).
+        let gpu_shape = answerer.answer_batch_plan(&gpu_matrix, &queries).unwrap();
+        let host_plan = pool.install(|| AnswerPlan::plan(&params, &encrypted, &queries).unwrap());
+        assert_eq!(gpu_shape, host_plan.shape(), "tier shapes must agree");
+        let mut gpu_workspace = AnswerWorkspace::new();
+        gpu_workspace.reserve(&host_plan).unwrap();
         group.bench_function(
             BenchmarkId::new("gpu", format!("batch{batch}-rows{rows}")),
             |b| {
-                b.iter(|| answerer.answer_batch(&gpu_matrix, &queries).unwrap());
+                b.iter(|| {
+                    // The answers view is dropped here; the workspace's
+                    // arena stays reserved for the next iteration.
+                    let _answers = answerer
+                        .execute_answer_batch_into(&gpu_matrix, &queries, &mut gpu_workspace)
+                        .unwrap();
+                });
             },
         );
         drop(gpu_matrix);
-        // CPU reference on the shared pinned eight-thread pool; small-row
-        // shapes under the parallel thresholds exercise the serial CPU
-        // tier, the rest the parallel tier.
+        // CPU reference on the shared pinned eight-thread pool, through the
+        // same plan-reserve-execute path: the plan fixes the serial or
+        // rayon tier from a pool snapshot, the workspace is reserved once
+        // and reused; small-row shapes under the parallel thresholds plan
+        // the serial CPU tier, the rest the parallel tier.
+        let cpu_plan = pool.install(|| AnswerPlan::plan(&params, &encrypted, &queries).unwrap());
+        let mut cpu_workspace = AnswerWorkspace::new();
+        cpu_workspace.reserve(&cpu_plan).unwrap();
         group.bench_function(
             BenchmarkId::new("cpu", format!("batch{batch}-rows{rows}")),
             |b| {
-                b.iter(|| pool.install(|| answer_batch(&params, &encrypted, &queries).unwrap()));
+                b.iter(|| {
+                    // The answers view is dropped here; the workspace's
+                    // arena stays reserved for the next iteration.
+                    let _answers = pool
+                        .install(|| execute_answer_batch(&cpu_plan, &mut cpu_workspace).unwrap());
+                });
             },
         );
     }

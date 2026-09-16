@@ -12,21 +12,27 @@
 //! # Fairness contract
 //!
 //! CPU and GPU answer the same batch of the same queries against the same
-//! encrypted-matrix fixture through the same batched API: one
-//! `answer_batch` call with a single query per measured iteration, over
+//! encrypted-matrix fixture through the same plan → reserve → execute
+//! batched API: one planned single-query batch executed per measured
+//! iteration into a case-owned workspace reserved before timing, over
 //! the `ell in {4096, 8192}` suites and `rows in {4096, 8192, 16384}`
-//! matrix heights. The CPU side runs on the shared pinned eight-thread
-//! pool (`benches/common::benchmark_pool`), the same size the protocol
-//! suite pins; the CPU numbers are therefore comparable with the saved
-//! protocol `answer_batch` baselines, but they are a different case from
-//! the protocol suite's single-query `answer_into` `answer` cases, so
-//! neither replaces the other in the tables. The parameter suites and
-//! fixtures are the shared ones from `benches/common`, so GPU and CPU rows
-//! here are directly comparable with each other. Fixture construction
-//! (derive + encrypt) and the one-time matrix upload happen before timing;
-//! the largest shape uploads a 1 GiB encrypted matrix, which fits the
-//! 6 GiB reference card together with its staging buffer. Without a compute
-//! adapter the binary prints a notice and benchmarks nothing.
+//! matrix heights. The GPU tier plans through
+//! [`GpuAnswerer::answer_batch_plan`] and executes through
+//! [`GpuAnswerer::execute_answer_batch_into`]; the CPU tier plans through
+//! [`AnswerPlan::plan`] on the shared pinned eight-thread pool
+//! (`benches/common::benchmark_pool`, the same size the protocol suite
+//! pins, which also fixes each plan's serial-or-rayon tier) and executes
+//! through [`execute_answer_batch`], so the CPU numbers are comparable
+//! with the saved protocol batched-answer baselines, but they are a
+//! different case from the protocol suite's single-query `answer_into`
+//! `answer` cases, so neither replaces the other in the tables. The
+//! parameter suites and fixtures are the shared ones from
+//! `benches/common`, so GPU and CPU rows here are directly comparable with
+//! each other. Fixture construction (derive + encrypt) and the one-time
+//! matrix upload happen before timing; the largest shape uploads a 1 GiB
+//! encrypted matrix, which fits the 6 GiB reference card together with its
+//! staging buffer. Without a compute adapter the binary prints a notice
+//! and benchmarks nothing.
 //!
 //! # Case IDs and filters
 //!
@@ -47,7 +53,8 @@ use std::time::Duration;
 
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use emvp::{
-    EncryptedQuery, GpuAnswerer, GpuEncryptedMatrix, GpuError, PhaseTimings, answer_batch, search,
+    AnswerPlan, AnswerWorkspace, EncryptedQuery, GpuAnswerer, GpuEncryptedMatrix, GpuError,
+    PhaseTimings, execute_answer_batch, search,
 };
 use rayon::ThreadPool;
 
@@ -98,12 +105,14 @@ fn collect_phase_diagnostics(
     answerer: &GpuAnswerer,
     gpu_matrix: &GpuEncryptedMatrix<MODULUS>,
     query: &EncryptedQuery<MODULUS>,
+    workspace: &mut AnswerWorkspace<MODULUS>,
     tag: &str,
 ) {
+    let queries = slice::from_ref(query);
     let mut samples = Vec::with_capacity(PHASE_DIAGNOSTIC_SAMPLES);
     for _ in 0..PHASE_DIAGNOSTIC_SAMPLES {
         let (_answers, timings) = answerer
-            .answer_batch_with_timings(gpu_matrix, slice::from_ref(query))
+            .execute_answer_batch_into(gpu_matrix, queries, workspace)
             .unwrap();
         samples.push(timings);
     }
@@ -141,32 +150,50 @@ fn gpu_benches(c: &mut Criterion) {
             // One shared fixture for both sides: same encrypted matrix,
             // same single query.
             let (encrypted, query, _decoding_key) = protocol_fixtures(params, rows);
+            let queries = slice::from_ref(&query);
             // One-time upload; the measured GPU iterations reuse the
             // device-resident matrix.
             let gpu_matrix = answerer.upload_matrix(&params, &encrypted).unwrap();
             let elements = u64::try_from(rows * params.n().unwrap()).unwrap();
             group.throughput(Throughput::Elements(elements));
+            // Device path: plan once, reserve the case workspace once, then
+            // execute into it every iteration. The host matrix plans the
+            // arena (the shape arithmetic is identical on both tiers).
+            let gpu_shape = answerer.answer_batch_plan(&gpu_matrix, queries).unwrap();
+            let host_plan =
+                pool.install(|| AnswerPlan::plan(&params, &encrypted, queries).unwrap());
+            assert_eq!(gpu_shape, host_plan.shape(), "tier shapes must agree");
+            let mut gpu_workspace = AnswerWorkspace::new();
+            gpu_workspace.reserve(&host_plan).unwrap();
             // Total wall time, device path.
             group.bench_function(BenchmarkId::new("gpu", tag.clone()), |b| {
                 b.iter(|| {
-                    answerer
-                        .answer_batch(&gpu_matrix, slice::from_ref(&query))
-                        .unwrap()
+                    // The answers view is dropped here; the workspace's
+                    // arena stays reserved for the next iteration.
+                    let _answers = answerer
+                        .execute_answer_batch_into(&gpu_matrix, queries, &mut gpu_workspace)
+                        .unwrap();
                 });
             });
-            // CPU reference through the same batched API, same batch size,
-            // same fixture, on the pinned eight-thread pool.
+            // CPU reference through the same plan-reserve-execute path,
+            // same batch size, same fixture, on the pinned eight-thread
+            // pool: planned on the pool (which fixes the serial-or-rayon
+            // tier) into a case-owned workspace reserved once.
+            let cpu_plan = pool.install(|| AnswerPlan::plan(&params, &encrypted, queries).unwrap());
+            let mut cpu_workspace = AnswerWorkspace::new();
+            cpu_workspace.reserve(&cpu_plan).unwrap();
             group.bench_function(BenchmarkId::new("cpu", tag.clone()), |b| {
                 b.iter(|| {
-                    pool.install(|| {
-                        answer_batch(&params, &encrypted, slice::from_ref(&query)).unwrap()
-                    })
+                    // The answers view is dropped here; the workspace's
+                    // arena stays reserved for the next iteration.
+                    let _answers = pool
+                        .install(|| execute_answer_batch(&cpu_plan, &mut cpu_workspace).unwrap());
                 });
             });
             // Phase diagnostics: a fixed number of instrumented calls
             // collected outside Criterion timing, so no storage or
             // instrumentation ever lands inside a measured iteration.
-            collect_phase_diagnostics(&answerer, &gpu_matrix, &query, &tag);
+            collect_phase_diagnostics(&answerer, &gpu_matrix, &query, &mut gpu_workspace, &tag);
             drop(gpu_matrix);
         }
     }
