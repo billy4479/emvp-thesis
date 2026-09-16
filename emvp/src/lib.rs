@@ -23,6 +23,7 @@
 //!
 //! [`trapdoor_matrices`]: trapdoor_matrices
 
+pub mod answer;
 pub mod code;
 pub mod dispatch;
 pub mod engine;
@@ -33,6 +34,7 @@ pub mod prf;
 pub mod protocol;
 pub mod view;
 
+pub use answer::{AnswerPlan, AnswerShape, AnswerWorkspace, Answers, execute_answer_batch};
 pub use code::{CodeError, CyclicCodeScratch, CyclicDualCode};
 pub use dispatch::{
     AnswerBackend, MIN_PARALLEL_MULTIPLICATIONS, select_answer_backend, select_cpu_backend,

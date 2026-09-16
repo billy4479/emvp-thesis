@@ -180,6 +180,14 @@ pub enum ProtocolError {
         /// The observed public query identifier.
         actual: u64,
     },
+    /// A caller-owned answer workspace lacked the arena capacity an
+    /// operation required.
+    Capacity {
+        /// The arena word count the operation required.
+        required: usize,
+        /// The arena word count the workspace offered.
+        available: usize,
+    },
 }
 
 impl fmt::Display for ProtocolError {
@@ -223,6 +231,10 @@ impl fmt::Display for ProtocolError {
             } => write!(
                 formatter,
                 "{name} query mismatch: expected {expected}, got {actual}"
+            ),
+            Self::Capacity { required, available } => write!(
+                formatter,
+                "answer arena capacity mismatch: required {required} words, available {available}"
             ),
         }
     }
@@ -287,7 +299,13 @@ pub(crate) const fn check_len(
     }
 }
 
-fn fill_answer_row<const MODULUS: u32>(
+/// The single-query answer row kernel: one row of `s` column-block dot
+/// products.
+///
+/// Shared by every CPU answer path (the one-shot batch, the dispatcher's
+/// CPU tier, and the plan-reserve-execute arena path), so all of them
+/// produce bit-identical answer rows by construction.
+pub(crate) fn fill_answer_row<const MODULUS: u32>(
     matrix_row: &[FieldElement<MODULUS>],
     query: &[FieldElement<MODULUS>],
     block_len: usize,
@@ -1521,12 +1539,15 @@ pub fn answer_batch<const MODULUS: u32>(
 ///
 /// The arena splits into `queries.len() * rows` disjoint answer rows, so
 /// the flattened grid parallelizes without nested pools and every row
-/// reuses the single-query row kernel. The parallel tier is selected by the
+/// reuses the single-query row kernel. The batch is generic over the query
+/// representation ([`QueryValues`], which must be [`Sync`] because the
+/// parallel tier reads it across rayon workers), so the owned and borrowed
+/// answer paths share one kernel. The parallel tier is selected by the
 /// shared dispatch policy ([`crate::dispatch`]); smaller batches stay on
 /// the serial row loop.
-fn fill_answer_batch<const MODULUS: u32>(
+fn fill_answer_batch<const MODULUS: u32, Q: QueryValues<MODULUS> + Sync>(
     matrix: &EncryptedMatrix<MODULUS>,
-    queries: &[EncryptedQuery<MODULUS>],
+    queries: &[Q],
     arena: &mut [FieldElement<MODULUS>],
     n: usize,
     b: usize,
@@ -1544,15 +1565,33 @@ fn fill_answer_batch<const MODULUS: u32>(
                 let query = &queries[flat_row / rows];
                 let matrix_row_index = flat_row % rows;
                 let matrix_row = &matrix.values()[matrix_row_index * n..(matrix_row_index + 1) * n];
-                fill_answer_row(matrix_row, &query.values, b, answer_row);
+                fill_answer_row(matrix_row, query.values(), b, answer_row);
             });
     } else {
-        for (flat_row, answer_row) in arena.chunks_mut(s).enumerate() {
-            let query = &queries[flat_row / rows];
-            let matrix_row_index = flat_row % rows;
-            let matrix_row = &matrix.values()[matrix_row_index * n..(matrix_row_index + 1) * n];
-            fill_answer_row(matrix_row, &query.values, b, answer_row);
-        }
+        fill_answer_batch_serial(matrix, queries, arena, n, b, s, rows);
+    }
+}
+
+/// Fills a query-major arena on the serial row loop.
+///
+/// The serial tier shared by [`fill_answer_batch`] and the plan-reserve-
+/// execute path ([`crate::answer::execute_answer_batch`]): every answer row
+/// is computed by the same row kernel in the same order, so both paths
+/// produce bit-identical arenas.
+pub(crate) fn fill_answer_batch_serial<const MODULUS: u32, Q: QueryValues<MODULUS>>(
+    matrix: &EncryptedMatrix<MODULUS>,
+    queries: &[Q],
+    arena: &mut [FieldElement<MODULUS>],
+    n: usize,
+    b: usize,
+    s: usize,
+    rows: usize,
+) {
+    for (flat_row, answer_row) in arena.chunks_mut(s).enumerate() {
+        let query = &queries[flat_row / rows];
+        let matrix_row_index = flat_row % rows;
+        let matrix_row = &matrix.values()[matrix_row_index * n..(matrix_row_index + 1) * n];
+        fill_answer_row(matrix_row, query.values(), b, answer_row);
     }
 }
 

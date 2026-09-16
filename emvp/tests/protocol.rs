@@ -4,9 +4,10 @@
 )]
 
 use emvp::{
-    AnswerMatrix, DecodingKey, DerivedState, EmvpParams, EncryptedMatrix, EncryptedQuery,
-    MaskContextId, ProtocolError, SecretKey, TdmMask, answer_batch, answer_into, decode_into,
-    encrypt, purpose, query, query_batch, query_with_scratch, search,
+    AnswerBackend, AnswerMatrix, AnswerPlan, AnswerWorkspace, DecodingKey, DerivedState,
+    EmvpParams, EncryptedMatrix, EncryptedQuery, MaskContextId, ProtocolError, SecretKey, TdmMask,
+    answer_batch, answer_into, decode_into, encrypt, execute_answer_batch, purpose, query,
+    query_batch, query_with_scratch, search,
 };
 use prime_field_layer::{FieldElement, PrimeField};
 use proptest::prelude::*;
@@ -1217,4 +1218,307 @@ proptest! {
             prop_assert_eq!(answer.instance_id(), encrypted.instance_id());
         }
     }
+}
+
+/// One encrypted matrix plus a batch of queries against it, with `ell = 8`
+/// (so `n = 16` and `s = 8` for the test parameters) and its parameters.
+struct BatchFixture {
+    params: EmvpParams,
+    encrypted: EncryptedMatrix<MODULUS>,
+    queries: Vec<EncryptedQuery<MODULUS>>,
+    rows: usize,
+}
+
+fn batch_fixture(rows: usize, batch: usize, key: u8, seed: u64) -> BatchFixture {
+    let ell = 8;
+    let mut rng = ChaCha20Rng::seed_from_u64(seed);
+    let matrix = random_vector(rows * ell, &mut rng);
+    let q = random_vector(ell, &mut rng);
+    let mut state = derive_toeplitz(rows, ell, key);
+    let encrypted = encrypt(&mut state, &matrix).unwrap();
+    let mut queries = Vec::new();
+    for _ in 0..batch {
+        let (encrypted_query, _key) = query(&mut state, &q).unwrap();
+        queries.push(encrypted_query);
+    }
+    BatchFixture {
+        params: test_params(ell),
+        encrypted,
+        queries,
+        rows,
+    }
+}
+
+fn answer_batch_collect(
+    params: &EmvpParams,
+    matrix: &EncryptedMatrix<MODULUS>,
+    queries: &[EncryptedQuery<MODULUS>],
+) -> (Vec<u64>, Vec<FieldElement<MODULUS>>) {
+    let answers = answer_batch(params, matrix, queries).unwrap();
+    let ids = answers.iter().map(AnswerMatrix::query_id).collect();
+    let values = answers
+        .iter()
+        .flat_map(|answer| answer.values().iter().copied())
+        .collect();
+    (ids, values)
+}
+
+/// Plans, reserves, executes, and collects a batch, asserting the plan's
+/// fixed backend so a tier change cannot silently weaken a parity test.
+fn plan_execute_collect(
+    params: &EmvpParams,
+    matrix: &EncryptedMatrix<MODULUS>,
+    queries: &[EncryptedQuery<MODULUS>],
+    workspace: &mut AnswerWorkspace<MODULUS>,
+    expected_backend: AnswerBackend,
+) -> (Vec<u64>, Vec<FieldElement<MODULUS>>) {
+    let plan = AnswerPlan::plan(params, matrix, queries).unwrap();
+    assert_eq!(plan.backend(), expected_backend);
+    workspace.reserve(&plan).unwrap();
+    let answers = execute_answer_batch(&plan, workspace).unwrap();
+    assert_eq!(answers.shape().queries(), queries.len());
+    assert_eq!(answers.len(), plan.arena_words());
+    let ids = (0..queries.len())
+        .map(|index| answers.answer(queries, index).unwrap().query_id())
+        .collect();
+    let values = answers.arena().to_vec();
+    (ids, values)
+}
+
+#[test]
+fn plan_reserve_execute_matches_answer_batch_on_both_cpu_tiers() {
+    // Serial tier: 3 queries * 5 rows * n = 240 estimated multiplications
+    // stay far below the parallel threshold, so a one-thread pool plans the
+    // single-core tier. Parallel tier: 16 queries * 128 rows * n = 32768
+    // clear the threshold and the 2048-row grid satisfies the
+    // two-rows-per-thread guard for a four-thread pool, so that plan fixes
+    // the rayon tier. The one-shot path must produce the very same answers
+    // and identifiers on each tier.
+    let serial = batch_fixture(5, 3, 0x30, 0x8d00);
+    let parallel = batch_fixture(128, 16, 0x31, 0x8d10);
+
+    let (serial_ids, serial_values) = pool(1).install(|| {
+        let mut workspace = AnswerWorkspace::new();
+        plan_execute_collect(
+            &serial.params,
+            &serial.encrypted,
+            &serial.queries,
+            &mut workspace,
+            AnswerBackend::SingleCore,
+        )
+    });
+    let (parallel_ids, parallel_values) = pool(4).install(|| {
+        let mut workspace = AnswerWorkspace::new();
+        plan_execute_collect(
+            &parallel.params,
+            &parallel.encrypted,
+            &parallel.queries,
+            &mut workspace,
+            AnswerBackend::Rayon,
+        )
+    });
+
+    let (expected_serial_ids, expected_serial_values) = pool(1)
+        .install(|| answer_batch_collect(&serial.params, &serial.encrypted, &serial.queries));
+    let (expected_parallel_ids, expected_parallel_values) = pool(4)
+        .install(|| answer_batch_collect(&parallel.params, &parallel.encrypted, &parallel.queries));
+    assert_eq!(serial_ids, expected_serial_ids);
+    assert_eq!(serial_values, expected_serial_values);
+    assert_eq!(parallel_ids, expected_parallel_ids);
+    assert_eq!(parallel_values, expected_parallel_values);
+}
+
+#[test]
+fn execute_rejects_insufficient_capacity_before_writing() {
+    // Four queries plan to 160 arena words; the two-query prefix reserves
+    // only 80, so the full batch is rejected whole and names both numbers.
+    let fixture = batch_fixture(5, 4, 0x32, 0x8d20);
+    let (small_queries, _rest) = fixture.queries.split_at(2);
+    let mut workspace = AnswerWorkspace::new();
+
+    // A first execute poisons the arena with known answers.
+    let small_plan = AnswerPlan::plan(&fixture.params, &fixture.encrypted, small_queries).unwrap();
+    workspace.reserve(&small_plan).unwrap();
+    let (poison_ids, poison_values) = {
+        let poisoned = execute_answer_batch(&small_plan, &mut workspace).unwrap();
+        let ids = (0..small_queries.len())
+            .map(|index| poisoned.answer(small_queries, index).unwrap().query_id())
+            .collect::<Vec<_>>();
+        (ids, poisoned.arena().to_vec())
+    };
+
+    let big_plan = AnswerPlan::plan(&fixture.params, &fixture.encrypted, &fixture.queries).unwrap();
+    assert!(matches!(
+        execute_answer_batch(&big_plan, &mut workspace),
+        Err(ProtocolError::Capacity { required, available })
+            if required == big_plan.arena_words()
+                && available == small_plan.arena_words()
+    ));
+
+    // The failed call left the workspace serving exactly what it served
+    // before: the small batch still re-executes to the very same answers
+    // (the capacity rejection precedes any arena access by construction).
+    let (ids, values) = plan_execute_collect(
+        &fixture.params,
+        &fixture.encrypted,
+        small_queries,
+        &mut workspace,
+        AnswerBackend::SingleCore,
+    );
+    assert_eq!(ids, poison_ids);
+    assert_eq!(values, poison_values);
+    assert_eq!(workspace.capacity_words(), small_plan.arena_words());
+}
+
+#[test]
+fn workspace_reuse_grows_once_and_never_shrinks() {
+    let fixture = batch_fixture(5, 6, 0x33, 0x8d30);
+    let (big_queries, small_queries) = fixture.queries.split_at(4);
+    let mut workspace = AnswerWorkspace::new();
+
+    let big_plan = AnswerPlan::plan(&fixture.params, &fixture.encrypted, big_queries).unwrap();
+    workspace.reserve(&big_plan).unwrap();
+    let words = workspace.capacity_words();
+    let (big_values, arena_ptr) = {
+        let grown = execute_answer_batch(&big_plan, &mut workspace).unwrap();
+        (grown.arena().to_vec(), grown.arena().as_ptr())
+    };
+
+    // Reserving and executing a smaller plan moves neither the capacity nor
+    // the arena's storage.
+    let small_plan = AnswerPlan::plan(&fixture.params, &fixture.encrypted, small_queries).unwrap();
+    workspace.reserve(&small_plan).unwrap();
+    assert_eq!(workspace.capacity_words(), words);
+    let (small_ids, small_values) =
+        answer_batch_collect(&fixture.params, &fixture.encrypted, small_queries);
+    {
+        let shrunk = execute_answer_batch(&small_plan, &mut workspace).unwrap();
+        assert_eq!(shrunk.arena().as_ptr(), arena_ptr);
+        assert_eq!(shrunk.arena().to_vec(), small_values);
+        assert_eq!(
+            shrunk.answer(small_queries, 0).unwrap().query_id(),
+            small_ids[0]
+        );
+    }
+
+    // A same-size re-reserve is free and keeps the arena where it was.
+    workspace.reserve(&big_plan).unwrap();
+    assert_eq!(workspace.capacity_words(), words);
+    {
+        let regrown = execute_answer_batch(&big_plan, &mut workspace).unwrap();
+        assert_eq!(regrown.arena().as_ptr(), arena_ptr);
+        assert_eq!(regrown.arena().to_vec(), big_values);
+    }
+
+    // Releasing reports the freed arena capacity in words.
+    assert!(workspace.release() >= words);
+}
+
+#[test]
+fn a_plan_executes_repeatedly_with_identical_answers() {
+    let fixture = batch_fixture(5, 3, 0x34, 0x8d40);
+    let plan = AnswerPlan::plan(&fixture.params, &fixture.encrypted, &fixture.queries).unwrap();
+    let mut workspace = AnswerWorkspace::new();
+    workspace.reserve(&plan).unwrap();
+
+    let (first_ids, first_values) = {
+        let first = execute_answer_batch(&plan, &mut workspace).unwrap();
+        let ids = (0..fixture.queries.len())
+            .map(|index| first.answer(&fixture.queries, index).unwrap().query_id())
+            .collect::<Vec<_>>();
+        (ids, first.arena().to_vec())
+    };
+    let (second_ids, second_values) = {
+        let second = execute_answer_batch(&plan, &mut workspace).unwrap();
+        let ids = (0..fixture.queries.len())
+            .map(|index| second.answer(&fixture.queries, index).unwrap().query_id())
+            .collect::<Vec<_>>();
+        (ids, second.arena().to_vec())
+    };
+    assert_eq!(second_ids, first_ids);
+    assert_eq!(second_values, first_values);
+
+    let (expected_ids, expected_values) =
+        answer_batch_collect(&fixture.params, &fixture.encrypted, &fixture.queries);
+    assert_eq!(first_ids, expected_ids);
+    assert_eq!(first_values, expected_values);
+}
+
+#[test]
+fn answers_iteration_pairs_queries_and_validates_slices() {
+    let fixture = batch_fixture(5, 3, 0x35, 0x8d50);
+    let plan = AnswerPlan::plan(&fixture.params, &fixture.encrypted, &fixture.queries).unwrap();
+    let mut workspace = AnswerWorkspace::new();
+    workspace.reserve(&plan).unwrap();
+    let answers = execute_answer_batch(&plan, &mut workspace).unwrap();
+
+    let iterated = answers.iter(&fixture.queries).unwrap();
+    assert_eq!(iterated.len(), fixture.queries.len());
+    for (index, answer) in iterated.enumerate() {
+        assert_eq!(answer.query_id(), fixture.queries[index].query_id());
+        assert_eq!(answer.instance_id(), fixture.encrypted.instance_id());
+        assert_eq!(answer.rows(), fixture.rows);
+        assert_eq!(answer.blocks(), fixture.params.blocks().unwrap());
+        let single = answers.answer(&fixture.queries, index).unwrap();
+        assert_eq!(single.values(), answer.values());
+        assert_eq!(single.query_id(), answer.query_id());
+    }
+
+    // A wrong-length query slice is rejected for both accessors.
+    assert!(matches!(
+        answers.iter(&fixture.queries[..2]),
+        Err(ProtocolError::LengthMismatch {
+            name: "queries",
+            ..
+        })
+    ));
+    assert!(matches!(
+        answers.answer(&fixture.queries[..2], 0),
+        Err(ProtocolError::LengthMismatch {
+            name: "queries",
+            ..
+        })
+    ));
+    // An out-of-range index is rejected too.
+    assert!(matches!(
+        answers.answer(&fixture.queries, fixture.queries.len()),
+        Err(ProtocolError::LengthMismatch {
+            name: "query index",
+            ..
+        })
+    ));
+
+    // A batch of foreign queries passes the length check but fails the
+    // instance check on every accessor.
+    let mut rng = ChaCha20Rng::seed_from_u64(0x8d51);
+    let q = random_vector(8, &mut rng);
+    let mut foreign_state = derive_toeplitz(fixture.rows, 8, 0x36);
+    let (foreign_query, _) = query(&mut foreign_state, &q).unwrap();
+    let foreign = vec![foreign_query.clone(), foreign_query.clone(), foreign_query];
+    assert!(matches!(
+        answers.answer(&foreign, 0),
+        Err(ProtocolError::InstanceMismatch { .. })
+    ));
+    assert!(matches!(
+        answers.iter(&foreign),
+        Err(ProtocolError::InstanceMismatch { .. })
+    ));
+}
+
+#[test]
+fn serial_execute_into_a_reserved_workspace_allocates_nothing() {
+    // 2 queries * 4 rows * n = 128 estimated multiplications stay below the
+    // parallel threshold under any pool, so the plan fixes the serial tier;
+    // parallel-tier allocation counting is deferred.
+    let fixture = batch_fixture(4, 2, 0x37, 0x8d60);
+    let plan = AnswerPlan::plan(&fixture.params, &fixture.encrypted, &fixture.queries).unwrap();
+    assert_eq!(plan.backend(), AnswerBackend::SingleCore);
+    let mut workspace = AnswerWorkspace::new();
+    workspace.reserve(&plan).unwrap();
+    execute_answer_batch(&plan, &mut workspace).unwrap();
+
+    let allocations = allocation_counter::measure(|| {
+        execute_answer_batch(&plan, &mut workspace).unwrap();
+    });
+    assert_eq!(allocations.count_total, 0);
 }
