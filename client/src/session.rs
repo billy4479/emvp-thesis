@@ -8,17 +8,27 @@
 //! before the first frame. The client keeps every secret locally:
 //! plaintext matrices, plaintext queries, derived state, and decoding keys
 //! never cross the stream.
+//!
+//! The wire boundary is zero copy in both directions. Uploads and
+//! evaluations stream from borrowed views over the owned artifacts, and
+//! the acknowledgment and the products response decode into per-session
+//! workspaces the next round reuses, so a steady-state round allocates
+//! nothing on the send path or per verified query.
 
 use std::time::{Duration, Instant};
 
 use emvp::{
-    AnswerMatrix, DecodingKey, EncryptedMatrix, EncryptedQuery, MaskContextId, ProtocolError,
-    SecretKey, TdmMask, decode_into, encrypt, query_batch,
+    AnswerRef, DecodingKey, EmvpParams, EncryptedMatrix, EncryptedQuery, EncryptedQueryRef,
+    MaskContextId, ProtocolError, SecretKey, TdmMask, decode_into, encrypt, query_batch,
+};
+use emvp_network::v2::{
+    EvaluateEntryInput, ProductsViews, ProductsWorkspace, UploadAcceptedWorkspace,
+    UploadMatrixView, decode_products, decode_upload_accepted, plan_products, plan_upload_accepted,
+    write_evaluate, write_upload_matrices,
 };
 use emvp_network::{
-    EvaluateEntry, FrameKind, FrameReader, MatrixUpload, PROTOCOL_MODULUS, ProductEntry,
-    client_handshake, read_error_payload, read_frame_header, read_products_payload,
-    read_upload_accepted_payload, write_evaluate, write_upload_matrices,
+    CodecError, FrameKind, FrameReader, HEADER_BYTES, PROTOCOL_MODULUS, client_handshake,
+    read_error_payload, read_frame_header,
 };
 use prime_field_layer::PrimeField;
 use rand_chacha::ChaCha20Rng;
@@ -85,6 +95,207 @@ struct Instance {
     encrypted: EncryptedMatrix<PROTOCOL_MODULUS>,
 }
 
+/// What one evaluate-and-verify round did and how long it took.
+#[derive(Clone, Copy, Debug)]
+struct RoundOutcome {
+    /// Bytes written for the evaluation request, header included.
+    evaluate_bytes: u64,
+    /// Bytes read for the products response, header included.
+    products_bytes: u64,
+    /// Writing the evaluation and reading the products.
+    evaluate_duration: Duration,
+    /// Decoding and verifying every product.
+    verify_duration: Duration,
+    /// Query products that decoded to the expected plaintext product.
+    verified_queries: usize,
+}
+
+/// One connection's reusable client state.
+///
+/// The session owns every buffer the protocol rounds share: the codec
+/// workspaces the upload acknowledgment and the products response decode
+/// into, the borrowed-query scratch each evaluation request is built
+/// from, and the two verification buffers every answer is decoded and
+/// compared against. Each buffer grows only through an explicit reserve
+/// step, is never shrunk, and carries nothing from one round to the next,
+/// so after the first round has shaped them a round allocates nothing.
+///
+/// `'q` is the borrow the query-reference scratch points into (the
+/// instances of the round), which a round supplies per call.
+struct Session<'a, 'q, S> {
+    /// The transport.
+    stream: &'a mut S,
+    /// The upload acknowledgment's identifiers, one list per upload.
+    ack_ids: UploadAcceptedWorkspace,
+    /// The products frame's decode arena, reused per evaluation round.
+    products: ProductsWorkspace,
+    /// Borrowed views of the owned queries, refilled per evaluation
+    /// round.
+    query_refs: Vec<EncryptedQueryRef<'q, PROTOCOL_MODULUS>>,
+    /// The decoded product of the answer under verification.
+    decoded: Vec<Field>,
+    /// The expected plaintext product of the query under verification.
+    expected: Vec<Field>,
+}
+
+impl<'a, 'q, S: std::io::Read + std::io::Write> Session<'a, 'q, S> {
+    /// Performs the connection's single handshake and returns the session.
+    ///
+    /// # Errors
+    ///
+    /// Returns the handshake failure.
+    fn new(stream: &'a mut S) -> Result<Self, RunError> {
+        client_handshake(stream)?;
+        Ok(Self {
+            stream,
+            ack_ids: UploadAcceptedWorkspace::new(),
+            products: ProductsWorkspace::new(),
+            query_refs: Vec::new(),
+            decoded: Vec::new(),
+            expected: Vec::new(),
+        })
+    }
+
+    /// Uploads every instance's encrypted matrix and validates the
+    /// acknowledgment, leaving the accepted identifiers in the session
+    /// for the evaluation rounds.
+    ///
+    /// The upload frame streams straight from borrowed views over the
+    /// encrypted matrices: no ciphertext element is copied.
+    ///
+    /// Returns the bytes written, header included.
+    ///
+    /// # Errors
+    ///
+    /// Returns the transport, codec, server, or acknowledgment failure.
+    fn upload(&mut self, instances: &[Instance], params: EmvpParams) -> Result<u64, RunError> {
+        let uploads: Vec<UploadMatrixView<'_>> = instances
+            .iter()
+            .map(|instance| UploadMatrixView {
+                params,
+                instance_id: instance.encrypted.instance_id(),
+                rows: instance.encrypted.rows(),
+                columns: instance.encrypted.columns(),
+                values: instance.encrypted.values(),
+            })
+            .collect();
+        let upload_bytes = write_upload_matrices(&mut self.stream, &uploads)?;
+        let identifiers = self.read_upload_reply()?;
+        validate_upload_reply(identifiers, instances.len())?;
+        Ok(upload_bytes)
+    }
+
+    /// Sends one evaluation round and verifies the returned products.
+    ///
+    /// The request streams from borrowed views of the owned queries, the
+    /// products frame decodes into the reused workspace, and every answer
+    /// decodes into and compares against the reused verification buffers.
+    ///
+    /// # Errors
+    ///
+    /// Returns the transport, codec, server, shape, or verification
+    /// failure.
+    fn evaluate_and_verify<'inst>(
+        &mut self,
+        instances: &'inst [Instance],
+        params: EmvpParams,
+    ) -> Result<RoundOutcome, RunError>
+    where
+        'inst: 'q,
+    {
+        let matrix_ids = self.ack_ids.identifiers();
+        if matrix_ids.len() != instances.len() {
+            return Err(RunError::UploadAcknowledge {
+                uploaded: instances.len(),
+                acknowledged: matrix_ids.len(),
+            });
+        }
+
+        let evaluate_start = Instant::now();
+        let entries = evaluate_entries(instances, matrix_ids, &mut self.query_refs)?;
+        let evaluate_bytes = write_evaluate(&mut self.stream, &entries)?;
+
+        let Some(header) = read_frame_header(self.stream)? else {
+            return Err(RunError::ProductsShape {
+                problem: "the connection closed before the products response",
+            });
+        };
+        let mut frame = FrameReader::new(self.stream, header.payload_len);
+        let products_bytes;
+        let products = match header.kind {
+            FrameKind::Products => {
+                let plan = plan_products(&mut frame)?;
+                self.products.reserve(&plan)?;
+                let products = decode_products(&mut frame, &plan, &mut self.products)?;
+                products_bytes = header.payload_len + HEADER_BYTES;
+                products
+            }
+            FrameKind::Error => {
+                let error = read_error_payload(&mut frame)?;
+                frame.finish()?;
+                return Err(RunError::Server(error));
+            }
+            _ => {
+                return Err(RunError::ProductsShape {
+                    problem: "the evaluation response was not a products frame",
+                });
+            }
+        };
+        let evaluate_duration = evaluate_start.elapsed();
+
+        let verify_start = Instant::now();
+        let verified_queries = verify_products(
+            products,
+            instances,
+            matrix_ids,
+            params,
+            &mut self.decoded,
+            &mut self.expected,
+        )?;
+        let verify_duration = verify_start.elapsed();
+
+        Ok(RoundOutcome {
+            evaluate_bytes,
+            products_bytes,
+            evaluate_duration,
+            verify_duration,
+            verified_queries,
+        })
+    }
+
+    /// Reads the upload acknowledgment, mapping a rejection to its error.
+    ///
+    /// The accepted identifiers are copied into the acknowledgment
+    /// workspace and returned as a slice of it.
+    ///
+    /// # Errors
+    ///
+    /// Returns the transport, codec, or server failure.
+    fn read_upload_reply(&mut self) -> Result<&[u64], RunError> {
+        let Some(header) = read_frame_header(self.stream)? else {
+            return Err(RunError::ProductsShape {
+                problem: "the connection closed before the upload acknowledgment",
+            });
+        };
+        let mut frame = FrameReader::new(self.stream, header.payload_len);
+        match header.kind {
+            FrameKind::UploadAccepted => {
+                let plan = plan_upload_accepted(&mut frame)?;
+                self.ack_ids.reserve(&plan)?;
+                Ok(decode_upload_accepted(&mut frame, &plan, &mut self.ack_ids)?)
+            }
+            FrameKind::Error => {
+                let error = read_error_payload(&mut frame)?;
+                frame.finish()?;
+                Err(RunError::Server(error))
+            }
+            _ => Err(RunError::ProductsShape {
+                problem: "the upload response was not an acknowledgment",
+            }),
+        }
+    }
+}
+
 /// Runs the whole demo against one connected stream.
 ///
 /// Performs the connection's single handshake, then derives and encrypts
@@ -115,82 +326,35 @@ where
     let derive_duration = derive_start.elapsed();
 
     let handshake_start = Instant::now();
-    client_handshake(stream)?;
+    let mut session = Session::new(stream)?;
     let handshake_duration = handshake_start.elapsed();
 
     let upload_start = Instant::now();
-    let uploads: Vec<MatrixUpload> = instances
-        .iter()
-        .map(|instance| MatrixUpload {
-            params: config.params,
-            matrix: instance.encrypted.clone(),
-        })
-        .collect();
-    let upload_bytes = write_upload_matrices(stream, &uploads)?;
-    let matrix_ids = read_upload_reply(stream)?;
-    validate_upload_reply(&matrix_ids, instances.len())?;
+    let upload_bytes = session.upload(&instances, config.params)?;
     let upload_duration = upload_start.elapsed();
 
-    let evaluate_start = Instant::now();
-    let entries: Vec<EvaluateEntry> = instances
-        .iter()
-        .zip(&matrix_ids)
-        .map(|(instance, matrix_id)| EvaluateEntry {
-            matrix_id: *matrix_id,
-            queries: instance.queries.clone(),
-        })
-        .collect();
-    let evaluate_bytes = write_evaluate(stream, &entries)?;
-    let (products, products_payload) = read_products_reply(stream)?;
-    let products_bytes = products_payload + emvp_network::HEADER_BYTES;
-    let evaluate_duration = evaluate_start.elapsed();
-
-    let verify_start = Instant::now();
-    if products.len() != instances.len() {
-        return Err(RunError::ProductsShape {
-            problem: "the entry count does not match the request",
-        });
-    }
-    let mut verified_queries = 0_usize;
-    for ((instance, matrix_id), product) in instances.iter().zip(&matrix_ids).zip(&products) {
-        if product.matrix_id != *matrix_id {
-            return Err(RunError::ProductsShape {
-                problem: "an entry answers a different matrix identifier",
-            });
-        }
-        if product.answers.len() != instance.decoding_keys.len() {
-            return Err(RunError::ProductsShape {
-                problem: "an entry's answer count does not match its query count",
-            });
-        }
-        let pairs = product
-            .answers
-            .iter()
-            .zip(&instance.decoding_keys)
-            .zip(&instance.plaintext_queries);
-        for ((answer, key), plaintext_query) in pairs {
-            verify_answer(answer, key, plaintext_query, instance, *matrix_id)?;
-            verified_queries += 1;
-        }
-    }
-    let verify_duration = verify_start.elapsed();
+    let outcome = session.evaluate_and_verify(&instances, config.params)?;
 
     Ok(Report {
-        matrix_ids,
+        matrix_ids: session.ack_ids.identifiers().to_vec(),
         upload_bytes,
-        evaluate_bytes,
-        products_bytes,
+        evaluate_bytes: outcome.evaluate_bytes,
+        products_bytes: outcome.products_bytes,
         handshake_duration,
         derive_duration,
         upload_duration,
-        evaluate_duration,
-        verify_duration,
-        verified_queries,
+        evaluate_duration: outcome.evaluate_duration,
+        verify_duration: outcome.verify_duration,
+        verified_queries: outcome.verified_queries,
     })
 }
 
 /// Checks the upload acknowledgment against the upload: one identifier per
 /// matrix, each nonzero and distinct.
+///
+/// The duplicate scan is a direct pairwise membership check over the
+/// acknowledged list: identifier counts are small, and the scan allocates
+/// nothing where a set would.
 ///
 /// # Errors
 ///
@@ -207,67 +371,199 @@ fn validate_upload_reply(identifiers: &[u64], uploaded: usize) -> Result<(), Run
             problem: "an identifier is zero",
         });
     }
-    let mut seen = std::collections::BTreeSet::new();
-    if identifiers
+    for (index, identifier) in identifiers.iter().enumerate() {
+        if identifiers[..index].contains(identifier) {
+            return Err(RunError::UploadIdentifiers {
+                problem: "an identifier appears twice",
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Builds the evaluation request's borrowed entries: one entry per
+/// instance, its queries the instance's owned query list viewed through
+/// the reusable reference scratch.
+///
+/// The scratch is cleared and refilled each round; growing it to a larger
+/// total query count is its only allocation moment.
+///
+/// # Errors
+///
+/// Returns the allocation failure of the scratch growth.
+fn evaluate_entries<'inst, 'q, 'scratch>(
+    instances: &'inst [Instance],
+    matrix_ids: &[u64],
+    query_refs: &'scratch mut Vec<EncryptedQueryRef<'q, PROTOCOL_MODULUS>>,
+) -> Result<Vec<EvaluateEntryInput<'scratch>>, RunError>
+where
+    'inst: 'q,
+    'q: 'scratch,
+{
+    let total_queries = instances
         .iter()
-        .any(|identifier| !seen.insert(*identifier))
-    {
-        return Err(RunError::UploadIdentifiers {
-            problem: "an identifier appears twice",
+        .try_fold(0_usize, |total, instance| {
+            total.checked_add(instance.queries.len())
+        })
+        .ok_or(RunError::Protocol(ProtocolError::DimensionOverflow))?;
+    query_refs.clear();
+    query_refs
+        .try_reserve_exact(total_queries.saturating_sub(query_refs.len()))
+        .map_err(|_reserve| RunError::Codec(CodecError::AllocationFailed))?;
+    query_refs.extend(
+        instances
+            .iter()
+            .flat_map(|instance| instance.queries.iter().map(EncryptedQueryRef::from)),
+    );
+
+    let mut entries = Vec::with_capacity(instances.len());
+    let mut offset = 0_usize;
+    for (instance, &matrix_id) in instances.iter().zip(matrix_ids) {
+        let end = offset + instance.queries.len();
+        entries.push(EvaluateEntryInput {
+            matrix_id,
+            queries: &query_refs[offset..end],
+        });
+        offset = end;
+    }
+    Ok(entries)
+}
+
+/// Validates the products frame against the request and verifies every
+/// answer against the plaintext product, reusing both verify buffers.
+///
+/// Returns the number of verified query products.
+///
+/// # Errors
+///
+/// Returns the shape or verification failure; on a verification failure
+/// every earlier product was still checked.
+fn verify_products(
+    products: ProductsViews<'_>,
+    instances: &[Instance],
+    matrix_ids: &[u64],
+    params: EmvpParams,
+    decoded: &mut Vec<Field>,
+    expected: &mut Vec<Field>,
+) -> Result<usize, RunError> {
+    if products.len() != instances.len() {
+        return Err(RunError::ProductsShape {
+            problem: "the entry count does not match the request",
+        });
+    }
+    let blocks = params.blocks().map_err(RunError::Params)?;
+    let mut verified_queries = 0_usize;
+    for ((instance, matrix_id), entry) in instances.iter().zip(matrix_ids).zip(products.iter()) {
+        if entry.matrix_id() != *matrix_id {
+            return Err(RunError::ProductsShape {
+                problem: "an entry answers a different matrix identifier",
+            });
+        }
+        if entry.instance_id() != instance.encrypted.instance_id() {
+            return Err(RunError::ProductsShape {
+                problem: "an entry answers a different matrix instance",
+            });
+        }
+        if entry.rows() != instance.rows {
+            return Err(RunError::ProductsShape {
+                problem: "an entry's answer rows do not match its matrix",
+            });
+        }
+        if entry.blocks() != blocks {
+            return Err(RunError::ProductsShape {
+                problem: "an entry's answer blocks do not match the parameters",
+            });
+        }
+        if entry.len() != instance.decoding_keys.len() {
+            return Err(RunError::ProductsShape {
+                problem: "an entry's answer count does not match its query count",
+            });
+        }
+        for (index, key) in instance.decoding_keys.iter().enumerate() {
+            let answer = entry.answer(index).ok_or(RunError::ProductsShape {
+                problem: "an entry's answer descriptor was missing",
+            })?;
+            verify_answer(
+                &answer,
+                key,
+                &instance.plaintext_queries[index],
+                instance,
+                *matrix_id,
+                decoded,
+                expected,
+            )?;
+            verified_queries += 1;
+        }
+    }
+    Ok(verified_queries)
+}
+
+/// Decodes one answer and compares it with the plaintext product,
+/// reusing the verification buffers.
+///
+/// # Errors
+///
+/// Returns the pairing, protocol, or verification failure.
+fn verify_answer(
+    answer: &AnswerRef<'_, PROTOCOL_MODULUS>,
+    key: &DecodingKey<PROTOCOL_MODULUS>,
+    plaintext_query: &[Field],
+    instance: &Instance,
+    matrix_id: u64,
+    decoded: &mut Vec<Field>,
+    expected: &mut Vec<Field>,
+) -> Result<(), RunError> {
+    if answer.query_id() != key.query_id() {
+        return Err(RunError::ProductsShape {
+            problem: "an answer is paired with another query's decoding key",
+        });
+    }
+    let rows = instance.rows;
+    ensure_capacity(decoded, rows)?;
+    ensure_capacity(expected, rows)?;
+    decode_into(answer, key, &mut decoded[..rows])?;
+    plaintext_product_into(&instance.plaintext, plaintext_query, &mut expected[..rows]);
+    if decoded[..rows] != expected[..rows] {
+        return Err(RunError::Verification {
+            matrix_id,
+            query_id: key.query_id(),
         });
     }
     Ok(())
 }
 
-/// Reads the upload acknowledgment, mapping a rejection to its error.
-fn read_upload_reply<S: std::io::Read>(stream: &mut S) -> Result<Vec<u64>, RunError> {
-    let Some(header) = read_frame_header(stream)? else {
-        return Err(RunError::ProductsShape {
-            problem: "the connection closed before the upload acknowledgment",
-        });
-    };
-    let mut frame = FrameReader::new(stream, header.payload_len);
-    match header.kind {
-        FrameKind::UploadAccepted => {
-            let identifiers = read_upload_accepted_payload(&mut frame)?;
-            frame.finish()?;
-            Ok(identifiers)
-        }
-        FrameKind::Error => {
-            let error = read_error_payload(&mut frame)?;
-            frame.finish()?;
-            Err(RunError::Server(error))
-        }
-        _ => Err(RunError::ProductsShape {
-            problem: "the upload response was not an acknowledgment",
-        }),
+/// Grows a verification buffer to hold `len` elements if it is smaller,
+/// filling any new slots with the field zero, and never shrinks it.
+///
+/// Growth is the buffer's only allocation moment: once the first round
+/// has sized it to the largest row count, steady-state verification
+/// reuses the storage unchanged.
+///
+/// # Errors
+///
+/// Returns the allocation failure when the reservation is refused.
+fn ensure_capacity(buffer: &mut Vec<Field>, len: usize) -> Result<(), RunError> {
+    if buffer.len() < len {
+        buffer
+            .try_reserve_exact(len - buffer.len())
+            .map_err(|_reserve| RunError::Codec(CodecError::AllocationFailed))?;
+        let zero = PrimeField::<PROTOCOL_MODULUS>::new().element_u32(0);
+        buffer.resize(len, zero);
     }
+    Ok(())
 }
 
-/// Reads the products response, mapping a rejection to its error.
-fn read_products_reply<S: std::io::Read>(
-    stream: &mut S,
-) -> Result<(Vec<ProductEntry>, u64), RunError> {
-    let Some(header) = read_frame_header(stream)? else {
-        return Err(RunError::ProductsShape {
-            problem: "the connection closed before the products response",
-        });
-    };
-    let mut frame = FrameReader::new(stream, header.payload_len);
-    match header.kind {
-        FrameKind::Products => {
-            let products = read_products_payload(&mut frame)?;
-            frame.finish()?;
-            Ok((products, header.payload_len))
+/// Writes the plaintext matrix-vector product of one query into `out`
+/// (one slot per row), the reference every answer is compared with.
+fn plaintext_product_into(plaintext: &[Field], query: &[Field], out: &mut [Field]) {
+    let field = PrimeField::<PROTOCOL_MODULUS>::new();
+    let ell = query.len();
+    for (row, slot) in out.iter_mut().enumerate() {
+        let mut accumulator = field.element_u32(0);
+        for (column, &coefficient) in query.iter().enumerate() {
+            accumulator += plaintext[row * ell + column] * coefficient;
         }
-        FrameKind::Error => {
-            let error = read_error_payload(&mut frame)?;
-            frame.finish()?;
-            Err(RunError::Server(error))
-        }
-        _ => Err(RunError::ProductsShape {
-            problem: "the evaluation response was not a products frame",
-        }),
+        *slot = accumulator;
     }
 }
 
@@ -320,61 +616,23 @@ where
         encrypted,
     })
 }
-
-/// Decodes one answer and compares it with the plaintext product.
-fn verify_answer(
-    answer: &AnswerMatrix<PROTOCOL_MODULUS>,
-    key: &DecodingKey<PROTOCOL_MODULUS>,
-    plaintext_query: &[Field],
-    instance: &Instance,
-    matrix_id: u64,
-) -> Result<(), RunError> {
-    if answer.query_id() != key.query_id() {
-        return Err(RunError::ProductsShape {
-            problem: "an answer is paired with another query's decoding key",
-        });
-    }
-    let mut decoded_product =
-        vec![PrimeField::<PROTOCOL_MODULUS>::new().element_u32(0); instance.rows];
-    decode_into(answer, key, &mut decoded_product)?;
-    let expected = plaintext_product(&instance.plaintext, plaintext_query, instance.rows);
-    if decoded_product != expected {
-        return Err(RunError::Verification {
-            matrix_id,
-            query_id: key.query_id(),
-        });
-    }
-    Ok(())
-}
-
-/// The plaintext matrix-vector product of one query.
-fn plaintext_product(plaintext: &[Field], query: &[Field], rows: usize) -> Vec<Field> {
-    let field = PrimeField::<PROTOCOL_MODULUS>::new();
-    let ell = query.len();
-    (0..rows)
-        .map(|row| {
-            let mut accumulator = field.element_u32(0);
-            for (column, &coefficient) in query.iter().enumerate() {
-                accumulator += plaintext[row * ell + column] * coefficient;
-            }
-            accumulator
-        })
-        .collect()
-}
 #[cfg(test)]
 mod tests {
+    use std::io::{Read, Write};
     use std::os::unix::net::UnixStream;
+    use std::sync::{Arc, Mutex};
     use std::thread;
 
     use emvp::{EmvpParams, EncryptedMatrix, answer_batch};
     use emvp_network::{
-        EvaluateEntry, FrameKind, FrameReader, MatrixUpload, ProductEntry, read_evaluate_payload,
-        read_frame_header, read_upload_matrices_payload, server_handshake, write_products,
-        write_upload_accepted,
+        EvaluateEntry, FrameKind, FrameReader, MatrixUpload, ProductEntry, PROTOCOL_VERSION,
+        read_evaluate_payload, read_frame_header, read_upload_matrices_payload, server_handshake,
+        write_client_hello, write_evaluate, write_products, write_upload_accepted,
+        write_upload_matrices,
     };
     use trapdoor_matrices::ToeplitzFastProduct;
 
-    use super::{Config, run};
+    use super::{Config, Instance, Session, derive_instance, run};
     use crate::demo::{
         CONTEXT_TOEPLITZ, PROTOCOL_MODULUS, master_seed_from_u64, random_master_seed,
     };
@@ -399,11 +657,55 @@ mod tests {
         matrix: EncryptedMatrix<PROTOCOL_MODULUS>,
     }
 
+    /// How the fake server sabotages each matrix's first answer.
+    #[derive(Clone, Copy)]
+    enum Sabotage {
+        /// Faithful answers.
+        None,
+        /// Flip one answer word, corrupting the product values.
+        CorruptValues,
+        /// Rename the answer with another query's identifier.
+        WrongQueryId,
+    }
+
+    /// Rewrites one matrix's first answer in place, sabotaged by `kind`.
+    fn sabotage_answer(kind: Sabotage, answers: &mut [emvp::AnswerMatrix<PROTOCOL_MODULUS>]) {
+        let answer = &answers[0];
+        answers[0] = match kind {
+            Sabotage::CorruptValues => {
+                let field = prime_field_layer::PrimeField::<PROTOCOL_MODULUS>::new();
+                let mut values = answer.values().to_vec();
+                values[0] -= field.element_u32(1);
+                emvp::AnswerMatrix::from_parts(
+                    answer.instance_id(),
+                    answer.query_id(),
+                    values,
+                    answer.rows(),
+                    answer.blocks(),
+                )
+            }
+            Sabotage::WrongQueryId => emvp::AnswerMatrix::from_parts(
+                answer.instance_id(),
+                answer.query_id() + 1,
+                answer.values().to_vec(),
+                answer.rows(),
+                answer.blocks(),
+            ),
+            Sabotage::None => emvp::AnswerMatrix::from_parts(
+                answer.instance_id(),
+                answer.query_id(),
+                answer.values().to_vec(),
+                answer.rows(),
+                answer.blocks(),
+            ),
+        };
+    }
+
     /// Serves one session the way the server binary does, except products
-    /// are computed on the CPU, `corrupt` flips one answer word of each
-    /// matrix's first query, and `acknowledged` overrides the identifiers
-    /// of the upload acknowledgment.
-    fn fake_server(stream: &mut UnixStream, corrupt: bool, acknowledged: Option<Vec<u64>>) {
+    /// are computed on the CPU, `sabotage` rewrites one answer word or
+    /// descriptor of each matrix's first query, and `acknowledged`
+    /// overrides the identifiers of the upload acknowledgment.
+    fn fake_server(stream: &mut UnixStream, sabotage: Sabotage, acknowledged: Option<Vec<u64>>) {
         server_handshake(stream).unwrap();
         let header = read_frame_header(stream).unwrap().unwrap();
         assert_eq!(header.kind, FrameKind::UploadMatrices);
@@ -436,18 +738,8 @@ mod tests {
                 let mut answers =
                     answer_batch(&stored_matrix.params, &stored_matrix.matrix, &entry.queries)
                         .unwrap();
-                if corrupt {
-                    let answer = &answers[0];
-                    let field = prime_field_layer::PrimeField::<PROTOCOL_MODULUS>::new();
-                    let mut values = answer.values().to_vec();
-                    values[0] -= field.element_u32(1);
-                    answers[0] = emvp::AnswerMatrix::from_parts(
-                        answer.instance_id(),
-                        answer.query_id(),
-                        values,
-                        answer.rows(),
-                        answer.blocks(),
-                    );
+                if !matches!(sabotage, Sabotage::None) {
+                    sabotage_answer(sabotage, &mut answers);
                 }
                 products.push(ProductEntry {
                     matrix_id: entry.matrix_id,
@@ -468,12 +760,23 @@ mod tests {
         }
     }
 
+    /// Re-derives the demo's instances from one config, in upload order.
+    fn derive_instances(config: &Config) -> Vec<Instance> {
+        let builder = toeplitz_builder(params().n().unwrap());
+        config
+            .rows
+            .iter()
+            .enumerate()
+            .map(|(index, &rows)| derive_instance(config, index, rows, &builder).unwrap())
+            .collect()
+    }
+
     #[test]
     fn client_verifies_products_end_to_end() {
         let (mut client_stream, server_stream) = UnixStream::pair().unwrap();
         let server = thread::spawn(move || {
             let mut server_stream = server_stream;
-            fake_server(&mut server_stream, false, None);
+            fake_server(&mut server_stream, Sabotage::None, None);
         });
         let report = run::<ToeplitzFastProduct<PROTOCOL_MODULUS>, _, _>(
             &mut client_stream,
@@ -495,7 +798,7 @@ mod tests {
         let (mut client_stream, server_stream) = UnixStream::pair().unwrap();
         let server = thread::spawn(move || {
             let mut server_stream = server_stream;
-            fake_server(&mut server_stream, true, None);
+            fake_server(&mut server_stream, Sabotage::CorruptValues, None);
         });
         let outcome = run::<ToeplitzFastProduct<PROTOCOL_MODULUS>, _, _>(
             &mut client_stream,
@@ -516,11 +819,35 @@ mod tests {
     }
 
     #[test]
+    fn wrong_query_id_in_an_answer_descriptor_is_rejected() {
+        let (mut client_stream, server_stream) = UnixStream::pair().unwrap();
+        let server = thread::spawn(move || {
+            let mut server_stream = server_stream;
+            fake_server(&mut server_stream, Sabotage::WrongQueryId, None);
+        });
+        let outcome = run::<ToeplitzFastProduct<PROTOCOL_MODULUS>, _, _>(
+            &mut client_stream,
+            &config(),
+            toeplitz_builder(params().n().unwrap()),
+        );
+
+        assert!(matches!(
+            outcome,
+            Err(RunError::ProductsShape {
+                problem: "an answer is paired with another query's decoding key"
+            })
+        ));
+
+        drop(client_stream);
+        server.join().unwrap();
+    }
+
+    #[test]
     fn duplicate_acknowledged_ids_are_rejected() {
         let (mut client_stream, server_stream) = UnixStream::pair().unwrap();
         let server = thread::spawn(move || {
             let mut server_stream = server_stream;
-            fake_server(&mut server_stream, false, Some(vec![1, 1]));
+            fake_server(&mut server_stream, Sabotage::None, Some(vec![1, 1]));
         });
         let outcome = run::<ToeplitzFastProduct<PROTOCOL_MODULUS>, _, _>(
             &mut client_stream,
@@ -539,6 +866,114 @@ mod tests {
         server.join().unwrap();
     }
 
+    #[test]
+    fn two_rounds_reuse_workspaces_and_match() {
+        let (mut client_stream, server_stream) = UnixStream::pair().unwrap();
+        let server = thread::spawn(move || {
+            let mut server_stream = server_stream;
+            fake_server(&mut server_stream, Sabotage::None, None);
+        });
+        let config = config();
+        let instances = derive_instances(&config);
+        let mut session = Session::new(&mut client_stream).unwrap();
+        assert!(session.upload(&instances, config.params).unwrap() > 0);
+
+        let first = session.evaluate_and_verify(&instances, config.params).unwrap();
+        let second = session
+            .evaluate_and_verify(&instances, config.params)
+            .unwrap();
+
+        assert_eq!(first.verified_queries, 4);
+        assert_eq!(second.verified_queries, first.verified_queries);
+        assert_eq!(second.evaluate_bytes, first.evaluate_bytes);
+        assert_eq!(second.products_bytes, first.products_bytes);
+        assert_eq!(session.ack_ids.identifiers(), &[1, 2]);
+
+        drop(session);
+        drop(client_stream);
+        server.join().unwrap();
+    }
+
+    /// A stream wrapper that records every byte written through it and
+    /// passes reads straight to the inner stream.
+    struct RecordingStream {
+        inner: UnixStream,
+        written: Arc<Mutex<Vec<u8>>>,
+    }
+
+    impl Write for RecordingStream {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            let written = self.inner.write(buf)?;
+            self.written
+                .lock()
+                .unwrap()
+                .extend_from_slice(&buf[..written]);
+            Ok(written)
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            self.inner.flush()
+        }
+    }
+
+    impl Read for RecordingStream {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            self.inner.read(buf)
+        }
+    }
+
+    #[test]
+    fn send_path_frames_match_the_owned_wrapper_bytes() {
+        let (client_stream, server_stream) = UnixStream::pair().unwrap();
+        let server = thread::spawn(move || {
+            let mut server_stream = server_stream;
+            fake_server(&mut server_stream, Sabotage::None, None);
+        });
+        let written = Arc::new(Mutex::new(Vec::new()));
+        let recorded = Arc::clone(&written);
+        let mut client = RecordingStream {
+            inner: client_stream,
+            written,
+        };
+
+        let config = config();
+        let instances = derive_instances(&config);
+
+        // The golden byte sequence, built from the owned wrappers the
+        // previous implementation sent through: hello, upload, evaluate.
+        let mut expected = Vec::new();
+        write_client_hello(&mut expected, PROTOCOL_VERSION, PROTOCOL_MODULUS).unwrap();
+        let uploads: Vec<MatrixUpload> = instances
+            .iter()
+            .map(|instance| MatrixUpload {
+                params: config.params,
+                matrix: instance.encrypted.clone(),
+            })
+            .collect();
+        write_upload_matrices(&mut expected, &uploads).unwrap();
+        let entries: Vec<EvaluateEntry> = instances
+            .iter()
+            .zip(1_u64..)
+            .map(|(instance, matrix_id)| EvaluateEntry {
+                matrix_id,
+                queries: instance.queries.clone(),
+            })
+            .collect();
+        write_evaluate(&mut expected, &entries).unwrap();
+
+        let report = run::<ToeplitzFastProduct<PROTOCOL_MODULUS>, _, _>(
+            &mut client,
+            &config,
+            toeplitz_builder(params().n().unwrap()),
+        )
+        .unwrap();
+        assert_eq!(report.verified_queries, 4);
+        assert_eq!(&*recorded.lock().unwrap(), &expected);
+
+        drop(client);
+        server.join().unwrap();
+    }
+
     /// A secure-mode structural test: the whole run completes from a
     /// fresh OS master seed. No equality is asserted between draws.
     #[test]
@@ -546,7 +981,7 @@ mod tests {
         let (mut client_stream, server_stream) = UnixStream::pair().unwrap();
         let server = thread::spawn(move || {
             let mut server_stream = server_stream;
-            fake_server(&mut server_stream, false, None);
+            fake_server(&mut server_stream, Sabotage::None, None);
         });
         let mut secure_config = config();
         secure_config.master_seed = random_master_seed().unwrap();
