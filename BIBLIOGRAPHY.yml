@@ -37,18 +37,6 @@ bradbury2021:
   url: https://eprint.iacr.org/2021/1396
   note: Theorem 2 analyzes the wide-input lazy Shoup product on 32-bit SIMD lanes with planted offsets in the multiplicand, the setting of the `shoup_mul_lazy_for` kernels in `prime-field-layer/src/ntt/support.rs` (the bound is derived independently in those comments). Its uncorrected product in `[0, 2p)` with the same quotient estimate on canonical inputs backs the reduced Shoup kernel for `2^30 <= p < 2^31`, where one correction keeps every butterfly input and output in `[0, p)`.
 
-scott2017:
-  type: Article
-  title: A Note on the Implementation of the Number Theoretic Transform
-  author: "Scott, Michael"
-  date: 2017
-  page-range: 247-258
-  serial-number:
-    doi: 10.1007/978-3-319-71045-7_13
-  parent:
-    type: Proceedings
-    title: "Cryptography and Coding (16th IMA International Conference, IMACC 2017), LNCS 10655"
-
 longa2016:
   type: Article
   title: Speeding up the Number Theoretic Transform for Faster Ideal Lattice-Based Cryptography
@@ -60,6 +48,7 @@ longa2016:
   parent:
     type: Proceedings
     title: "Cryptology and Network Security (15th International Conference, CANS 2016), LNCS 10052"
+  note: "Origin customarily cited for the fused negacyclic NTT of NewHope-style implementations: with psi a primitive 2N-th root of unity and omega = psi^2, a product modulo x^N + 1 is evaluation-interpolation at the odd powers psi^(2i+1), and the identity a(psi^(2i+1)) = sum_j a_j psi^j omega^(ij) shows the negacyclic spectrum is a plain cyclic NTT of the twisted input. Longa-Naehrig absorb that twist into the per-stage twiddle tables (storing combined omega^e psi^f constants built once at plan construction), so forward and inverse butterflies map directly between coefficients and the negacyclic spectrum with the same multiplication count as the cyclic transform, and the three separate twist/untwist passes disappear. `prime-field-layer` uses the unfused folklore scheme instead (von zur Gathen-Gerhard, ch. 8): `NegacyclicPlan::convolution` in `prime-field-layer/src/ntt/convolution.rs` scales both operands by psi powers and unscales the result, paying 3N extra field multiplications per product against (N/2) log_2 N butterfly products plus N pointwise products."
 
 seiler2018:
   type: Misc
@@ -68,14 +57,6 @@ seiler2018:
   date: 2018
   serial-number: "IACR ePrint 2018/039"
   url: https://eprint.iacr.org/2018/039
-
-vanderhoeven2024:
-  type: Misc
-  title: Implementing number theoretic transforms
-  author: ["van der Hoeven, Joris", "Lecerf, Grégoire"]
-  date: 2024
-  serial-number: "HAL hal-04841449"
-  url: https://hal.science/hal-04841449
 
 fasterntt:
   type: Repository
@@ -87,7 +68,7 @@ fasterntt:
     value: https://github.com/nict-sfl/FasterNTT/commit/95179634d2edbd7ae9e1ad3c39b8609bf74d20a6
     date: 2026-09-10
   serial-number: "commit 95179634d2edbd7ae9e1ad3c39b8609bf74d20a6"
-  note: "MIT-licensed Rust NTT employing Shoup's trick for the transform, Montgomery multiplication for pointwise products, and Scott's slothy NTT ordering. Used only as a bibliographic comparison point; its source was not copied."
+  note: "MIT-licensed Rust NTT employing Shoup's trick for the transform, Montgomery multiplication for pointwise products, and a slothy per-stage sequential-twiddle NTT ordering. Used only as a bibliographic comparison point; its source was not copied."
 
 concrete-ntt:
   type: Repository
@@ -196,7 +177,7 @@ gathen2013:
   publisher: Cambridge University Press
   serial-number:
     isbn: 978-1-107-03903-2
-  note: "Chapter 9 (Newton iteration for power-series inversion) backs the `O(K log K)` truncated inverse of the reversed modulus in `prime_field-layer`'s `PolynomialReductionPlan`, replacing the `O(K^2)` schoolbook recurrence that dominated plan construction at large degrees."
+  note: "Chapter 8 (evaluation-interpolation multiplication, including convolution modulo x^N + 1 through evaluation at odd powers of a 2N-th root of unity) backs the twist-based negacyclic convolution in `NegacyclicPlan::convolution`. Chapter 9 (Newton iteration for power-series inversion) backs the `O(K log K)` truncated inverse of the reversed modulus in `prime_field-layer`'s `PolynomialReductionPlan`, replacing the `O(K^2)` schoolbook recurrence that dominated plan construction at large degrees."
 
 lemire2019:
   type: Article
@@ -668,6 +649,18 @@ rpprof:
   serial-number: "v0.18.1"
   note: "Fork of tikv/pprof-rs published as the `rpprof` crate, used for opt-in flamegraph profiling of the criterion benchmarks (`--features bench-flamegraph`, then `cargo bench -- --profile-time <secs>`); its built-in criterion integration samples CPU stacks at 1 kHz and renders per-benchmark flamegraphs."
 
+criterion:
+  type: Repository
+  title: "criterion: Statistics-driven micro-benchmarking library for Rust"
+  author: "Heisler, Brook"
+  organization: criterion-rs
+  date: 2026
+  url:
+    value: https://github.com/criterion-rs/criterion.rs
+    date: 2026-09-16
+  serial-number: "v0.8.2"
+  note: "Statistics-driven benchmarking harness used by the `prime-field-layer` and `trapdoor-matrices` benchmark suites: bootstrap confidence intervals, change-point detection against saved baselines, and optional CSV/HTML reports. Apache-2.0 OR MIT; version as pinned in `Cargo.lock`, integrated with rpprof for flamegraph profiling."
+
 aero2024:
   type: Misc
   title: "AERO: Entropy-Guided Framework for Private LLM Inference"
@@ -971,4 +964,16 @@ hayagriva:
   date: 2026
   url: https://github.com/typst/hayagriva
   note: "Reference for the YAML file format (`docs/file-format.md`) implemented by `handout/lib/bibliography.typ` and exercised by `handout/lib/bibliography-tests.typ`."
+
+emvp-code:
+  type: Repository
+  title: "Code Repository for the EMVP Project"
+  author: "Chen, Caicai"
+  organization: SecretKeyCrypto
+  date: 2025
+  url:
+    value: https://github.com/SecretKeyCrypto/Encrypted-Matrix-Vector-Products/commit/856762f5925fe873bb5cbc0401ceb5a44568efa9
+    date: 2026-09-16
+  serial-number: "commit 856762f5925fe873bb5cbc0401ceb5a44568efa9"
+  note: "Official companion code of the EMVP paper (`emvp2025`) and of the secret-key PIR paper (ePrint 2025/646), MIT-licensed, Go benchmarks driving native C++ libraries (NTT, Reed-Solomon, MVP). HEAD of `main` as of the access date; also used as a bibliographic comparison point."
 
