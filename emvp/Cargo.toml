@@ -46,6 +46,10 @@ name = "protocol"
 harness = false
 
 [[bench]]
+name = "client_throughput"
+harness = false
+
+[[bench]]
 name = "online"
 harness = false
 
