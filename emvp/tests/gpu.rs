@@ -26,6 +26,7 @@ use emvp::{
     EncryptedMatrix, EncryptedQuery, GpuAnswerer, GpuError, MaskContextId, PhaseTimings,
     ProtocolError, SecretKey, answer_into, decode_into, encrypt, query,
 };
+use prime_field_layer::arithmetic_kernels::dot_product;
 use prime_field_layer::{FieldElement, PrimeField};
 use proptest::{prelude::*, test_runner::TestCaseError};
 use rand_chacha::ChaCha20Rng;
@@ -291,12 +292,15 @@ fn gpu_answer_handles_near_modulus_operands() -> Result<(), GpuError> {
         FieldElement::<MODULUS>::try_from_raw(MODULUS - delta).unwrap()
     };
     let params = test_params(1, 1, 2);
-    // rows = [p-1, p-2] and [p-5, p-6]; query = [p-3, p-4]:
-    //   row0: (p-1)(p-3) + (p-2)(p-4) ≡ 1*3 + 2*4 = 11 (mod p)
-    //   row1: (p-5)(p-3) + (p-6)(p-4) ≡ 5*3 + 6*4 = 39 (mod p)
-    // Expected canonical Montgomery words:
-    //   11 * 301989884 mod p = 327155665
-    //   39 * 301989884 mod p = 796917593
+    // The raw words (p - delta) are canonical Montgomery residues, so the
+    // values they represent are (p - delta) * R^-1 with R = 2^32. The
+    // matvec of those represented values is
+    //   [(p-1)(p-3) + (p-2)(p-4)] * R^-2 = 11 * R^-2,
+    //   [(p-5)(p-3) + (p-6)(p-4)] * R^-2 = 39 * R^-2,
+    // and the canonical Montgomery word of a value v is v * R, so the
+    // expected answer words are 11 * R^-1 and 39 * R^-1:
+    //   11 * R^-1 mod p = 555663358
+    //   39 * R^-1 mod p = 64339959
     let encrypted =
         EncryptedMatrix::from_parts(0xBEE, 2, 2, vec![word(1), word(2), word(5), word(6)]).unwrap();
     let queries = [EncryptedQuery::from_parts(0xBEE, 0, vec![word(3), word(4)])];
@@ -308,11 +312,17 @@ fn gpu_answer_handles_near_modulus_operands() -> Result<(), GpuError> {
     let (gpu, _timings) =
         answerer.execute_answer_batch_into(&gpu_matrix, &queries, &mut workspace)?;
     let answer = gpu.answer(&queries, 0)?;
-    let field = PrimeField::<MODULUS>::new();
     let words: Vec<u32> = answer.values().iter().map(|value| value.to_raw()).collect();
-    assert_eq!(words, [327_155_665, 796_917_593]);
-    for (value, sum) in answer.values().iter().zip([11_u32, 39]) {
-        assert_eq!(*value, field.element_u32(sum));
+    assert_eq!(words, [555_663_358, 64_339_959]);
+    // Bit-identity with the CPU Montgomery dot product on the same extreme
+    // operands: the kernel must fold exactly where the accumulator is at
+    // its bound, not merely match a rescaled expectation.
+    for (answer_value, sum) in answer.values().iter().zip([[1, 2], [5, 6]]) {
+        let expected = dot_product(&[word(sum[0]), word(sum[1])], &[word(3), word(4)]).unwrap();
+        assert_eq!(
+            *answer_value, expected,
+            "GPU row diverges from CPU dot_product"
+        );
     }
     Ok(())
 }
