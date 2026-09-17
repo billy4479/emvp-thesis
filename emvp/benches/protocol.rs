@@ -14,16 +14,16 @@ use emvp::{
     encrypt, execute_answer_batch, query, query_batch, search,
 };
 use prime_field_layer::{FieldElement, PrimeField};
-use rayon::{ThreadPool, prelude::*};
+use rayon::prelude::*;
 use trapdoor_matrices::TdmMask;
 
-mod common;
+use emvp_bench_common as common;
 
 use common::{
     BlockBuilder, LLM_LAMBDA, LLM_RECORD_LENGTHS, LLM_ROW_COUNTS, MODULUS, MaskSuite, PARAMS,
-    SUITE_RAA, SUITE_RING, SUITE_TOEPLITZ, bench_parameter, benchmark_pool, derive_with, elements,
-    field_values, protocol_fixtures, protocol_fixtures_batch, raa_block, ring_block, seeded_rng,
-    suite_group, toeplitz_block,
+    SUITE_RAA, SUITE_RING, SUITE_TOEPLITZ, bench_parameter, derive_with, elements, field_values,
+    protocol_fixtures, protocol_fixtures_batch, raa_block, ring_block, seeded_rng, suite_group,
+    toeplitz_block,
 };
 
 // Quick-mode row counts, picked to keep both sides of the n-row mask-block
@@ -31,8 +31,8 @@ use common::{
 const QUICK_DERIVE_ROW_COUNTS: [usize; 2] = [128, 1025];
 const QUICK_CLIENT_ROW_COUNTS: [usize; 3] = [128, 1024, 1025];
 const QUICK_SERVER_ROW_COUNTS: [usize; 2] = [128, 1024];
-// Cases around the eight-thread answer crossover; calibration-only because
-// that boundary was measured once when sizing the rayon thread pool.
+// Cases around the serial-to-parallel answer crossover; calibration-only
+// because that boundary depends on the machine's pool size.
 const ANSWER_CALIBRATION_ROW_COUNTS: [usize; 3] = [16, 31, 32];
 // Batch size of the answer_batch cases.
 const ANSWER_BATCH: usize = 4;
@@ -100,9 +100,8 @@ fn bench_encrypt_for<M: TdmMask<MODULUS>>(
     );
 }
 
-// One query per iteration on the fixed pool: the mask evaluation inside
-// `query` sizes its parallel decision against the installed pool, so the
-// pinned pool keeps the case comparable across machines.
+// One query per iteration on rayon's global pool: the mask evaluation
+// inside `query` sizes its parallel decision against the machine's pool.
 fn bench_query_for<M: TdmMask<MODULUS>>(
     group: &mut BenchmarkGroup<'_, WallTime>,
     tag: &str,
@@ -119,20 +118,18 @@ fn bench_query_for<M: TdmMask<MODULUS>>(
         BenchmarkId::new(suite.label, bench_parameter(tag, rows)),
         |b| {
             b.iter(|| {
-                benchmark_pool().install(|| {
-                    let (encrypted_query, decoding_key) =
-                        query(black_box(&mut state), black_box(&record)).unwrap();
-                    black_box((encrypted_query, decoding_key))
-                })
+                let (encrypted_query, decoding_key) =
+                    query(black_box(&mut state), black_box(&record)).unwrap();
+                black_box((encrypted_query, decoding_key))
             });
         },
     );
 }
 
-// One query batch per iteration, either through `query_batch` on the fixed
-// pool or, as the pre-batch reference, through a sequential `query` loop
-// holding the same derived state. The counter keeps advancing across
-// iterations, so both variants generate fresh randomness each time.
+// One query batch per iteration, either through `query_batch` or, as the
+// pre-batch reference, through a sequential `query` loop holding the same
+// derived state. The counter keeps advancing across iterations, so both
+// variants generate fresh randomness each time.
 fn bench_query_batch_for<M: TdmMask<MODULUS>>(
     group: &mut BenchmarkGroup<'_, WallTime>,
     tag: &str,
@@ -149,22 +146,17 @@ fn bench_query_batch_for<M: TdmMask<MODULUS>>(
     group.bench_function(
         BenchmarkId::new(format!("batch{batch}"), bench_parameter(tag, rows)),
         |b| {
-            b.iter(|| {
-                benchmark_pool()
-                    .install(|| black_box(query_batch(black_box(&mut state), &queries).unwrap()))
-            });
+            b.iter(|| black_box(query_batch(black_box(&mut state), &queries).unwrap()));
         },
     );
     group.bench_function(
         BenchmarkId::new(format!("serial{batch}"), bench_parameter(tag, rows)),
         |b| {
             b.iter(|| {
-                benchmark_pool().install(|| {
-                    for _ in 0..batch {
-                        let artifacts = query(black_box(&mut state), black_box(&record)).unwrap();
-                        black_box(artifacts);
-                    }
-                });
+                for _ in 0..batch {
+                    let artifacts = query(black_box(&mut state), black_box(&record)).unwrap();
+                    black_box(artifacts);
+                }
             });
         },
     );
@@ -175,7 +167,6 @@ fn bench_plaintext(
     tag: &str,
     params: EmvpParams,
     rows: usize,
-    pool: &ThreadPool,
 ) {
     let matrix = field_values(rows * params.ell, 0x0a);
     let query = field_values(params.ell, 0x0b);
@@ -186,18 +177,16 @@ fn bench_plaintext(
         BenchmarkId::from_parameter(bench_parameter(tag, rows)),
         |b| {
             b.iter(|| {
-                pool.install(|| {
-                    output
-                        .par_iter_mut()
-                        .zip(matrix.par_chunks(params.ell))
-                        .for_each(|(slot, matrix_row)| {
-                            let mut accumulator = zero;
-                            for (&coefficient, &value) in matrix_row.iter().zip(&query) {
-                                accumulator += coefficient * value;
-                            }
-                            *slot = accumulator;
-                        });
-                });
+                output
+                    .par_iter_mut()
+                    .zip(matrix.par_chunks(params.ell))
+                    .for_each(|(slot, matrix_row)| {
+                        let mut accumulator = zero;
+                        for (&coefficient, &value) in matrix_row.iter().zip(&query) {
+                            accumulator += coefficient * value;
+                        }
+                        *slot = accumulator;
+                    });
                 black_box(&output);
             });
         },
@@ -209,7 +198,6 @@ fn bench_answer(
     tag: &str,
     params: EmvpParams,
     rows: usize,
-    pool: &ThreadPool,
 ) {
     let (encrypted, encrypted_query, _decoding_key) = protocol_fixtures(params, rows);
     let zero = PrimeField::<MODULUS>::new().element_u32(0);
@@ -219,14 +207,12 @@ fn bench_answer(
         BenchmarkId::from_parameter(bench_parameter(tag, rows)),
         |b| {
             b.iter(|| {
-                pool.install(|| {
-                    answer_into(
-                        black_box(&params),
-                        black_box(&encrypted),
-                        black_box(&encrypted_query),
-                        black_box(&mut output),
-                    )
-                })
+                answer_into(
+                    black_box(&params),
+                    black_box(&encrypted),
+                    black_box(&encrypted_query),
+                    black_box(&mut output),
+                )
                 .unwrap();
                 black_box(&output);
             });
@@ -235,9 +221,9 @@ fn bench_answer(
 }
 
 // The batched server answer answers `batch` queries against one encrypted
-// matrix through the plan-reserve-execute path: the plan fixes the CPU
-// tier from a snapshot of the pinned pool, the workspace is reserved once
-// per case, and every iteration executes the plan into the reused
+// matrix through the plan-reserve-execute path: the plan fixes the CPU tier
+// from a snapshot of the machine's global pool, the workspace is reserved
+// once per case, and every iteration executes the plan into the reused
 // workspace, parallelizing the flattened (query, row) grid internally
 // without allocating.
 fn bench_answer_batch(
@@ -246,10 +232,9 @@ fn bench_answer_batch(
     params: EmvpParams,
     rows: usize,
     batch: usize,
-    pool: &ThreadPool,
 ) {
     let (encrypted, queries, _decoding_keys) = protocol_fixtures_batch(params, rows, batch);
-    let plan = pool.install(|| AnswerPlan::plan(&params, &encrypted, &queries).unwrap());
+    let plan = AnswerPlan::plan(&params, &encrypted, &queries).unwrap();
     let mut workspace = AnswerWorkspace::new();
     workspace.reserve(&plan).unwrap();
     group.throughput(elements(batch * rows * params.n().unwrap()));
@@ -257,9 +242,7 @@ fn bench_answer_batch(
         BenchmarkId::new(format!("batch{batch}"), bench_parameter(tag, rows)),
         |b| {
             b.iter(|| {
-                pool.install(|| {
-                    execute_answer_batch(black_box(&plan), &mut workspace).unwrap();
-                });
+                execute_answer_batch(black_box(&plan), &mut workspace).unwrap();
             });
         },
     );
@@ -290,15 +273,12 @@ fn bench_decode(
         BenchmarkId::from_parameter(bench_parameter(tag, rows)),
         |b| {
             b.iter(|| {
-                benchmark_pool()
-                    .install(|| {
-                        decode_into(
-                            black_box(&answer_ref),
-                            black_box(&decoding_key),
-                            black_box(&mut output),
-                        )
-                    })
-                    .unwrap();
+                decode_into(
+                    black_box(&answer_ref),
+                    black_box(&decoding_key),
+                    black_box(&mut output),
+                )
+                .unwrap();
                 black_box(&output);
             });
         },
@@ -388,21 +368,14 @@ fn run_suite(criterion: &mut Criterion, tag: &str, params: EmvpParams, counts: &
     {
         let mut answer_group = suite_group(criterion, "answer", huge);
         for &rows in counts.server {
-            bench_answer(&mut answer_group, tag, params, rows, benchmark_pool());
+            bench_answer(&mut answer_group, tag, params, rows);
         }
         for &rows in counts.server {
-            bench_answer_batch(
-                &mut answer_group,
-                tag,
-                params,
-                rows,
-                ANSWER_BATCH,
-                benchmark_pool(),
-            );
+            bench_answer_batch(&mut answer_group, tag, params, rows, ANSWER_BATCH);
         }
         if !huge && bench_common::calibration_enabled() {
             for &rows in &ANSWER_CALIBRATION_ROW_COUNTS {
-                bench_answer(&mut answer_group, tag, params, rows, benchmark_pool());
+                bench_answer(&mut answer_group, tag, params, rows);
             }
         }
         answer_group.finish();
@@ -419,7 +392,7 @@ fn run_suite(criterion: &mut Criterion, tag: &str, params: EmvpParams, counts: &
     {
         let mut plaintext_group = suite_group(criterion, "plaintext", huge);
         for &rows in counts.server {
-            bench_plaintext(&mut plaintext_group, tag, params, rows, benchmark_pool());
+            bench_plaintext(&mut plaintext_group, tag, params, rows);
         }
         plaintext_group.finish();
     }

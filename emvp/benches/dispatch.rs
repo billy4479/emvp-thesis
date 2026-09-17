@@ -18,11 +18,10 @@
 //! iteration is the steady-state no-allocation cycle: the GPU tier through
 //! [`GpuAnswerer::answer_batch_plan`] plus
 //! [`GpuAnswerer::execute_answer_batch_into`], the CPU tier through
-//! [`AnswerPlan::plan`] (planned on the shared pinned pool, which fixes
+//! [`AnswerPlan::plan`] (planned on rayon's global pool, which fixes
 //! its serial-or-rayon tier) plus [`execute_answer_batch`]. The fixed
-//! parameter set, shared fixture construction
-//! (`benches/common::protocol_fixtures_batch`), and the shared pinned
-//! eight-thread CPU pool (`benches/common::benchmark_pool`) match
+//! parameter set and shared fixture construction
+//! (`benches/common::protocol_fixtures_batch`) match
 //! `benches/gpu.rs` exactly, so CPU and GPU rows are directly comparable
 //! with each other here and with the GPU suite; only the shapes differ,
 //! sweeping work from 2^16 up to 2^24 estimated field multiplications.
@@ -55,18 +54,18 @@
 //! `emvp::dispatch::MIN_GPU_MULTIPLICATIONS` (previously 2^24 from an
 //! Intel Iris Xe iGPU calibration). The sweep now runs the LLM-scale
 //! deployment parameter set (n = 8192) over the same 2^16..2^24 work
-//! range. Its fixture and pool semantics differ from legacy saved baselines;
+//! range. Its fixture semantics differ from legacy saved baselines;
 //! establish a fresh `dispatch-policy-v2` baseline on GPU-equipped hardware
-//! whenever the answer hardware or pool size changes.
+//! whenever the answer hardware changes.
 
 use std::time::Duration;
 
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use emvp::{AnswerPlan, AnswerWorkspace, GpuAnswerer, GpuError, execute_answer_batch, search};
 
-mod common;
+use emvp_bench_common as common;
 
-use common::{LLM_LAMBDA, benchmark_pool, protocol_fixtures_batch};
+use common::{LLM_LAMBDA, protocol_fixtures_batch};
 
 // LLM-scale record length for the sweep's parameter set: the same
 // parameter search and parameter set the `gpu` suite's first suite uses,
@@ -116,7 +115,6 @@ fn dispatch_benches(c: &mut Criterion) {
         params.n().unwrap(),
         params.lambda
     );
-    let pool = benchmark_pool();
     let mut group = c.benchmark_group("answer_dispatch_llm_v2");
     // Iterations at the top sizes cost tens of milliseconds each; few
     // samples and short phases keep the 28-case sweep bounded.
@@ -132,7 +130,7 @@ fn dispatch_benches(c: &mut Criterion) {
         // execute into it every iteration. The host matrix plans the arena
         // (the shape arithmetic is identical on both tiers).
         let gpu_shape = answerer.answer_batch_plan(&gpu_matrix, &queries).unwrap();
-        let host_plan = pool.install(|| AnswerPlan::plan(&params, &encrypted, &queries).unwrap());
+        let host_plan = AnswerPlan::plan(&params, &encrypted, &queries).unwrap();
         assert_eq!(gpu_shape, host_plan.shape(), "tier shapes must agree");
         let mut gpu_workspace = AnswerWorkspace::new();
         gpu_workspace.reserve(&host_plan).unwrap();
@@ -149,12 +147,12 @@ fn dispatch_benches(c: &mut Criterion) {
             },
         );
         drop(gpu_matrix);
-        // CPU reference on the shared pinned eight-thread pool, through the
-        // same plan-reserve-execute path: the plan fixes the serial or
-        // rayon tier from a pool snapshot, the workspace is reserved once
-        // and reused; small-row shapes under the parallel thresholds plan
-        // the serial CPU tier, the rest the parallel tier.
-        let cpu_plan = pool.install(|| AnswerPlan::plan(&params, &encrypted, &queries).unwrap());
+        // CPU reference on the machine's global pool, through the same
+        // plan-reserve-execute path: the plan fixes the serial or rayon
+        // tier from a pool snapshot, the workspace is reserved once and
+        // reused; small-row shapes under the parallel thresholds plan the
+        // serial CPU tier, the rest the parallel tier.
+        let cpu_plan = AnswerPlan::plan(&params, &encrypted, &queries).unwrap();
         let mut cpu_workspace = AnswerWorkspace::new();
         cpu_workspace.reserve(&cpu_plan).unwrap();
         group.bench_function(
@@ -163,8 +161,7 @@ fn dispatch_benches(c: &mut Criterion) {
                 b.iter(|| {
                     // The answers view is dropped here; the workspace's
                     // arena stays reserved for the next iteration.
-                    let _answers = pool
-                        .install(|| execute_answer_batch(&cpu_plan, &mut cpu_workspace).unwrap());
+                    let _answers = execute_answer_batch(&cpu_plan, &mut cpu_workspace).unwrap();
                 });
             },
         );

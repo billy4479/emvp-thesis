@@ -12,10 +12,9 @@
 //! rows, the plaintext-equivalent of one 7B-class attention projection, and
 //! the smallest shape the `gpu` suite pins for the server side)
 //! runs with the shared `search(4096, 128)` protocol parameters. Every
-//! measured iteration executes on the fixed eight-thread rayon pool
-//! ([`benchmark_pool`]), so the parallel decisions inside the library and
-//! the bench-side distribution see the same pool on every machine. No GPU
-//! is involved: both phases are client-side CPU work.
+//! measured iteration executes on rayon's global pool, so the library's
+//! parallel decisions see the machine's pool size and use all of its
+//! cores. No GPU is involved: both phases are client-side CPU work.
 //!
 //! - `query`: one [`query_batch`] call per iteration, the library's
 //!   parallel client path. The batch reserves one identifier range and
@@ -86,11 +85,11 @@ use emvp::{
 use prime_field_layer::{FieldElement, PrimeField};
 use trapdoor_matrices::TdmMask;
 
-mod common;
+use emvp_bench_common as common;
 
 use common::{
     BlockBuilder, LLM_LAMBDA, MODULUS, MaskSuite, SUITE_RAA, SUITE_RING, SUITE_TOEPLITZ,
-    benchmark_pool, derive_with, elements, field_values, raa_block, ring_block, toeplitz_block,
+    derive_with, elements, field_values, raa_block, ring_block, toeplitz_block,
 };
 
 // One 4096 x 4096 attention projection: the smallest shape the `gpu`
@@ -101,7 +100,7 @@ const MATRIX_ROWS: usize = 4096;
 
 // Query-batch sweep: powers of two from one query through 256 queries. Each
 // value is the number of client-phase artifacts of one measured iteration;
-// 256 queries against the eight-thread pool leave every worker with a
+// 256 queries against the machine's pool leave every worker with a
 // sustained run of independent work.
 const BATCHES: [usize; 9] = [1, 2, 4, 8, 16, 32, 64, 128, 256];
 const MAX_BATCH: usize = 256;
@@ -148,8 +147,7 @@ fn bench_query_case<M: TdmMask<MODULUS>>(
         BenchmarkId::new(format!("{}/query", suite.label), batch),
         |b| {
             b.iter(|| {
-                benchmark_pool()
-                    .install(|| black_box(query_batch(black_box(&mut *state), &queries).unwrap()))
+                black_box(query_batch(black_box(&mut *state), &queries).unwrap());
             });
         },
     );
@@ -178,7 +176,7 @@ fn decrypt_fixtures<const MODULUS: u32, M: TdmMask<MODULUS>>(
     let records = vec![record; MAX_BATCH];
     // The same parallel path the query cases measure, so the fixture batch
     // is bit-identical to what sustained serving would have produced.
-    let artifacts = benchmark_pool().install(|| query_batch(&mut *state, &records).unwrap());
+    let artifacts = query_batch(&mut *state, &records).unwrap();
     let zero = PrimeField::<MODULUS>::new().element_u32(0);
     let mut answers = Vec::with_capacity(MAX_BATCH);
     for (query, _key) in &artifacts {
@@ -230,15 +228,12 @@ fn bench_decrypt_case(
     group.throughput(elements(batch));
     group.bench_function(BenchmarkId::new("decrypt", batch), |b| {
         b.iter(|| {
-            benchmark_pool()
-                .install(|| {
-                    black_box(decode_batch_into(
-                        black_box(&answers),
-                        black_box(&decoding_keys[..batch]),
-                        black_box(&mut outputs),
-                    ))
-                })
-                .unwrap();
+            black_box(decode_batch_into(
+                black_box(&answers),
+                black_box(&decoding_keys[..batch]),
+                black_box(&mut outputs),
+            ))
+            .unwrap();
         });
     });
 }

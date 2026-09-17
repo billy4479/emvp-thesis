@@ -72,7 +72,7 @@ use emvp::{
     PhaseTimings, search,
 };
 
-mod common;
+use emvp_bench_common as common;
 
 use common::{LLM_LAMBDA, MODULUS, protocol_fixtures_batch};
 

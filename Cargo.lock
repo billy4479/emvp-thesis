@@ -430,6 +430,7 @@ dependencies = [
  "allocation-counter",
  "bench-common",
  "criterion",
+ "emvp-bench-common",
  "naga",
  "pollster",
  "prime-field-layer",
@@ -439,6 +440,19 @@ dependencies = [
  "rayon",
  "trapdoor-matrices",
  "wgpu",
+]
+
+[[package]]
+name = "emvp-bench-common"
+version = "0.1.0"
+dependencies = [
+ "criterion",
+ "emvp",
+ "prime-field-layer",
+ "rand_chacha 0.10.0",
+ "rand_core 0.10.1",
+ "rayon",
+ "trapdoor-matrices",
 ]
 
 [[package]]

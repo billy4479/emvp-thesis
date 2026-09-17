@@ -2,15 +2,8 @@
 //!
 //! Every suite builds its protocol artifacts from the same seeded builders,
 //! so measurements taken by any target refer to identical fixtures. The
-//! fixed-size rayon pools here pin the thread counts each suite's fairness
-//! contract needs; suites intentionally differ in which pool they install.
-
-// Every bench target compiles this module wholesale but uses only the
-// subset of helpers its suite needs, so each target sees some dead items.
-#![expect(
-    dead_code,
-    reason = "each bench target uses a different subset of the shared helpers"
-)]
+//! one-thread rayon pool here pins the online suite's single-core fairness
+//! contract; every other suite runs on rayon's global pool.
 
 use std::sync::OnceLock;
 
@@ -66,27 +59,13 @@ pub fn field_values(length: usize, domain: u8) -> Vec<FieldElement<MODULUS>> {
     values
 }
 
-// The fixed eight-thread pool keeps every multi-threaded suite case
-// comparable across machines and across saved baselines: without it, cases
-// measured outside an explicit pool inherit rayon's global pool, whose size
-// is whatever the benchmark machine has cores. The `protocol` suite's
-// `answer`, `plaintext`, `query`, and `decode` cases, the `online` suite's
-// serial cases' counterpart, and the GPU suites' CPU references all install
-// this pool, and every internal rayon site in the library sizes its
-// parallel decision against it. The GPU and dispatch suites use it for
-// their CPU-vs-GPU comparisons so both sides see the same pool.
-#[must_use]
-pub fn benchmark_pool() -> &'static ThreadPool {
-    static POOL: OnceLock<ThreadPool> = OnceLock::new();
-    POOL.get_or_init(|| ThreadPoolBuilder::new().num_threads(8).build().unwrap())
-}
-
 // The one-thread pool behind the online suite's fairness contract: rayon
 // work installed here stays on a single worker, and
 // `rayon::current_num_threads()` inside the library reports one, which pins
-// every internal serial/parallel decision to its serial tier. Deliberately
-// different from `benchmark_pool`: the online suite measures single-core
-// protocol overhead, not throughput.
+// every internal serial/parallel decision to its serial tier. Every other
+// suite runs on rayon's global pool, so its cases use all the cores of the
+// benchmark machine and the library's parallel decisions see the machine's
+// pool size.
 #[must_use]
 pub fn serial_pool() -> &'static ThreadPool {
     static POOL: OnceLock<ThreadPool> = OnceLock::new();

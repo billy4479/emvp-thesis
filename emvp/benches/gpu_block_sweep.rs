@@ -76,7 +76,7 @@ use emvp::{
 use prime_field_layer::arithmetic_kernels::dot_product;
 use prime_field_layer::{FieldElement, PrimeField};
 
-mod common;
+use emvp_bench_common as common;
 
 use common::{
     CONTEXT_TOEPLITZ, LLM_LAMBDA, MODULUS, derive_with, elements, field_values, toeplitz_block,

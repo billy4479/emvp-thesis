@@ -1,0 +1,19 @@
+[package]
+name = "emvp-bench-common"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[lib]
+bench = false
+
+[dependencies]
+criterion = { workspace = true }
+emvp = { path = "../.." }
+prime-field-layer = { path = "../../../prime-field-layer" }
+rand_chacha = { workspace = true }
+rand_core = { workspace = true }
+rayon = { workspace = true }
+# The shared deterministic Ring-LPN fixtures live behind the `test-utils`
+# feature; only tests and benchmarks compile them.
+trapdoor-matrices = { path = "../../../trapdoor-matrices", features = ["test-utils"] }

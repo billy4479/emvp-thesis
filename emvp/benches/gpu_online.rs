@@ -52,8 +52,8 @@
 //! - No pinned pools: the bench-side query generation runs on rayon's
 //!   global pool at its default width, strictly outside timing, so it never
 //!   lands in a measured iteration. Deliberately different from the
-//!   `online` suite's single-core contract and the `gpu` suite's
-//!   eight-thread pool.
+//!   `online` suite's single-core contract; every CPU-side suite now shares
+//!   the global pool.
 //! - Answer phase only: the measured emvp iteration is exactly the server
 //!   answer call; the same queries are answered every iteration (field
 //!   arithmetic performance is data-independent, so re-answering them
@@ -95,7 +95,7 @@ use prime_field_layer::{FieldElement, PrimeField};
 use rand_core::Rng;
 use trapdoor_matrices::ToeplitzFastProduct;
 
-mod common;
+use emvp_bench_common as common;
 
 use common::{
     CONTEXT_TOEPLITZ, LLM_LAMBDA, MODULUS, derive_with, elements, field_values, seeded_rng,
@@ -794,9 +794,7 @@ fn bench_emvp_case(
     // Plan and reserve once: the shape arithmetic only depends on (rows,
     // blocks, batch, instance), which every iteration shares.
     let host_plan = AnswerPlan::plan(&params, encrypted, &queries).unwrap();
-    let gpu_shape = answerer
-        .answer_batch_plan(gpu_matrix, &queries)
-        .unwrap();
+    let gpu_shape = answerer.answer_batch_plan(gpu_matrix, &queries).unwrap();
     assert_eq!(gpu_shape, host_plan.shape(), "tier shapes must agree");
     let mut workspace = AnswerWorkspace::<MODULUS>::new();
     workspace.reserve(&host_plan).unwrap();

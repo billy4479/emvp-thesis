@@ -46,7 +46,7 @@ use prime_field_layer::{FieldElement, PrimeField};
 use rayon::ThreadPool;
 use trapdoor_matrices::TdmMask;
 
-mod common;
+use emvp_bench_common as common;
 
 use common::{
     BlockBuilder, LLM_LAMBDA, LLM_RECORD_LENGTHS, LLM_ROW_COUNTS, MODULUS, MaskSuite, PARAMS,

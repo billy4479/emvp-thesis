@@ -1,6 +1,6 @@
 [workspace]
 members = ["emvp", "prime-field-layer", "trapdoor-matrices", "emvp-network", "server", "client"]
-exclude = ["prime-field-layer/benches/common"]
+exclude = ["emvp/benches/common", "prime-field-layer/benches/common"]
 resolver = "3"
 
 [profile.release]

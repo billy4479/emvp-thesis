@@ -23,6 +23,9 @@ criterion = { workspace = true }
 # (behind the `gpu` feature). Only the WGSL front end is pulled in; the
 # shader the device compiles is the exact string this validates.
 naga = { version = "30", default-features = false, features = ["wgsl-in"] }
+# Shared fixtures and helpers of this crate's benchmark targets, including
+# the deterministic Ring-LPN builders behind trapdoor-matrices' test-utils.
+emvp-bench-common = { path = "./benches/common" }
 proptest = { workspace = true }
 # Tests and benches build the shared deterministic Ring-LPN fixtures, which
 # live behind the `test-utils` feature. The normal dependency above stays
