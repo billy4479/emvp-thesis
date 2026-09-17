@@ -76,8 +76,8 @@
 //! and the staging copy are fused into a single pass with no intermediate
 //! allocation (all wgpu-supported hosts are little-endian, and the
 //! workspace denies `unsafe`). Readbacks map only the live slice of the
-//! staging buffer and stream the answer words straight into a caller-owned
-//! arena in one pass over the mapped bytes
+//! staging buffer and stream the answer words into a caller-owned arena
+//! through a fixed stack scratch
 //! ([`GpuAnswerer::execute_answer_batch_into`]).
 //!
 //! # Blocking behavior
@@ -438,8 +438,9 @@ pub struct PhaseTimings {
     /// run. This is the phase that waits on GPU execution.
     pub wait_readback: Duration,
     /// Reconstructing the caller's arena from the mapped staging bytes:
-    /// the checked `FieldElement::try_from_raw` word pass streaming into
-    /// the arena. Pure host work with no device dependency.
+    /// the staged bytes streaming through a fixed stack scratch while the
+    /// checked `FieldElement::try_from_raw` word pass fills the arena.
+    /// Pure host work with no device dependency.
     pub reconstruct: Duration,
 }
 
@@ -1497,19 +1498,32 @@ fn reconstruct_staged_into<const MODULUS: u32>(
     result
 }
 
+/// Size of the fixed stack scratch the staged-answer readback streams
+/// through.
+///
+/// The staging mapping is device memory read across the bus (typically a
+/// write-combined mapping), where narrow per-word loads serialize; bulk
+/// `copy_from_slice` chunks into ordinary stack memory first keep several
+/// wide reads in flight ahead of the checked per-word decode. 4 KiB is one
+/// page, sits in L1, and bounds the function's stack use; the chunking is
+/// invisible to semantics because every chunk runs the identical decode.
+const RECON_SCRATCH_BYTES: usize = 4096;
+
 /// Streams little-endian staged answer words into `dest` as canonical
 /// field elements, rejecting a corrupt word precisely.
 ///
-/// Each word is wrapped with the checked
-/// [`FieldElement::try_from_raw`](prime_field_layer::FieldElement::try_from_raw):
-/// the kernel's final fold produces canonical words, so a word outside
-/// `0..MODULUS` means a corrupt readback and is rejected as
+/// The byte length is checked against `dest` before any write, so a length
+/// mismatch leaves `dest` untouched. The remaining bytes then stream
+/// through a fixed [`RECON_SCRATCH_BYTES`] stack scratch: each chunk is
+/// bulk-copied from the source with [`slice::copy_from_slice`] and decoded
+/// chunk-ordered, so the first non-canonical word in read order is the
+/// reported one. The kernel's final fold produces canonical words, so a
+/// word outside `0..MODULUS` means a corrupt readback and is rejected as
 /// [`GpuError::NonCanonicalWord`] with the offending word, never
-/// canonicalized. The byte length is checked against `dest` before any
-/// write, so a length mismatch leaves `dest` untouched.
+/// canonicalized.
 ///
 /// This is the device-free core of the into-arena readback: one pass over
-/// the mapped bytes, no intermediate allocation.
+/// the source bytes through stack memory, no allocation.
 fn reconstruct_bytes_into<const MODULUS: u32>(
     dest: &mut [FieldElement<MODULUS>],
     bytes: &[u8],
@@ -1525,8 +1539,19 @@ fn reconstruct_bytes_into<const MODULUS: u32>(
             actual: bytes.len(),
         });
     }
-    for (slot, word) in dest.iter_mut().zip(bytes.chunks_exact(WORD_BYTES)) {
-        *slot = staged_answer_word::<MODULUS>(word)?;
+    let mut scratch = [0_u8; RECON_SCRATCH_BYTES];
+    for (dest_chunk, source_chunk) in dest
+        .chunks_mut(RECON_SCRATCH_BYTES / WORD_BYTES)
+        .zip(bytes.chunks(RECON_SCRATCH_BYTES))
+    {
+        let scratch_chunk = &mut scratch[..source_chunk.len()];
+        scratch_chunk.copy_from_slice(source_chunk);
+        for (slot, word) in dest_chunk
+            .iter_mut()
+            .zip(scratch_chunk.chunks_exact(WORD_BYTES))
+        {
+            *slot = staged_answer_word::<MODULUS>(word)?;
+        }
     }
     Ok(())
 }
@@ -1942,6 +1967,90 @@ mod tests {
         words[3] = u32::MAX;
         assert!(matches!(
             reconstruct_bytes_into::<MODULUS>(&mut poisoned_dest(), &host_bytes(&words)),
+            Err(super::GpuError::NonCanonicalWord {
+                word: u32::MAX,
+                modulus: MODULUS,
+            })
+        ));
+
+        // A byte buffer shorter than the destination is rejected
+        // fail-closed before any word is wrapped, leaving the destination
+        // poisoned untouched.
+        let bytes = host_bytes(&HOST_GOLDEN_WORDS);
+        let mut dest = poisoned_dest();
+        assert!(matches!(
+            reconstruct_bytes_into::<MODULUS>(&mut dest, &bytes[..bytes.len() - 1]),
+            Err(super::GpuError::LengthMismatch {
+                name: "staged answer bytes",
+                ..
+            })
+        ));
+        assert!(dest.iter().all(|slot| *slot == poison_sentinel()));
+    }
+
+    /// A readback spanning several [`super::RECON_SCRATCH_BYTES`] stack
+    /// chunks must reconstruct exactly: chunk boundaries and the short
+    /// tail chunk are invisible to the streamed words, and an empty
+    /// readback succeeds untouched.
+    #[test]
+    fn reconstruction_streams_across_scratch_chunks() {
+        let field = PrimeField::<MODULUS>::new();
+        // 2500 words = 3 chunks (1024 + 1024 + 452): two full scratch
+        // chunks plus a short tail, over the 4096-byte scratch. The
+        // staged words are the Montgomery images of the plain values, as
+        // the kernel leaves them.
+        let values: Vec<u32> = (0..2500)
+            .map(|index| u32::try_from(index % 997).unwrap())
+            .collect();
+        let words: Vec<u32> = values
+            .iter()
+            .map(|&value| field.element_u32(value).to_raw())
+            .collect();
+        let expected: Vec<_> = values
+            .iter()
+            .map(|&value| field.element_u32(value))
+            .collect();
+        let mut dest = vec![poison_sentinel(); words.len()];
+        reconstruct_bytes_into::<MODULUS>(&mut dest, &host_bytes(&words))
+            .expect("a multi-chunk readback must reconstruct");
+        assert_eq!(dest, expected);
+
+        let mut dest: Vec<FieldElement<MODULUS>> = Vec::new();
+        reconstruct_bytes_into::<MODULUS>(&mut dest, &[])
+            .expect("an empty readback must reconstruct trivially");
+    }
+
+    /// A non-canonical word in a later scratch chunk must be rejected with
+    /// the same precise error the first chunk raises, and the length check
+    /// must run before any write, leaving a poisoned destination untouched.
+    #[test]
+    fn reconstruction_rejects_the_first_noncanonical_word_across_chunks() {
+        // The 2000th word (inside the second 1024-word scratch chunk) is
+        // the smallest noncanonical residue; chunk-ordered decoding still
+        // reports exactly that word.
+        let mut words = vec![0; 1999];
+        words.push(MODULUS);
+        words.resize(2500, 0);
+        let mut dest = vec![poison_sentinel(); words.len()];
+        let error = reconstruct_bytes_into::<MODULUS>(&mut dest, &host_bytes(&words)).unwrap_err();
+        assert_eq!(
+            error,
+            super::GpuError::NonCanonicalWord {
+                word: MODULUS,
+                modulus: MODULUS,
+            }
+        );
+
+        // With two non-canonical words, the first in read order is the
+        // reported one.
+        let mut words = vec![0; 1999];
+        words.push(u32::MAX);
+        words.resize(2200, 0);
+        words.push(MODULUS);
+        words.resize(2500, 0);
+        let mut dest = vec![poison_sentinel(); words.len()];
+        assert!(matches!(
+            reconstruct_bytes_into::<MODULUS>(&mut dest, &host_bytes(&words)),
             Err(super::GpuError::NonCanonicalWord {
                 word: u32::MAX,
                 modulus: MODULUS,
