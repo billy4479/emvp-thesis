@@ -53,8 +53,8 @@ pub struct Segment {
     answer_offset_words: usize,
     query_words: usize,
     answer_words: usize,
-    /// Queries per kernel invocation for this segment ([`u32`]: 1 or 4,
-    /// from `gpu::queries_per_tile`); the dispatch covers
+    /// Queries per kernel invocation for this segment (1 or 4, from
+    /// `gpu::queries_per_tile`); the dispatch covers
     /// `ceil(query_count / tile) * rows * s` threads.
     tile: u32,
     workgroups_x: u32,

@@ -1622,7 +1622,10 @@ pub(crate) const fn narrow_modulus(modulus: u32) -> bool {
 /// modulus supports the narrow kernel and the batch fills a tile, otherwise
 /// the single-query kernel. The tiled kernel's clamped tail lanes make any
 /// `batch >= 4` correct (and its stores guarded), so this is purely a
-/// performance choice; protocol outputs are identical either way.
+/// performance choice; protocol outputs are identical either way. An
+/// eight-query tile was measured slower than four at every batch size on
+/// the reference GTX 1060 — the doubled register state costs more than the
+/// halved matrix stream — so four is the only tiled size.
 pub(crate) const fn queries_per_tile(modulus: u32, batch: usize) -> u32 {
     if narrow_modulus(modulus) && batch >= QUERIES_PER_TILE_MIN {
         4
