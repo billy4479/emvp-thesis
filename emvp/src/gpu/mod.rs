@@ -18,7 +18,9 @@
 //! reproduces the crate's Montgomery multiplication (REDC)
 //! on those raw words, so uploads and readbacks move the words as-is:
 //! [`GpuAnswerer::upload_matrix`] streams the raw words into the device
-//! buffer, and [`GpuAnswerer::execute_answer_batch_into`] wraps the returned
+//! buffer — permuting the wire's row-major order into the kernel's
+//! `matrix[block][t][row]` device layout in the same pass — and
+//! [`GpuAnswerer::execute_answer_batch_into`] wraps the returned
 //! words with the checked [`prime_field_layer::FieldElement::try_from_raw`].
 //! The results are bit-identical to the CPU [`crate::answer_into`], which
 //! remains the reference implementation; the parity tests in
@@ -51,10 +53,14 @@
 //! # Data flow and resource ownership
 //!
 //! [`GpuAnswerer::upload_matrix`] is the explicit upload-once step: it
-//! copies the row-major encrypted matrix into a device-side storage buffer
-//! held by the returned [`GpuEncryptedMatrix`].
+//! copies the encrypted matrix into a device-side storage buffer held by
+//! the returned [`GpuEncryptedMatrix`], permuting the wire's row-major
+//! order into the kernel's `matrix[block][t][row]` device layout (the
+//! kernel dispatches adjacent threads over matrix rows, so that layout
+//! makes every warp's matrix reads contiguous).
 //! [`GpuAnswerer::execute_answer_batch_into`] then uploads the query
-//! batch, dispatches one thread per output element, and reads the answers
+//! batch, dispatches one thread per output element (four queries per
+//! thread on narrow moduli, see `queries_per_tile`), and reads the answers
 //! back through a staging buffer.
 //!
 //! The per-batch device buffers (queries, uniform, output, staging
@@ -640,7 +646,7 @@ impl GpuAnswerer {
             },
         )?;
         let mut view = staged_write_view(&self.queue, &buffer, words_u32)?;
-        fill_matrix_view(&mut view, matrix.values());
+        fill_matrix_view(&mut view, matrix.values(), rows, n);
         drop(view);
         // Flush the one-time upload now rather than leaving it queued behind
         // the next answer batch's submission.
@@ -1404,21 +1410,38 @@ fn staged_write_view(
     })
 }
 
-/// Streams the matrix's raw Montgomery words into the staged upload view as
-/// little-endian bytes.
+/// Wire-layout source word for the permuted device-layout destination `d`.
 ///
-/// `view` is exactly `values.len()` words of `WORD_BYTES` bytes by
-/// construction, so the write fills it completely. This fuses the `to_raw`
-/// word pass, the byte conversion, and the staging copy into a single pass
-/// with no intermediate allocation; the element-wise walk is the safe
-/// (workspace `unsafe`-denying) alternative to reinterpreting the slice and
-/// is dominated by the `PCIe` transfer it feeds.
+/// The device layout is `matrix[block][t][row]` (destination word
+/// `(block * b + t) * rows + row`) over the wire layout's row-major
+/// `row * n + block * b + t`; `destination / rows` recovers `block * b + t`
+/// and `destination % rows` the row, so the source word is
+/// `(destination % rows) * n + destination / rows`. Pure host arithmetic,
+/// unit-tested for bijectivity below; [`fill_matrix_view`] applies it.
+const fn permuted_matrix_source(destination: usize, rows: usize, n: usize) -> usize {
+    (destination % rows) * n + destination / rows
+}
+
+/// Streams the encrypted matrix into the staged upload view, permuting the
+/// wire layout into the kernel's device layout.
+///
+/// With [`permuted_matrix_source`] recovering the source word from the
+/// destination index, the permutation is one destination-linear pass
+/// writing every word exactly once; the source reads stride `n` words,
+/// which is irrelevant at this frequency (one upload per matrix, feeding
+/// the `PCIe` transfer).
 fn fill_matrix_view<const MODULUS: u32>(
     view: &mut wgpu::QueueWriteBufferView,
     values: &[FieldElement<MODULUS>],
+    rows: usize,
+    n: usize,
 ) {
     let (word_bytes, _tail) = view.slice(..).into_chunks::<WORD_BYTES>();
-    word_bytes.write_iter(values.iter().map(|element| element.to_raw().to_le_bytes()));
+    for (destination, slot) in word_bytes.into_iter().enumerate() {
+        let source = permuted_matrix_source(destination, rows, n);
+        let value = values[source].to_raw().to_le_bytes();
+        slot.write(value);
+    }
 }
 
 /// Streams the query batch's raw Montgomery words into the staged upload
@@ -1743,6 +1766,32 @@ mod tests {
         for &modulus in &[998_244_353_u32, 1_073_479_681, 2_147_483_647] {
             assert_eq!(super::fold_fast_path(modulus, 2), 1);
         }
+    }
+
+    /// The matrix upload permutation must be a bijection on the matrix
+    /// words: every device word carries exactly one wire word, or some
+    /// matrix content would be lost or duplicated at upload. The hand
+    /// checks pin the `matrix[block][t][row]` layout at corner indices.
+    #[test]
+    fn matrix_upload_permutation_is_a_bijection_of_the_wire_layout() {
+        // rows = 3, n = 6 (b = 2, s = 3): 18 words.
+        let (rows, n) = (3_usize, 6_usize);
+        let mut seen = vec![false; rows * n];
+        for destination in 0..rows * n {
+            let source = super::permuted_matrix_source(destination, rows, n);
+            assert!(source < rows * n, "source {source} escapes the matrix");
+            assert!(!seen[source], "source {source} written twice");
+            seen[source] = true;
+        }
+        // Destination 0 = (block 0, t 0, row 0) carries the wire word 0;
+        // destination 1 = (block 0, t 0, row 1) carries wire word n; and
+        // destination rows = (block 0, t 1, row 0) carries wire word 1.
+        assert_eq!(super::permuted_matrix_source(0, rows, n), 0);
+        assert_eq!(super::permuted_matrix_source(1, rows, n), n);
+        assert_eq!(super::permuted_matrix_source(rows, rows, n), 1);
+        // (block 1, t 0, row 2) sits at destination b * rows + 2 = 8 and
+        // carries the wire word 2 * n + b = 2 * 6 + 2 = 14.
+        assert_eq!(super::permuted_matrix_source(8, rows, n), 2 * n + 2);
     }
 
     /// The `Dims` uniform must carry the final-fold flag in the shader's

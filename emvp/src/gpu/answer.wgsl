@@ -13,14 +13,26 @@
 //
 //     answer[g] = sum_{t < b} M[r][j * b + t] * Q[q][j * b + t]   in F_p,
 //
-// where `M` is the row-major encrypted matrix (`rows x n` words), `Q` holds
-// the `batch` encrypted queries (`batch x n` words), `n = b * s` is the
+// where `M` is the encrypted matrix (`rows x n` words), `Q` holds the
+// `batch` encrypted queries (`batch x n` words), `n = b * s` is the
 // codeword length, and `b` is the protocol block size. Host code must keep
 // `rows * n <= 2^32` and `batch * n <= 2^32` so every index below fits u32
 // without overflow; the output count is additionally capped below
 // `2^32 - 65535 * WORKGROUP_SIZE` by the host (see `MAX_ANSWER_WORDS` in
 // gpu/mod.rs) so the reconstructed thread index, which includes workgroup
 // padding, also stays inside u32.
+//
+// # Device matrix layout
+//
+// The wire layout of `M` is row-major (`r * n + j * b + t`, the CPU answer
+// arena's order), but the host uploads it permuted into the device layout
+// `matrix[j][t][r]` (word `(j * b + t) * rows + r`), and adjacent threads
+// cover adjacent rows `r` of one (query, block) pair. At one loop step the
+// warp's 32 matrix loads are then 128 contiguous bytes consumed in full,
+// and its query loads all broadcast the same word; nothing depends on L1
+// retaining strided reuse across iterations. The kernel's answers are
+// unchanged — the permutation is invisible to the arithmetic — so results
+// stay bit-identical to the CPU reference.
 //
 // # Lazy reduction
 //
@@ -73,10 +85,10 @@
 // exactly the sum of canonical Montgomery products the CPU accumulates, so
 // results stay bit-identical to the CPU reference under either path.
 //
-// The four-wide main loop issues one thread's four consecutive loads
-// together so the driver can merge them into single wide loads, and drops
-// the loop trip count fourfold; a scalar tail covers `b` values that are
-// not multiples of four.
+// The four-wide main loop issues one thread's four loads together so the
+// driver can merge them into single wide loads, and drops the loop trip
+// count fourfold; a scalar tail covers `b` values that are not multiples
+// of four.
 //
 // All protocol data here is public (encrypted matrix, encrypted queries,
 // answers), so no constant-time discipline is required on the GPU side.
@@ -341,31 +353,34 @@ fn main(
         return;
     }
     // Query-major grid matching the CPU answer arena: answers for query 0
-    // first, then query 1, and so on. Consecutive threads cover consecutive
-    // blocks of one (query, row) pair, so each iteration step reads four
-    // consecutive words per thread at a stride of `b` words (one block);
-    // the four-wide loop keeps the per-thread reads contiguous so they merge
-    // into wide load instructions. Because of the query-major order,
-    // though, a matrix row is streamed once per query: the reuses of one
-    // row across queries are separated by a whole matrix scan, so they
-    // hit DRAM rather than staying resident in L1/L2; per-thread wide
-    // loads and the row-block locality of one scan are what the cache
-    // hierarchy actually sees.
-    let block = index % dims.s;
-    let query_row = index / dims.s;
-    let row = query_row % dims.rows;
-    let query = query_row / dims.rows;
+    // first, then query 1, and so on. Adjacent threads cover adjacent
+    // matrix ROWS of one (query, block) pair — the encrypted matrix is
+    // stored permuted as `matrix[block][t][row]` (see the module comment),
+    // so at one loop step `t` the warp's 32 lanes read 128 consecutive
+    // bytes of the matrix stream and all broadcast the same query word;
+    // every cache line the kernel touches is consumed in full the moment
+    // it arrives. Each thread's four loads per step span four consecutive
+    // `t` rows of the permuted layout, so the per-thread stream is four
+    // independent sequential readers instead of one strided one. Writes
+    // scatter across one answer word per lane at a stride of `s`, which is
+    // one word per thread per kernel and negligible.
+    let row = index % dims.rows;
+    let rest = index / dims.rows;
+    let block = rest % dims.s;
+    let query = rest / dims.s;
 
-    let matrix_base = row * dims.n + block * dims.b;
+    // Permuted matrix base `block * b * rows + row`, advanced by `rows`
+    // words per `t` step; the invariant offsets are hoisted.
+    let matrix_base = block * dims.b * dims.rows + row;
     let query_base = query * dims.n + block * dims.b;
     // The accumulator starts at exact integer zero: it holds raw products,
     // not residues, so no Montgomery seed is involved.
     var accumulator = vec3<u32>(0u, 0u, 0u);
     // Four-wide main loop over the multiples of four, then a scalar tail
-    // for the remaining `b mod 4` elements. For `b` a multiple of four the
-    // thread's four reads per operand are consecutive words starting at a
-    // 16-byte-aligned offset (`b | n` keeps every block base aligned), so
-    // the driver can merge them into single wide loads.
+    // for the remaining `b mod 4` elements. The thread's four matrix reads
+    // per step sit `rows` words apart (consecutive `t` rows of the permuted
+    // layout) and its four query reads are consecutive words; the driver
+    // can merge each group into wide loads.
     //
     // For `MODULUS < 2^30` the narrow branch multiplies with `mul_30x30`
     // (three native multiplies per product) and folds each group of four
@@ -376,33 +391,39 @@ fn main(
     // pipeline constant, uniform over the dispatch.
     let narrow = MODULUS < 0x40000000u;
     let vector_end = dims.b - (dims.b % 4u);
+    let row1 = dims.rows;
+    let row2 = 2u * dims.rows;
+    let row3 = 3u * dims.rows;
+    let row4 = 4u * dims.rows;
+    var mrow = matrix_base;
     var offset: u32 = 0u;
     if (narrow) {
         while (offset < vector_end) {
-            let m0 = matrix_words[matrix_base + offset];
+            let m0 = matrix_words[mrow];
             let q0 = query_words[query_base + offset];
-            let m1 = matrix_words[matrix_base + offset + 1u];
+            let m1 = matrix_words[mrow + row1];
             let q1 = query_words[query_base + offset + 1u];
-            let m2 = matrix_words[matrix_base + offset + 2u];
+            let m2 = matrix_words[mrow + row2];
             let q2 = query_words[query_base + offset + 2u];
-            let m3 = matrix_words[matrix_base + offset + 3u];
+            let m3 = matrix_words[mrow + row3];
             let q3 = query_words[query_base + offset + 3u];
             let p0 = mul_30x30(m0, q0);
             let p1 = mul_30x30(m1, q1);
             let p2 = mul_30x30(m2, q2);
             let p3 = mul_30x30(m3, q3);
             accumulator = accumulate4(accumulator, p0, p1, p2, p3);
+            mrow = mrow + row4;
             offset = offset + 4u;
         }
     } else {
         while (offset < vector_end) {
-            let m0 = matrix_words[matrix_base + offset];
+            let m0 = matrix_words[mrow];
             let q0 = query_words[query_base + offset];
-            let m1 = matrix_words[matrix_base + offset + 1u];
+            let m1 = matrix_words[mrow + row1];
             let q1 = query_words[query_base + offset + 1u];
-            let m2 = matrix_words[matrix_base + offset + 2u];
+            let m2 = matrix_words[mrow + row2];
             let q2 = query_words[query_base + offset + 2u];
-            let m3 = matrix_words[matrix_base + offset + 3u];
+            let m3 = matrix_words[mrow + row3];
             let q3 = query_words[query_base + offset + 3u];
             let p0 = mul_32x32(m0, q0);
             let p1 = mul_32x32(m1, q1);
@@ -412,6 +433,7 @@ fn main(
             accumulator = accumulate(accumulator, p1.x, p1.y);
             accumulator = accumulate(accumulator, p2.x, p2.y);
             accumulator = accumulate(accumulator, p3.x, p3.y);
+            mrow = mrow + row4;
             offset = offset + 4u;
         }
     }
@@ -419,13 +441,19 @@ fn main(
     // nothing measurable.
     while (offset < dims.b) {
         let product = mul_32x32(
-            matrix_words[matrix_base + offset],
+            matrix_words[mrow],
             query_words[query_base + offset],
         );
         accumulator = accumulate(accumulator, product.x, product.y);
+        mrow = mrow + row1;
         offset = offset + 1u;
     }
-    answer_words[index] = fold(accumulator);
+    // The arena is query-major, then row-major, then block-major — the
+    // thread index is (query, block, row)-major after the row-dispatched
+    // lane swap, so the store slot is computed explicitly rather than
+    // taken from `index`.
+    let out = query * dims.rows * dims.s + row * dims.s + block;
+    answer_words[out] = fold(accumulator);
 }
 
 // Four-query tiled variant of `main`, for `MODULUS < 2^30` batches.
@@ -440,12 +468,13 @@ fn main(
 // accumulators of register state per thread.
 //
 // Dispatch geometry: the host launches `ceil(batch / 4) * rows * s`
-// threads, indexed by tile-group-major `index`; `index / tiles` selects
-// the query tile and `index % tiles` the `(row, block)` tile. Queries past
-// the end of the batch are clamped to the last query: their lanes load,
-// multiply, and fold duplicate data (keeping the loop branch-free and
-// every address in bounds) but their stores are individually guarded, so
-// the answers for queries `batch..` are never written.
+// threads, tile-group-major; `index / (rows * s)` selects the query tile,
+// and within one tile adjacent threads cover adjacent matrix rows (see
+// `main`). Queries past the end of the batch are clamped to the last
+// query: their lanes load, multiply, and fold duplicate data (keeping the
+// loop branch-free and every address in bounds) but their stores are
+// individually guarded, so the answers for queries `batch..` are never
+// written.
 @compute
 @workgroup_size(WORKGROUP_SIZE)
 fn main_q4(
@@ -459,13 +488,19 @@ fn main_q4(
     if index >= total {
         return;
     }
-    let tile = index % tiles;
-    let group = index / tiles;
-    let row = tile / dims.s;
-    let block = tile % dims.s;
+    // Row-dispatched lanes over the permuted matrix (see `main`): adjacent
+    // threads cover adjacent rows of one (tile-group, block), so the
+    // warp's matrix reads are contiguous and its query reads broadcast.
+    // `group` selects the query tile, `out` is the per-query answer offset
+    // inside one query's `tiles`-word arena run.
+    let row = index % dims.rows;
+    let rest = index / dims.rows;
+    let block = rest % dims.s;
+    let group = rest / dims.s;
     let first_query = group * 4u;
+    let out = row * dims.s + block;
 
-    let matrix_base = row * dims.n + block * dims.b;
+    let matrix_base = block * dims.b * dims.rows + row;
     // Clamp the tile's query indices into the batch; guarded stores below
     // decide which of the four results are real.
     let query0 = min(first_query, dims.batch - 1u);
@@ -482,12 +517,17 @@ fn main_q4(
     var acc2 = vec3<u32>(0u, 0u, 0u);
     var acc3 = vec3<u32>(0u, 0u, 0u);
     let vector_end = dims.b - (dims.b % 4u);
+    let row1 = dims.rows;
+    let row2 = 2u * dims.rows;
+    let row3 = 3u * dims.rows;
+    let row4 = 4u * dims.rows;
+    var mrow = matrix_base;
     var offset: u32 = 0u;
     while (offset < vector_end) {
-        let m0 = matrix_words[matrix_base + offset];
-        let m1 = matrix_words[matrix_base + offset + 1u];
-        let m2 = matrix_words[matrix_base + offset + 2u];
-        let m3 = matrix_words[matrix_base + offset + 3u];
+        let m0 = matrix_words[mrow];
+        let m1 = matrix_words[mrow + row1];
+        let m2 = matrix_words[mrow + row2];
+        let m3 = matrix_words[mrow + row3];
 
         let a00 = query_words[query_base0 + offset];
         let a01 = query_words[query_base0 + offset + 1u];
@@ -528,10 +568,11 @@ fn main_q4(
         let b32 = mul_30x30(m2, a32);
         let b33 = mul_30x30(m3, a33);
         acc3 = accumulate4(acc3, b30, b31, b32, b33);
+        mrow = mrow + row4;
         offset = offset + 4u;
     }
     while (offset < dims.b) {
-        let m = matrix_words[matrix_base + offset];
+        let m = matrix_words[mrow];
         let c0 = mul_30x30(m, query_words[query_base0 + offset]);
         acc0 = accumulate(acc0, c0.x, c0.y);
         let c1 = mul_30x30(m, query_words[query_base1 + offset]);
@@ -540,10 +581,11 @@ fn main_q4(
         acc2 = accumulate(acc2, c2.x, c2.y);
         let c3 = mul_30x30(m, query_words[query_base3 + offset]);
         acc3 = accumulate(acc3, c3.x, c3.y);
+        mrow = mrow + row1;
         offset = offset + 1u;
     }
 
-    let out0 = first_query * tiles + tile;
+    let out0 = first_query * tiles + out;
     answer_words[out0] = fold(acc0);
     if (first_query + 1u < dims.batch) {
         answer_words[out0 + tiles] = fold(acc1);
