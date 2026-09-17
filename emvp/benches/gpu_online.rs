@@ -36,8 +36,9 @@
 //!   isolates what masking and encryption cost on identical hardware; the
 //!   remaining emvp work is the `rows x n` expanded width the protocol
 //!   answers over (`n = 2k > ell`), which is inherent to it.
-//! - `f32/batchB-rowsR`: a tuned float32 GEMV (`gemv_f32.wgsl`:
-//!   workgroup-per-row cooperative reduction over vector-shaped loads), the
+//! - `f32/batchB-rowsR`: a tuned float32 GEMV (`gemv_f32.wgsl`: the answer
+//!   kernel's thread-per-row streaming layout over a column-major matrix
+//!   with broadcast query loads, minus the modular arithmetic), the
 //!   throughput an unencrypted f32 deployment gets from the same device.
 //!
 //! # Fairness contract
@@ -72,10 +73,14 @@
 //!
 //! # Correctness pins
 //!
-//! Once per row count, outside Criterion timing: the bench-local field path
-//! must reproduce the CPU `dot_product` word-for-word, and the f32 kernel
-//! must match a naive CPU GEMV within f32 round-off tolerance (summation
-//! order differs, so bit equality is not expected there). Both checks
+//! Once per row count, outside Criterion timing, for both entry points of
+//! each cleartext kernel (single-query and four-query tile): the bench-local
+//! field path must reproduce the CPU `dot_product` word-for-word for every
+//! query of the batch, and the f32 kernel must match a naive CPU GEMV
+//! within f32 round-off tolerance (summation order differs, so bit equality
+//! is not expected there). Checking every query of a tiled batch is what
+//! catches a grid sized for one entry point but dispatched on the other,
+//! which silently leaves most of the answer buffer uncomputed. Both checks
 //! double as pipeline and buffer warm-up for the cleartext paths.
 //!
 //! ```text
@@ -115,8 +120,9 @@ const GEMV_F32_WGSL: &str = include_str!("gemv_f32.wgsl");
 
 // Threads per workgroup of the f32 baseline kernel, passed into its
 // `@workgroup_size` override; the sweep value lives here so trying 64,
-// 128, and 256 is a one-line change.
-const F32_WORKGROUP_SIZE: u32 = 128;
+// 128, and 256 is a one-line change. Matches the answer kernel's width so
+// the two thread-per-row kernels differ only in their arithmetic.
+const F32_WORKGROUP_SIZE: u32 = 256;
 
 // The 7B-class record length; the suite runs one record length to keep the
 // case count bounded.
@@ -336,11 +342,20 @@ impl BenchDevice {
     }
 }
 
-/// The f32 baseline's two pipelines: the single-query entry point and the
-/// four-query tile, compiled from one source with one override value.
-struct F32Pipelines {
+/// One cleartext baseline's two pipelines: the single-query entry point and
+/// the four-query tile, compiled from one source with the same overrides.
+/// The field pair mirrors the library's per-tile `answer_pipeline` cache;
+/// the case grid ([`field_grid`], [`f32_grid`]) assumes the matching entry
+/// point, so [`Pipelines::for_tile`] is the only way a case picks one.
+struct Pipelines {
     single: wgpu::ComputePipeline,
     tiled: wgpu::ComputePipeline,
+}
+
+impl Pipelines {
+    const fn for_tile(&self, tile: usize) -> &wgpu::ComputePipeline {
+        if tile == 4 { &self.tiled } else { &self.single }
+    }
 }
 
 /// One cleartext path's run-wide device state: the shared bench device, the
@@ -421,14 +436,19 @@ fn grid_for(workgroup_total: usize) -> (u32, u32) {
     (x, y)
 }
 
+/// The field baseline's query tile size: the answer kernel's own policy for
+/// the bench modulus, so the grid and entry point agree with the library.
+fn field_tile(batch: usize) -> usize {
+    usize::try_from(queries_per_tile(MODULUS, batch)).unwrap()
+}
+
 /// The field baseline's dispatch grid for one `(rows, batch)`: the answer
 /// kernel selects its query tile from the bench modulus and batch exactly
 /// as the library path does, so the grid must cover
 /// `ceil(batch / tile) * rows * s` threads at [`WORKGROUP_SIZE`] per
-/// workgroup.
+/// workgroup, dispatched on the entry point of that tile.
 fn field_grid(rows: usize, batch: usize) -> (u32, u32) {
-    let tile = usize::try_from(queries_per_tile(MODULUS, batch)).unwrap();
-    let threads = batch.div_ceil(tile) * rows;
+    let threads = batch.div_ceil(field_tile(batch)) * rows;
     grid_for(threads.div_ceil(WORKGROUP_SIZE as usize))
 }
 
@@ -453,18 +473,18 @@ fn field_uniform(ell: usize, rows: usize, batch: usize) -> [u8; 32] {
 }
 
 /// The f32 baseline's query tile size: four queries per workgroup from the
-/// same batch threshold the EMVP kernel uses (`f32_q4.wgsl`'s tiled entry
-/// point), the single-query kernel below it.
+/// same batch threshold the EMVP kernel uses (`gemv_f32.wgsl`'s `main_q4`
+/// entry point), the single-query kernel below it.
 const fn f32_tile(batch: usize) -> usize {
     if batch >= 4 { 4 } else { 1 }
 }
 
-/// The f32 baseline's dispatch grid for one `(rows, batch)`: one workgroup
-/// per `ceil(batch / tile) * rows` output group.
+/// The f32 baseline's dispatch grid for one `(rows, batch)`: one thread
+/// per `ceil(batch / tile) * rows` output group at [`F32_WORKGROUP_SIZE`]
+/// threads per workgroup, dispatched on the entry point of that tile.
 fn f32_grid(rows: usize, batch: usize) -> (u32, u32) {
-    let tile = f32_tile(batch);
-    let groups = batch.div_ceil(tile) * rows;
-    grid_for(groups)
+    let threads = batch.div_ceil(f32_tile(batch)) * rows;
+    grid_for(threads.div_ceil(F32_WORKGROUP_SIZE as usize))
 }
 
 /// Encodes the f32 kernel's `Dims` uniform: `rows`, `batch`, `ell`, and the
@@ -660,29 +680,49 @@ fn f32_gemv_batch(
     reconstruct_into(&buffers.staging, buffers.answer_bytes, values, answer_value);
 }
 
-/// Pins the bench-local field path to the CPU reference: one batch-1
-/// dispatch must reproduce `dot_product` word-for-word, because it runs the
-/// identical kernel over the identical Montgomery-word representation.
-/// Runs outside Criterion timing and doubles as pipeline warm-up.
+/// Pins the bench-local field path to the CPU reference: one dispatch of
+/// `batch` copies of the record must reproduce `dot_product` word-for-word
+/// for every query, because it runs the identical kernel over the identical
+/// Montgomery-word representation. Called once per entry point (batch 1 for
+/// `main`, a tile-filling batch for `main_q4`) so a grid/entry mismatch
+/// that leaves answers uncomputed fails loudly. Runs outside Criterion
+/// timing and doubles as pipeline warm-up.
 fn check_field_parity(
     server: &CleartextServer<'_>,
     matrix: &[FieldElement<MODULUS>],
     record: &[FieldElement<MODULUS>],
     ell: usize,
     rows: usize,
+    batch: usize,
 ) {
-    let buffers = CaseBuffers::new(server.bench, FIELD_UNIFORM_BYTES, ell, rows);
-    let uniform = field_uniform(ell, rows, 1);
-    let mut answers = Vec::with_capacity(rows);
-    field_answer_batch(server, &buffers, &uniform, record, rows, 1, &mut answers);
-    assert_eq!(answers.len(), rows, "field readback length");
-    for (row, word) in answers.iter().enumerate() {
-        let expected = dot_product(&matrix[row * ell..(row + 1) * ell], record).unwrap();
-        assert_eq!(
-            *word,
-            expected.to_raw(),
-            "field GPU row {row} diverges from CPU dot_product"
-        );
+    let buffers = CaseBuffers::new(server.bench, FIELD_UNIFORM_BYTES, batch * ell, batch * rows);
+    let uniform = field_uniform(ell, rows, batch);
+    let mut answers = Vec::with_capacity(batch * rows);
+    field_answer_batch(
+        server,
+        &buffers,
+        &uniform,
+        record,
+        rows,
+        batch,
+        &mut answers,
+    );
+    assert_eq!(answers.len(), batch * rows, "field readback length");
+    // Every query is the same record, so one CPU pass serves all of them.
+    let expected: Vec<u32> = (0..rows)
+        .map(|row| {
+            dot_product(&matrix[row * ell..(row + 1) * ell], record)
+                .unwrap()
+                .to_raw()
+        })
+        .collect();
+    for (query, words) in answers.chunks_exact(rows).enumerate() {
+        for (row, (word, expected)) in words.iter().zip(&expected).enumerate() {
+            assert_eq!(
+                word, expected,
+                "field GPU q{query} row{row} diverges from CPU dot_product"
+            );
+        }
     }
 }
 
@@ -928,14 +968,20 @@ fn upload_field_matrix(
     )
 }
 
-/// Uploads one f32 matrix from its values.
-fn upload_f32_matrix(bench: &BenchDevice, values: &[f32]) -> wgpu::Buffer {
+/// Uploads one row-major `rows x ell` f32 matrix in the kernel's
+/// column-major device layout, `matrix_words[t * rows + r] = A[r][t]`, so a
+/// warp's per-step matrix loads are contiguous (the f32 analogue of the
+/// answer kernel's permuted layout). Setup-time only.
+fn upload_f32_matrix(bench: &BenchDevice, values: &[f32], rows: usize, ell: usize) -> wgpu::Buffer {
     bench.upload(
         "gpu-online-f32-matrix",
         WORD_BYTES * values.len() as u64,
         |view| {
             let (word_bytes, _tail) = view.slice(..).into_chunks::<4>();
-            word_bytes.write_iter(values.iter().map(|value| value.to_le_bytes()));
+            for (destination, slot) in word_bytes.into_iter().enumerate() {
+                let (column, row) = (destination / rows, destination % rows);
+                slot.write(values[row * ell + column].to_le_bytes());
+            }
         },
     )
 }
@@ -947,8 +993,8 @@ fn bench_row_count(
     group: &mut BenchmarkGroup<'_, WallTime>,
     answerer: &GpuAnswerer,
     bench: &BenchDevice,
-    field_pipeline: &wgpu::ComputePipeline,
-    f32_pipelines: &F32Pipelines,
+    field_pipelines: &Pipelines,
+    f32_pipelines: &Pipelines,
     params: EmvpParams,
     rows: usize,
 ) {
@@ -965,34 +1011,32 @@ fn bench_row_count(
     let f32_matrix_values = f32_values(rows * params.ell, 0x0a);
     let f32_queries = f32_values(BATCHES[BATCHES.len() - 1] * params.ell, 0x0b);
     let field_matrix = upload_field_matrix(bench, &matrix, rows, params.ell);
-    let f32_matrix = upload_f32_matrix(bench, &f32_matrix_values);
-    let field_server = CleartextServer {
+    let f32_matrix = upload_f32_matrix(bench, &f32_matrix_values, rows, params.ell);
+    let field_server = |tile| CleartextServer {
         bench,
-        pipeline: field_pipeline,
+        pipeline: field_pipelines.for_tile(tile),
         matrix: &field_matrix,
     };
-    let f32_server = CleartextServer {
+    let f32_server = |tile| CleartextServer {
         bench,
-        pipeline: &f32_pipelines.single,
-        matrix: &f32_matrix,
-    };
-    let f32_q4_server = CleartextServer {
-        bench,
-        pipeline: &f32_pipelines.tiled,
+        pipeline: f32_pipelines.for_tile(tile),
         matrix: &f32_matrix,
     };
 
-    // One-time parity pins, outside Criterion timing.
-    check_field_parity(&field_server, &matrix, &record, params.ell, rows);
+    // One-time parity pins, outside Criterion timing: both entry points of
+    // both cleartext kernels. Batch 5 fills one tile and clamps a partial
+    // one with guarded stores.
+    check_field_parity(&field_server(1), &matrix, &record, params.ell, rows, 1);
+    check_field_parity(&field_server(4), &matrix, &record, params.ell, rows, 5);
     check_f32_parity(
-        &f32_server,
+        &f32_server(1),
         &f32_matrix_values,
         &f32_queries,
         params.ell,
         rows,
     );
     check_f32_tiled_parity(
-        &f32_q4_server,
+        &f32_server(4),
         &f32_matrix_values,
         &f32_queries,
         params.ell,
@@ -1026,18 +1070,22 @@ fn bench_row_count(
             },
             answerer,
         );
-        bench_field_case(group, &tag, &field_server, &record, params.ell, rows, batch);
-        // The tiled f32 entry point serves batches that fill a tile,
-        // mirroring the EMVP kernel's tile policy.
-        let f32_case_server = if f32_tile(batch) == 4 {
-            &f32_q4_server
-        } else {
-            &f32_server
-        };
+        // Both cleartext kernels dispatch their tiled entry point for
+        // batches that fill a tile, mirroring the library's tile policy;
+        // the grid helpers assume the matching entry point.
+        bench_field_case(
+            group,
+            &tag,
+            &field_server(field_tile(batch)),
+            &record,
+            params.ell,
+            rows,
+            batch,
+        );
         bench_f32_case(
             group,
             &tag,
-            f32_case_server,
+            &f32_server(f32_tile(batch)),
             &f32_queries,
             params.ell,
             rows,
@@ -1065,14 +1113,22 @@ fn gpu_online_benches(criterion: &mut Criterion) {
             return;
         }
     };
-    let field_pipeline = bench.pipeline(
-        ANSWER_WGSL,
-        "gpu-online-field-answer.wgsl",
-        "main",
-        &field_constants(),
-    );
+    let field_pipelines = Pipelines {
+        single: bench.pipeline(
+            ANSWER_WGSL,
+            "gpu-online-field-answer.wgsl",
+            "main",
+            &field_constants(),
+        ),
+        tiled: bench.pipeline(
+            ANSWER_WGSL,
+            "gpu-online-field-answer-q4.wgsl",
+            "main_q4",
+            &field_constants(),
+        ),
+    };
     let f32_constants = [("WORKGROUP_SIZE", f64::from(F32_WORKGROUP_SIZE))];
-    let f32_pipelines = F32Pipelines {
+    let f32_pipelines = Pipelines {
         single: bench.pipeline(
             GEMV_F32_WGSL,
             "gpu-online-gemv-f32.wgsl",
@@ -1107,7 +1163,7 @@ fn gpu_online_benches(criterion: &mut Criterion) {
             &mut group,
             &answerer,
             &bench,
-            &field_pipeline,
+            &field_pipelines,
             &f32_pipelines,
             params,
             rows,

@@ -1,35 +1,41 @@
 // Tuned float32 matrix-vector product: the cleartext baseline an unencrypted
 // f32 deployment would run on the same device as the EMVP answer kernel.
 //
-// For each output pair `g = q * rows + r` (query-major, matching the EMVP
-// answer arena) the kernel computes
+// For each output `q * rows + r` (query-major, matching the EMVP answer
+// arena) the kernel computes
 //
-//     output[g] = sum_{t < ell} A[r][t] * X[q][t]      in f32,
+//     output[q * rows + r] = sum_{t < ell} A[r][t] * X[q][t]      in f32,
 //
-// where `A` is the row-major matrix (`rows x ell`), `X` holds the `batch`
-// query vectors (`batch x ell`), and all indices stay inside u32 because the
-// host caps `rows * ell` and `batch * ell` below 2^32 (at the benchmark's
-// largest shape, rows * ell = 16384 * 4096 ~ 2^26).
+// where `X` holds the `batch` query vectors (`batch x ell`, row-major) and
+// `A` is the `rows x ell` matrix stored COLUMN-MAJOR on the device, i.e.
+// `matrix_words[t * rows + r] = A[r][t]`. All indices stay inside u32
+// because the host caps `rows * ell` and `batch * ell` below 2^32 (at the
+// benchmark's largest shape, rows * ell = 16384 * 4096 ~ 2^26).
 //
-// # Workgroup-per-row cooperative design
+// # Thread-per-row streaming design
 //
-// One whole workgroup computes one (query, row) output pair, so the thread
-// count is `batch * rows * WORKGROUP_SIZE` instead of the `batch * rows` a
-// thread-per-output kernel would launch. At rows = 4096 and batch = 1 a
-// thread-per-row kernel would issue only 4096 threads, far below every
-// discrete GPU's occupancy, and would flatter the EMVP comparison at small
-// shapes; the cooperative layout keeps ~10^6 threads in flight at every
-// benchmarked shape.
+// This is the same access pattern as the EMVP answer kernel
+// (`src/gpu/answer.wgsl`): one thread per (query tile, row), adjacent lanes
+// on adjacent rows, so at one loop step `t` a warp reads 128 consecutive
+// bytes of the column-major matrix and every lane reads the SAME query word,
+// which the hardware serves as a single broadcast load. The matrix is the
+// only per-lane stream; the query costs one broadcast per step regardless of
+// the workgroup width. Each thread's four loads per step are four
+// consecutive columns, four independent sequential readers.
 //
-// Each thread accumulates a private f32 partial over its share of the row:
-// the main loop strides through the row in chunks of `4 * WORKGROUP_SIZE`
-// elements with thread `t` loading the four consecutive words at
-// `base + 4 * t` .. `+ 3`, so every iteration step reads
-// `4 * WORKGROUP_SIZE` consecutive f32 words per workgroup and the driver
-// can merge each thread's four loads into single wide loads. A scalar
-// strided tail covers `ell mod (4 * WORKGROUP_SIZE)` elements. The
-// workgroup then tree-reduces its partials through workgroup-shared memory
-// (`log2(256)` rounds, barrier after each) and thread 0 writes the result.
+// A workgroup-per-output cooperative reduction (the previous baseline) was
+// measured slower on the reference GTX 1060: it re-read the query vector per
+// lane (five loads per four MACs instead of one plus a broadcast), spread
+// each scalar load across four cache lines, and paid a seven-round barrier
+// reduction after only `ell / 512` loop iterations. The thread-per-row form
+// has no barriers and no shared memory; occupancy comes from
+// `ceil(batch / tile) * rows` threads, which the tiled entry point keeps
+// above 10^5 at every benchmarked shape.
+//
+// `main_q4` tiles four queries per thread so the matrix streams
+// `ceil(batch / 4)` times instead of once per query; tail queries are
+// clamped to the last query and their stores individually guarded,
+// mirroring the answer kernel's tiled entry point.
 //
 // Summation order differs from a sequential CPU accumulation, so results
 // are not bit-identical to a naive CPU GEMV; the benchmark pins them with a
@@ -55,12 +61,10 @@ struct Dims {
 @group(0) @binding(2) var<storage, read_write> output_words: array<f32>;
 @group(0) @binding(3) var<uniform> dims: Dims;
 
-// Per-thread partials reduced across the workgroup after the load loop:
-// the scalar array serves `main`, the vec4 array serves `main_q4` (one
-// reduction pass serves all four outputs of a tile). Each entry point
-// only pays the workgroup memory it references.
-var<workgroup> partials: array<f32, WORKGROUP_SIZE>;
-var<workgroup> partials4: array<vec4<f32>, WORKGROUP_SIZE>;
+// Linear thread index over the host's 2D dispatch grid.
+fn thread_index(local_id: vec3<u32>, workgroup: vec3<u32>) -> u32 {
+    return ((workgroup.y * dims.workgroups_x) + workgroup.x) * WORKGROUP_SIZE + local_id.x;
+}
 
 @compute
 @workgroup_size(WORKGROUP_SIZE)
@@ -68,84 +72,60 @@ fn main(
     @builtin(local_invocation_id) local_id: vec3<u32>,
     @builtin(workgroup_id) workgroup: vec3<u32>,
 ) {
-    // The host dispatches workgroups_x x workgroups_y workgroups over a
-    // linear work count of `batch * rows`; every thread reconstructs its
-    // output pair the same way the EMVP answer kernel reconstructs its
-    // answer index.
-    let pair = (workgroup.y * dims.workgroups_x) + workgroup.x;
-    if (pair >= dims.batch * dims.rows) {
+    let index = thread_index(local_id, workgroup);
+    if (index >= dims.batch * dims.rows) {
         return;
     }
-    let row = pair % dims.rows;
-    let query = pair / dims.rows;
-
-    let matrix_base = row * dims.ell;
+    let row = index % dims.rows;
+    let query = index / dims.rows;
     let query_base = query * dims.ell;
-    var accumulator = 0.0;
-    // Four-wide main loop: thread `t` covers indices
-    // `base + 4 * t .. base + 4 * t + 3` of one 4 * WORKGROUP_SIZE chunk, so
-    // each thread's four loads per operand are consecutive words at a
-    // 16-byte-aligned offset and merge into wide load instructions.
-    let chunk_span = 4u * WORKGROUP_SIZE;
-    let chunk_end = dims.ell - (dims.ell % chunk_span);
-    var base = 0u;
-    while (base < chunk_end) {
-        let index = base + local_id.x * 4u;
-        let m0 = matrix_words[matrix_base + index];
-        let q0 = query_words[query_base + index];
-        let m1 = matrix_words[matrix_base + index + 1u];
-        let q1 = query_words[query_base + index + 1u];
-        let m2 = matrix_words[matrix_base + index + 2u];
-        let q2 = query_words[query_base + index + 2u];
-        let m3 = matrix_words[matrix_base + index + 3u];
-        let q3 = query_words[query_base + index + 3u];
-        accumulator = accumulator + ((m0 * q0 + m1 * q1) + (m2 * q2 + m3 * q3));
-        base = base + chunk_span;
-    }
-    // Scalar tail for `ell mod (4 * WORKGROUP_SIZE)` elements, strided by
-    // the workgroup so the remaining loads stay coalesced.
-    var tail = chunk_end + local_id.x;
-    while (tail < dims.ell) {
-        accumulator = accumulator
-            + matrix_words[matrix_base + tail] * query_words[query_base + tail];
-        tail = tail + WORKGROUP_SIZE;
-    }
 
-    // Tree reduction: every thread publishes its partial, then rounds of
-    // half-span pairwise adds with a barrier between rounds. All threads
-    // reach every barrier because the loop bounds are workgroup-uniform and
-    // the conditional add is inside the barrier points.
-    partials[local_id.x] = accumulator;
-    workgroupBarrier();
-    var span = WORKGROUP_SIZE / 2u;
-    while (span > 0u) {
-        if (local_id.x < span) {
-            partials[local_id.x] = partials[local_id.x] + partials[local_id.x + span];
-        }
-        workgroupBarrier();
-        span = span / 2u;
+    // Four-wide main loop over the multiples of four, then a scalar tail
+    // for `ell mod 4` columns. Two accumulator pairs break the serial
+    // dependency on every add.
+    let rows1 = dims.rows;
+    let rows2 = 2u * dims.rows;
+    let rows3 = 3u * dims.rows;
+    let rows4 = 4u * dims.rows;
+    let vector_end = dims.ell - (dims.ell % 4u);
+    var acc_a = 0.0;
+    var acc_b = 0.0;
+    var column = row;
+    var offset = 0u;
+    while (offset < vector_end) {
+        let m0 = matrix_words[column];
+        let m1 = matrix_words[column + rows1];
+        let m2 = matrix_words[column + rows2];
+        let m3 = matrix_words[column + rows3];
+        let q0 = query_words[query_base + offset];
+        let q1 = query_words[query_base + offset + 1u];
+        let q2 = query_words[query_base + offset + 2u];
+        let q3 = query_words[query_base + offset + 3u];
+        acc_a = acc_a + (m0 * q0 + m1 * q1);
+        acc_b = acc_b + (m2 * q2 + m3 * q3);
+        column = column + rows4;
+        offset = offset + 4u;
     }
-    if (local_id.x == 0u) {
-        output_words[pair] = partials[0];
+    while (offset < dims.ell) {
+        acc_a = acc_a + matrix_words[column] * query_words[query_base + offset];
+        column = column + rows1;
+        offset = offset + 1u;
     }
+    output_words[query * dims.rows + row] = acc_a + acc_b;
 }
 
-// Four-query tiled variant of `main`: one workgroup computes the same row's
+// Four-query tiled variant of `main`: one thread computes the same row's
 // output for a tile of four consecutive queries, so every matrix word load
 // feeds four accumulators and the matrix is streamed `ceil(batch / 4)`
-// times instead of once per query. The loads per step are one matrix
-// chunk per thread (shared) plus four query chunks (one per accumulator);
-// the shared-memory tree reduction runs on `vec4` lanes, so one reduction
-// pass serves all four outputs. Tail queries are clamped to the last
-// query and their stores are individually guarded, mirroring the EMVP
-// answer kernel's tiled entry point.
+// times instead of once per query. Query words stay broadcast loads: all
+// lanes of a warp share the tile.
 @compute
 @workgroup_size(WORKGROUP_SIZE)
 fn main_q4(
     @builtin(local_invocation_id) local_id: vec3<u32>,
     @builtin(workgroup_id) workgroup: vec3<u32>,
 ) {
-    let index = (workgroup.y * dims.workgroups_x) + workgroup.x;
+    let index = thread_index(local_id, workgroup);
     let total = ((dims.batch + 3u) / 4u) * dims.rows;
     if (index >= total) {
         return;
@@ -153,86 +133,75 @@ fn main_q4(
     let row = index % dims.rows;
     let first_query = (index / dims.rows) * 4u;
     let last = dims.batch - 1u;
-    let query0 = min(first_query, last);
-    let query1 = min(first_query + 1u, last);
-    let query2 = min(first_query + 2u, last);
-    let query3 = min(first_query + 3u, last);
+    let query_base0 = min(first_query, last) * dims.ell;
+    let query_base1 = min(first_query + 1u, last) * dims.ell;
+    let query_base2 = min(first_query + 2u, last) * dims.ell;
+    let query_base3 = min(first_query + 3u, last) * dims.ell;
 
-    let matrix_base = row * dims.ell;
-    let query_base0 = query0 * dims.ell;
-    let query_base1 = query1 * dims.ell;
-    let query_base2 = query2 * dims.ell;
-    let query_base3 = query3 * dims.ell;
-
+    let rows1 = dims.rows;
+    let rows2 = 2u * dims.rows;
+    let rows3 = 3u * dims.rows;
+    let rows4 = 4u * dims.rows;
+    let vector_end = dims.ell - (dims.ell % 4u);
     var acc = vec4<f32>(0.0, 0.0, 0.0, 0.0);
-    let chunk_span = 4u * WORKGROUP_SIZE;
-    let chunk_end = dims.ell - (dims.ell % chunk_span);
-    var base = 0u;
-    while (base < chunk_end) {
-        let index = base + local_id.x * 4u;
-        let m0 = matrix_words[matrix_base + index];
-        let m1 = matrix_words[matrix_base + index + 1u];
-        let m2 = matrix_words[matrix_base + index + 2u];
-        let m3 = matrix_words[matrix_base + index + 3u];
-        acc.x = acc.x
-            + ((m0 * query_words[query_base0 + index]
-                + m1 * query_words[query_base0 + index + 1u])
-                + (m2 * query_words[query_base0 + index + 2u]
-                    + m3 * query_words[query_base0 + index + 3u]));
-        acc.y = acc.y
-            + ((m0 * query_words[query_base1 + index]
-                + m1 * query_words[query_base1 + index + 1u])
-                + (m2 * query_words[query_base1 + index + 2u]
-                    + m3 * query_words[query_base1 + index + 3u]));
-        acc.z = acc.z
-            + ((m0 * query_words[query_base2 + index]
-                + m1 * query_words[query_base2 + index + 1u])
-                + (m2 * query_words[query_base2 + index + 2u]
-                    + m3 * query_words[query_base2 + index + 3u]));
-        acc.w = acc.w
-            + ((m0 * query_words[query_base3 + index]
-                + m1 * query_words[query_base3 + index + 1u])
-                + (m2 * query_words[query_base3 + index + 2u]
-                    + m3 * query_words[query_base3 + index + 3u]));
-        base = base + chunk_span;
-    }
-    // Scalar tail for `ell mod (4 * WORKGROUP_SIZE)` elements, strided by
-    // the workgroup so the remaining loads stay coalesced.
-    var tail = chunk_end + local_id.x;
-    while (tail < dims.ell) {
-        let m = matrix_words[matrix_base + tail];
-        acc = acc + vec4<f32>(
-            m * query_words[query_base0 + tail],
-            m * query_words[query_base1 + tail],
-            m * query_words[query_base2 + tail],
-            m * query_words[query_base3 + tail],
+    var column = row;
+    var offset = 0u;
+    while (offset < vector_end) {
+        let m0 = matrix_words[column];
+        let m1 = matrix_words[column + rows1];
+        let m2 = matrix_words[column + rows2];
+        let m3 = matrix_words[column + rows3];
+        // One vec4 per query: its four columns of the tile's query vector.
+        let x0 = vec4<f32>(
+            query_words[query_base0 + offset],
+            query_words[query_base0 + offset + 1u],
+            query_words[query_base0 + offset + 2u],
+            query_words[query_base0 + offset + 3u],
         );
-        tail = tail + WORKGROUP_SIZE;
+        let x1 = vec4<f32>(
+            query_words[query_base1 + offset],
+            query_words[query_base1 + offset + 1u],
+            query_words[query_base1 + offset + 2u],
+            query_words[query_base1 + offset + 3u],
+        );
+        let x2 = vec4<f32>(
+            query_words[query_base2 + offset],
+            query_words[query_base2 + offset + 1u],
+            query_words[query_base2 + offset + 2u],
+            query_words[query_base2 + offset + 3u],
+        );
+        let x3 = vec4<f32>(
+            query_words[query_base3 + offset],
+            query_words[query_base3 + offset + 1u],
+            query_words[query_base3 + offset + 2u],
+            query_words[query_base3 + offset + 3u],
+        );
+        let m = vec4<f32>(m0, m1, m2, m3);
+        acc = acc + vec4<f32>(dot(m, x0), dot(m, x1), dot(m, x2), dot(m, x3));
+        column = column + rows4;
+        offset = offset + 4u;
+    }
+    while (offset < dims.ell) {
+        let m = matrix_words[column];
+        acc = acc + m * vec4<f32>(
+            query_words[query_base0 + offset],
+            query_words[query_base1 + offset],
+            query_words[query_base2 + offset],
+            query_words[query_base3 + offset],
+        );
+        column = column + rows1;
+        offset = offset + 1u;
     }
 
-    // One vec4 tree reduction serves all four outputs.
-    partials4[local_id.x] = acc;
-    workgroupBarrier();
-    var span = WORKGROUP_SIZE / 2u;
-    while (span > 0u) {
-        if (local_id.x < span) {
-            partials4[local_id.x] = partials4[local_id.x] + partials4[local_id.x + span];
-        }
-        workgroupBarrier();
-        span = span / 2u;
+    let out0 = first_query * dims.rows + row;
+    output_words[out0] = acc.x;
+    if (first_query + 1u < dims.batch) {
+        output_words[out0 + dims.rows] = acc.y;
     }
-    if (local_id.x == 0u) {
-        let sums = partials4[0];
-        // The workgroup's tile group exists, so query0 is in range.
-        output_words[first_query * dims.rows + row] = sums.x;
-        if (first_query + 1u < dims.batch) {
-            output_words[(first_query + 1u) * dims.rows + row] = sums.y;
-        }
-        if (first_query + 2u < dims.batch) {
-            output_words[(first_query + 2u) * dims.rows + row] = sums.z;
-        }
-        if (first_query + 3u < dims.batch) {
-            output_words[(first_query + 3u) * dims.rows + row] = sums.w;
-        }
+    if (first_query + 2u < dims.batch) {
+        output_words[out0 + 2u * dims.rows] = acc.z;
+    }
+    if (first_query + 3u < dims.batch) {
+        output_words[out0 + 3u * dims.rows] = acc.w;
     }
 }
