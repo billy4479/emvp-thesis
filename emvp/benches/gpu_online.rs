@@ -16,16 +16,19 @@
 //! `ell = 4096` (the 7B-class record length), under the
 //! `gpu_answer_cost_v1` group:
 //!
-//! - `emvp/batchB-rowsR`: one [`GpuAnswerer::execute_answer_batch_into`]
-//!   call per iteration — the server answer phase alone against the
-//!   device-resident encrypted matrix, covering query upload, dispatch,
-//!   readback, and host reconstruction. The batch's queries are generated
-//!   once per case outside timing, and the workspace is planned and
-//!   reserved once per case, so steady-state iterations follow the
-//!   library's plan-reserve-execute contract. This is the number a
-//!   deployment pays per encrypted batch on the server; the client-side
-//!   query and decode costs are the CPU suites' subject (`online`,
-//!   `client_throughput`).
+//! - `emvp/batchB-rowsR`: [`TOTAL_QUERIES`] queries answered per measured
+//!   iteration, split into `TOTAL_QUERIES / B`
+//!   [`GpuAnswerer::execute_answer_batch_into`] calls of `B` queries each
+//!   against the device-resident encrypted matrix — per execute: query
+//!   upload, dispatch, readback, and host reconstruction. The full query
+//!   set is generated once per case outside timing, and the workspace is
+//!   planned and reserved once for the `B`-query shape, so steady-state
+//!   iterations follow the library's plan-reserve-execute contract.
+//!   Because every case in the sweep serves the same query total, the
+//!   sweep compares batching strategies — how many queries per server
+//!   execute — on identical work, which is the deployment's real dial;
+//!   the client-side query and decode costs are the CPU suites' subject
+//!   (`online`, `client_throughput`).
 //! - `field/batchB-rowsR`: a cleartext field-element matvec of the same
 //!   logical `rows x ell` problem, served by *the same WGSL answer kernel*
 //!   the EMVP server runs, driven by bench-local wgpu plumbing with the
@@ -39,10 +42,11 @@
 //!
 //! # Fairness contract
 //!
-//! - Same logical problem: every case reports
-//!   `Throughput::Elements(rows * ell)`, so criterion's elem/s column and
-//!   every plaintext-to-protocol ratio compare directly across cases, and
-//!   with the `gpu` suite's batch grid.
+//! - Same total work: every case in a sweep answers exactly
+//!   [`TOTAL_QUERIES`] queries over the same logical `rows x ell` problem
+//!   and reports `Throughput::Elements(TOTAL_QUERIES * rows * ell)`, so
+//!   times and elem/s compare directly across the whole batch sweep and
+//!   between families.
 //! - Same device discipline: EMVP and the field baseline run the identical
 //!   kernel and pipeline constants; all three paths reuse their device
 //!   buffers and output storage across iterations exactly like the
@@ -54,10 +58,11 @@
 //!   lands in a measured iteration. Deliberately different from the
 //!   `online` suite's single-core contract; every CPU-side suite now shares
 //!   the global pool.
-//! - Answer phase only: the measured emvp iteration is exactly the server
-//!   answer call; the same queries are answered every iteration (field
-//!   arithmetic performance is data-independent, so re-answering them
-//!   measures the same work fresh queries would).
+//! - Answer phase only: the measured emvp iteration is exactly
+//!   `TOTAL_QUERIES / batch` server answer calls; the same queries are
+//!   answered every iteration (field arithmetic performance is
+//!   data-independent, so re-answering them measures the same work fresh
+//!   queries would).
 //! - One mask construction: the suite runs the toeplitz suite only;
 //!   client query cost varies slightly by construction and the `online`
 //!   suite already covers that spread on the CPU.
@@ -122,6 +127,12 @@ const ONLINE_ROW_COUNTS: [usize; 2] = [4096, 16384];
 
 // Query batches per measured iteration.
 const BATCHES: [usize; 4] = [1, 8, 64, 256];
+
+// Queries answered per measured iteration: every case in a batch sweep
+// serves exactly this many queries, split into `TOTAL_QUERIES / batch`
+// executes, so sweeping the batch size compares batching strategies on
+// identical work. Must be divisible by every entry of `BATCHES`.
+const TOTAL_QUERIES: usize = 256;
 
 // Absolute f32 tolerance of the GEMV parity pin: random [-1, 1) operands
 // over 4096-term dot products accumulate f32 round-off far below this, and
@@ -761,18 +772,22 @@ struct AnswerFixtures<'a> {
     state: &'a mut DerivedState<MODULUS, ToeplitzFastProduct<MODULUS>>,
     encrypted: &'a EncryptedMatrix<MODULUS>,
     gpu_matrix: &'a GpuEncryptedMatrix<MODULUS>,
-    /// `batch` views of one record: the same vector queried `batch` times
-    /// with fresh randomness, matching the `online` suite's round trip.
+    /// [`TOTAL_QUERIES`] views of one record: the query set is generated
+    /// from it once per case, matching the `online` suite's round trip.
     record_slices: &'a [&'a [FieldElement<MODULUS>]],
     ell: usize,
     rows: usize,
+    /// Queries per server execute: the sweep's independent variable.
+    batch: usize,
 }
 
-/// Registers the EMVP answer-phase case for one (rows, batch): the batch's
-/// queries are generated once and the workspace planned and reserved once,
-/// both strictly outside timing, then every measured iteration is exactly
-/// one [`GpuAnswerer::execute_answer_batch_into`] call into the once-
-/// reserved workspace. No client work lands in the timed iteration.
+/// Registers the EMVP answer-phase case for one (rows, batch): the full
+/// [`TOTAL_QUERIES`]-query set is generated once and the workspace planned
+/// and reserved once for the `batch`-query shape, both strictly outside
+/// timing, then every measured iteration serves the whole set as
+/// `TOTAL_QUERIES / batch` [`GpuAnswerer::execute_answer_batch_into`]
+/// calls into the once-reserved workspace. No client work lands in the
+/// timed iteration.
 fn bench_emvp_case(
     group: &mut BenchmarkGroup<'_, WallTime>,
     tag: &str,
@@ -787,32 +802,39 @@ fn bench_emvp_case(
         record_slices,
         ell,
         rows,
+        batch,
     } = fixtures;
-    // The case's query batch, generated once outside timing.
+    // The case's query set, generated once outside timing.
     let pairs = query_batch(state, record_slices).unwrap();
     let (queries, _decoding_keys): (Vec<_>, Vec<_>) = pairs.into_iter().unzip();
-    // Plan and reserve once: the shape arithmetic only depends on (rows,
-    // blocks, batch, instance), which every iteration shares.
-    let host_plan = AnswerPlan::plan(&params, encrypted, &queries).unwrap();
-    let gpu_shape = answerer.answer_batch_plan(gpu_matrix, &queries).unwrap();
+    debug_assert_eq!(queries.len(), TOTAL_QUERIES, "sweep query total");
+    // Plan and reserve once for one batch-of-`batch` shape: the shape
+    // arithmetic only depends on (rows, blocks, batch, instance), which
+    // every per-execute chunk shares.
+    let (first_chunk, _rest) = queries.split_at(batch);
+    let host_plan = AnswerPlan::plan(&params, encrypted, first_chunk).unwrap();
+    let gpu_shape = answerer.answer_batch_plan(gpu_matrix, first_chunk).unwrap();
     assert_eq!(gpu_shape, host_plan.shape(), "tier shapes must agree");
     let mut workspace = AnswerWorkspace::<MODULUS>::new();
     workspace.reserve(&host_plan).unwrap();
 
-    group.throughput(elements(rows * ell));
+    group.throughput(elements(TOTAL_QUERIES * rows * ell));
     group.bench_function(BenchmarkId::new("emvp", tag.to_owned()), |b| {
         b.iter(|| {
-            let (answers, _timings) = answerer
-                .execute_answer_batch_into(gpu_matrix, &queries, &mut workspace)
-                .unwrap();
-            black_box(&answers);
+            for chunk in queries.chunks(batch) {
+                let (answers, _timings) = answerer
+                    .execute_answer_batch_into(gpu_matrix, chunk, &mut workspace)
+                    .unwrap();
+                black_box(&answers);
+            }
         });
     });
 }
 
-/// Registers the cleartext field case for one (rows, batch): one dispatch of
-/// the same WGSL answer kernel the EMVP server runs, on unencrypted field
-/// elements with the trivial decomposition `s = 1, b = ell`.
+/// Registers the cleartext field case for one (rows, batch): `TOTAL_QUERIES
+/// / batch` dispatches of the same WGSL answer kernel the EMVP server runs,
+/// on unencrypted field elements with the trivial decomposition
+/// `s = 1, b = ell`.
 fn bench_field_case(
     group: &mut BenchmarkGroup<'_, WallTime>,
     tag: &str,
@@ -826,26 +848,31 @@ fn bench_field_case(
     let uniform = field_uniform(ell, rows, batch);
     // Reserved once, like the protocol path's workspace.
     let mut answers = Vec::with_capacity(batch * rows);
-    group.throughput(elements(rows * ell));
+    let executes = TOTAL_QUERIES / batch;
+    group.throughput(elements(TOTAL_QUERIES * rows * ell));
     group.bench_function(BenchmarkId::new("field", tag.to_owned()), |b| {
         b.iter(|| {
-            field_answer_batch(
-                server,
-                &buffers,
-                &uniform,
-                record,
-                rows,
-                batch,
-                &mut answers,
-            );
+            for _ in 0..executes {
+                field_answer_batch(
+                    server,
+                    &buffers,
+                    &uniform,
+                    record,
+                    rows,
+                    batch,
+                    &mut answers,
+                );
+            }
             black_box(&answers);
         });
     });
 }
 
 /// Registers the tuned float32 case for one (rows, batch): the f32 GEMV a
-/// cleartext deployment would run on the same device, over the same logical
-/// `rows x ell` problem.
+/// cleartext deployment would run on the same device, serving the same
+/// [`TOTAL_QUERIES`] queries as the other families. Each execute draws its
+/// `batch` queries from a distinct slice of the query pool, so the whole
+/// pool turns over once per measured iteration.
 fn bench_f32_case(
     group: &mut BenchmarkGroup<'_, WallTime>,
     tag: &str,
@@ -859,18 +886,21 @@ fn bench_f32_case(
     let uniform = f32_uniform(ell, rows, batch);
     // Reserved once, like the protocol path's workspace.
     let mut values = Vec::with_capacity(batch * rows);
-    group.throughput(elements(rows * ell));
+    let executes = TOTAL_QUERIES / batch;
+    group.throughput(elements(TOTAL_QUERIES * rows * ell));
     group.bench_function(BenchmarkId::new("f32", tag.to_owned()), |b| {
         b.iter(|| {
-            f32_gemv_batch(
-                server,
-                &buffers,
-                &uniform,
-                &queries[..batch * ell],
-                rows,
-                batch,
-                &mut values,
-            );
+            for chunk in 0..executes {
+                f32_gemv_batch(
+                    server,
+                    &buffers,
+                    &uniform,
+                    &queries[chunk * batch * ell..(chunk + 1) * batch * ell],
+                    rows,
+                    batch,
+                    &mut values,
+                );
+            }
             black_box(&values);
         });
     });
@@ -969,9 +999,18 @@ fn bench_row_count(
         rows,
     );
 
+    // The full query set every case serves: one record queried
+    // TOTAL_QUERIES times with fresh randomness, generated per case
+    // outside timing.
+    let record_slices: Vec<&[FieldElement<MODULUS>]> = vec![record.as_slice(); TOTAL_QUERIES];
+
     for &batch in &BATCHES {
+        assert_eq!(
+            TOTAL_QUERIES % batch,
+            0,
+            "sweep batches must divide the query total"
+        );
         let tag = format!("batch{batch}-rows{rows}");
-        let record_slices: Vec<&[FieldElement<MODULUS>]> = vec![record.as_slice(); batch];
         bench_emvp_case(
             group,
             &tag,
@@ -983,6 +1022,7 @@ fn bench_row_count(
                 record_slices: &record_slices,
                 ell: params.ell,
                 rows,
+                batch,
             },
             answerer,
         );
