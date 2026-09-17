@@ -121,12 +121,26 @@ montgomery1985:
   page-range: 519-521
   serial-number:
     doi: 10.2307/2007970
-  note: "Origin of Montgomery multiplication (REDC). Used in `prime-field-layer` for field-element pointwise multiplication, inverse normalization, and the wide-modulus fallback representation. The `emvp::gpu` answer kernel applies the same REDC lazily: raw products accumulate unnormalized in a 96-bit integer accumulator and one two-word fold per output (plus an `R2 = 2^64 mod p` multiply that cancels the fold's `2^-64` factor) replaces per-element reduction, halving the kernel's multiply count."
+  note: "Origin of Montgomery multiplication (REDC). Used in `prime-field-layer` for field-element pointwise multiplication, inverse normalization, and the wide-modulus fallback representation. The `emvp::gpu` answer kernel applies the same REDC lazily: raw products accumulate unnormalized in a 96-bit integer accumulator and one two-word fold per output replaces per-element reduction, halving the kernel's multiply count. The fold's second half is a two-way choice: the direct reduction of the intermediate `S1` through `R1 = 2^32 mod p` (exact whenever the block-size worst case keeps `s1_high * R1` inside a u32, see `fold_fast_path` in `emvp/src/gpu/mod.rs`), or the fallback second REDC plus an `R2 = 2^64 mod p` multiply that cancels the fold's extra `2^-32` factor."
   parent:
     type: Periodical
     title: Mathematics of Computation
     volume: 44
     issue: 170
+
+karatsuba1963:
+  type: Article
+  title: Multiplication of Many-Digital Numbers by Automatic Computers
+  author:
+    - "Karatsuba, Anatolii A."
+    - "Ofman, Yuri P."
+  date: 1963
+  page-range: 293-294
+  parent:
+    type: Periodical
+    title: Doklady Akademii Nauk SSSR
+    volume: 145
+  note: "Origin of the Karatsuba divide-and-conquer multiplication. Used in the `emvp::gpu` answer kernel's narrow hot loop: for `p < 2^30` every canonical residue splits at 15 bits into halves whose sums stay below `2^16`, so the crossing term `(a0 + a1)(b0 + b1)` fits a u32 exactly and `mul_30x30` computes each 64-bit product with three native multiplies instead of the schoolbook split's four. Moduli of `2^30` and above keep the schoolbook `mul_32x32`."
 
 montgomery1987:
   type: Article

@@ -8,7 +8,8 @@ use prime_field_layer::FieldElement;
 
 use super::{
     DIMS_UNIFORM_BYTES, GpuAnswerer, GpuEncryptedMatrix, GpuError, MAX_ANSWER_WORDS,
-    create_buffer_checked, dims_uniform_bytes, dispatch_grid, lock_recovered, staged_answer_word,
+    create_buffer_checked, dims_uniform_bytes, dispatch_grid, lock_recovered, queries_per_tile,
+    staged_answer_word,
 };
 use crate::EncryptedQuery;
 use crate::view::QueryValues;
@@ -52,6 +53,10 @@ pub struct Segment {
     answer_offset_words: usize,
     query_words: usize,
     answer_words: usize,
+    /// Queries per kernel invocation for this segment ([`u32`]: 1 or 4,
+    /// from `gpu::queries_per_tile`); the dispatch covers
+    /// `ceil(query_count / tile) * rows * s` threads.
+    tile: u32,
     workgroups_x: u32,
     workgroups_y: u32,
     uniform: [u8; DIMS_UNIFORM_BYTES as usize],
@@ -173,6 +178,7 @@ fn align_up(value: usize, alignment: usize) -> Result<usize, GpuError> {
 }
 
 fn plan_chunks(
+    modulus: u32,
     shapes: &[Shape],
     query_counts: &[usize],
     max_buffer_words: usize,
@@ -217,8 +223,14 @@ fn plan_chunks(
                     .checked_add(answer_words)
                     .ok_or(GpuError::DimensionOverflow)?;
                 if query_end <= max_buffer_words && answer_end <= max_buffer_words {
-                    let (workgroups_x, workgroups_y) = dispatch_grid(answer_words)?;
+                    let tile = queries_per_tile(modulus, count);
+                    let threads = count
+                        .div_ceil(tile as usize)
+                        .checked_mul(answer_per_query)
+                        .ok_or(GpuError::DimensionOverflow)?;
+                    let (workgroups_x, workgroups_y) = dispatch_grid(threads)?;
                     let uniform = dims_uniform_bytes(
+                        modulus,
                         shape.n,
                         shape.b,
                         shape.s,
@@ -234,6 +246,7 @@ fn plan_chunks(
                         answer_offset_words: answer_offset,
                         query_words,
                         answer_words,
+                        tile,
                         workgroups_x,
                         workgroups_y,
                         uniform,
@@ -595,6 +608,7 @@ impl GpuAnswerer {
             .collect::<Result<_, GpuError>>()?;
         let query_counts: Vec<_> = jobs.iter().map(|job| job.queries.len()).collect();
         let chunks = plan_chunks(
+            MODULUS,
             &shapes,
             &query_counts,
             max_buffer_words,
@@ -653,7 +667,6 @@ impl GpuAnswerer {
         jobs: &[PackedJob<'_, MODULUS, Q>],
         plan: &PackedPlan,
         scratch: &PackedScratch,
-        pipeline: &wgpu::ComputePipeline,
     ) -> Result<wgpu::CommandEncoder, GpuError> {
         let mut encoder = self
             .device
@@ -668,7 +681,6 @@ impl GpuAnswerer {
                     buffers,
                     segment,
                     segment_index as u64 * plan.uniform_alignment,
-                    pipeline,
                 )?;
             }
             encoder.copy_buffer_to_buffer(
@@ -689,8 +701,10 @@ impl GpuAnswerer {
         buffers: &ChunkScratch,
         segment: &Segment,
         uniform_offset: u64,
-        pipeline: &wgpu::ComputePipeline,
     ) -> Result<(), GpuError> {
+        // The segment's tile selects the entry point; both pipelines' bind
+        // group layouts are identical by construction.
+        let pipeline = self.answer_pipeline::<MODULUS>(segment.tile)?;
         let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("emvp-packed-answer-bind-group"),
             layout: &pipeline.get_bind_group_layout(0),
@@ -721,12 +735,15 @@ impl GpuAnswerer {
                 },
             ],
         });
-        let (x, y) = dispatch_grid(segment.answer_words)?;
+        // The plan stored this segment's dispatch (tile-derived thread
+        // count included); issuing it verbatim keeps plan and execution in
+        // lockstep.
+        let (x, y) = (segment.workgroups_x, segment.workgroups_y);
         let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
             label: Some("emvp-packed-answer-pass"),
             timestamp_writes: None,
         });
-        pass.set_pipeline(pipeline);
+        pass.set_pipeline(&pipeline);
         pass.set_bind_group(0, &bind_group, &[]);
         pass.dispatch_workgroups(x, y, 1);
         Ok(())
@@ -761,7 +778,6 @@ impl GpuAnswerer {
             .pop()
             .unwrap_or(PackedScratch { chunks: Vec::new() });
         scratch.prepare(&self.device, &plan.chunks, plan.uniform_alignment)?;
-        let pipeline = self.answer_pipeline::<MODULUS>();
         timings.prepare_buffers = prepare_start.elapsed();
 
         let upload_start = Instant::now();
@@ -769,7 +785,7 @@ impl GpuAnswerer {
         timings.encode_upload_queries = upload_start.elapsed();
 
         let submit_start = Instant::now();
-        let encoder = self.encode_packed_commands(jobs, plan, &scratch, &pipeline)?;
+        let encoder = self.encode_packed_commands(jobs, plan, &scratch)?;
         let submission = self.queue.submit([encoder.finish()]);
         timings.dispatch_submit = submit_start.elapsed();
 
@@ -1031,7 +1047,7 @@ mod tests {
                 s: 4,
             },
         ];
-        let chunks = plan_chunks(&shapes, &[9, 3], 256, 96, 16).unwrap();
+        let chunks = plan_chunks(MODULUS, &shapes, &[9, 3], 256, 96, 16).unwrap();
         let segments: Vec<_> = chunks.iter().flat_map(|chunk| &chunk.segments).collect();
         assert_eq!(
             segments
@@ -1054,6 +1070,7 @@ mod tests {
     #[test]
     fn planner_rejects_one_query_larger_than_a_binding() {
         let error = plan_chunks(
+            MODULUS,
             &[Shape {
                 n: 65,
                 b: 1,
@@ -1072,6 +1089,7 @@ mod tests {
     #[test]
     fn planner_aligns_every_binding_range() {
         let chunks = plan_chunks(
+            MODULUS,
             &[Shape {
                 n: 6,
                 b: 2,
@@ -1113,6 +1131,7 @@ mod tests {
             answer_offset_words,
             query_words: 0,
             answer_words,
+            tile: 1,
             workgroups_x: 0,
             workgroups_y: 0,
             uniform: [0; DIMS_UNIFORM_BYTES as usize],
@@ -1474,7 +1493,7 @@ mod tests {
                 s: 4,
             },
         ];
-        let chunks = plan_chunks(&shapes, &[9, 3], 256, 96, 16).unwrap();
+        let chunks = plan_chunks(MODULUS, &shapes, &[9, 3], 256, 96, 16).unwrap();
         let mut totals = vec![0_usize; shapes.len()];
         for segment in chunks.iter().flat_map(|chunk| &chunk.segments) {
             let shape = &shapes[segment.job];
@@ -1492,7 +1511,7 @@ mod tests {
             rows: 2,
             s: 2,
         }];
-        let split = plan_chunks(&one_job, &[10], 32, 96, 8).unwrap();
+        let split = plan_chunks(MODULUS, &one_job, &[10], 32, 96, 8).unwrap();
         assert_eq!(split.iter().flat_map(|chunk| &chunk.segments).count(), 2);
         let mut split_total = 0_usize;
         for segment in split.iter().flat_map(|chunk| &chunk.segments) {
@@ -1520,7 +1539,7 @@ mod tests {
                 s: 4,
             },
         ];
-        let chunks = plan_chunks(&shapes, &[9, 3], 256, 96, 16).unwrap();
+        let chunks = plan_chunks(MODULUS, &shapes, &[9, 3], 256, 96, 16).unwrap();
         let mut plan = PackedPlan {
             chunks,
             uniform_alignment: 64,
@@ -1546,7 +1565,7 @@ mod tests {
             rows: 2,
             s: 2,
         }];
-        plan.chunks = plan_chunks(&one_job, &[10], 32, 96, 8).unwrap();
+        plan.chunks = plan_chunks(MODULUS, &one_job, &[10], 32, 96, 8).unwrap();
         assert_eq!(plan.segment_counts(), vec![(0, 2)]);
     }
 }

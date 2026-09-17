@@ -32,14 +32,21 @@
 //!
 //! One compute pipeline exists per field modulus, cached in
 //! [`GpuAnswerer`]. The shader receives the modulus `p`, the REDC constant
-//! `-p^{-1} mod 2^32` (from [`PrimeField::montgomery_neg_inv`]), and the
+//! `-p^{-1} mod 2^32` (from [`PrimeField::montgomery_neg_inv`]), the
+//! Montgomery radix `2^32 mod p` (from [`PrimeField::montgomery_r`]), the
 //! Montgomery conversion constant `2^64 mod p` (from
-//! [`PrimeField::montgomery_r2`]) as pipeline-overridable constants compiled
-//! into the kernel. `R2` does not convert into Montgomery form — the buffers
-//! already hold Montgomery residues — it cancels the lazy accumulator's
-//! double `2^-32` fold in the kernel's final reduction. Per-call dimensions
-//! (`n`, `b`, `s`, rows, batch, dispatch width) travel in a small uniform
-//! buffer so changing protocol parameters never recompiles the pipeline.
+//! [`PrimeField::montgomery_r2`]), and the workgroup size as
+//! pipeline-overridable constants compiled into the kernel. `R1` folds the
+//! `2^32` weights of the kernel's two-word intermediate through in the
+//! direct final fold; `R2` does not convert into Montgomery form — the
+//! buffers already hold Montgomery residues — it cancels the lazy
+//! accumulator's extra `2^-32` fold in the generic final fold (see the
+//! answer shader's "Final fold" section). Which of the two final-fold
+//! paths a batch takes depends on the block size's exact worst-case bound,
+//! so it travels per call in the `Dims` uniform, not in the pipeline.
+//! Per-call dimensions (`n`, `b`, `s`, rows, batch, dispatch width) travel
+//! in the same small uniform buffer so changing protocol parameters never
+//! recompiles the pipeline.
 //!
 //! # Data flow and resource ownership
 //!
@@ -122,8 +129,10 @@ pub(crate) mod packed;
 /// The answer compute kernel, compiled once per modulus.
 const ANSWER_WGSL: &str = include_str!("answer.wgsl");
 
-/// Threads per workgroup; must match the `WORKGROUP_SIZE` const in
-/// [`ANSWER_WGSL`].
+/// Threads per workgroup. Passed into the shader as the pipeline
+/// constant the `@workgroup_size(WORKGROUP_SIZE)` override consumes, so
+/// host and device share this one definition; sweeping the size is a
+/// one-line change here.
 const WORKGROUP_SIZE: u32 = 256;
 
 /// [`WORKGROUP_SIZE`] as a host word count.
@@ -133,7 +142,8 @@ const WORKGROUP_SIZE_USIZE: usize = WORKGROUP_SIZE as usize;
 /// [`FieldElement::to_raw`] residue.
 const WORD_BYTES: usize = 4;
 
-/// Words in the `Dims` uniform: six used words plus two padding words.
+/// Words in the `Dims` uniform: six dimensions, the final-fold path flag,
+/// and one padding word.
 const DIMS_UNIFORM_WORDS: usize = 8;
 
 /// [`DIMS_UNIFORM_WORDS`] in bytes; the fixed size of every uniform buffer.
@@ -236,6 +246,15 @@ pub enum GpuError {
         /// The rejected field modulus.
         modulus: u32,
     },
+    /// A query tile size outside the kernel's supported entry points
+    /// (`1` or `4`) reached pipeline compilation. Unreachable through
+    /// [`queries_per_tile`], which only produces the supported sizes;
+    /// retained so a corrupted or hand-built plan fails closed instead of
+    /// mis-dispatching.
+    UnsupportedTile {
+        /// The rejected tile size.
+        tile: u32,
+    },
     /// A queue submission or device poll failed.
     Submission(String),
     /// Mapping or reading the staging buffer failed.
@@ -312,6 +331,10 @@ impl fmt::Display for GpuError {
             Self::UnsupportedModulus { modulus } => write!(
                 formatter,
                 "the GPU answer kernel requires 2 < modulus < 2^31, got modulus {modulus}"
+            ),
+            Self::UnsupportedTile { tile } => write!(
+                formatter,
+                "the GPU answer kernel supports query tiles of 1 or 4, got {tile}"
             ),
             Self::Submission(reason) => {
                 write!(formatter, "GPU submission or poll failed: {reason}")
@@ -487,7 +510,9 @@ impl<const MODULUS: u32> fmt::Debug for GpuEncryptedMatrix<MODULUS> {
 pub struct GpuAnswerer {
     pub(crate) device: wgpu::Device,
     pub(crate) queue: wgpu::Queue,
-    pipelines: Mutex<HashMap<u32, wgpu::ComputePipeline>>,
+    /// Compiled answer pipelines, keyed by `(modulus, queries per tile)`;
+    /// see [`queries_per_tile`].
+    pipelines: Mutex<HashMap<(u32, u32), wgpu::ComputePipeline>>,
     scratch_pool: Mutex<Vec<AnswerScratch>>,
     pub(crate) packed_scratch_pool: Mutex<Vec<packed::PackedScratch>>,
 }
@@ -807,13 +832,25 @@ impl GpuAnswerer {
     /// Derives the pipeline, dispatch grid, and uniform bytes for one
     /// validated answer shape — the shared preflight of the plan and
     /// execute paths, so both reject the same undeliverable shapes.
+    ///
+    /// The query tile size comes from [`queries_per_tile`]: the tiled
+    /// kernel dispatches `ceil(batch / tile) * rows * s` threads over the
+    /// same answer arena, so the grid covers fewer threads than the
+    /// single-query kernel while writing exactly the same words.
     fn answer_dispatch<const MODULUS: u32>(
         &self,
         shape: &AnswerShape,
     ) -> Result<AnswerDispatch, GpuError> {
-        let pipeline = self.answer_pipeline::<MODULUS>();
-        let workgroups = dispatch_grid(shape.answer_words)?;
+        let tile = queries_per_tile(MODULUS, shape.batch);
+        let pipeline = self.answer_pipeline::<MODULUS>(tile)?;
+        let threads = shape
+            .rows
+            .checked_mul(shape.s)
+            .and_then(|per_query| shape.batch.div_ceil(tile as usize).checked_mul(per_query))
+            .ok_or(GpuError::DimensionOverflow)?;
+        let workgroups = dispatch_grid(threads)?;
         let uniform = dims_uniform_bytes(
+            MODULUS,
             shape.n,
             shape.b,
             shape.s,
@@ -828,24 +865,37 @@ impl GpuAnswerer {
         })
     }
 
-    /// Returns the cached answer pipeline for this modulus, compiling it on
-    /// first use.
-    pub(crate) fn answer_pipeline<const MODULUS: u32>(&self) -> wgpu::ComputePipeline {
+    /// Returns the cached answer pipeline for `(modulus, tile)`, compiling
+    /// it on first use.
+    pub(crate) fn answer_pipeline<const MODULUS: u32>(
+        &self,
+        tile: u32,
+    ) -> Result<wgpu::ComputePipeline, GpuError> {
         // Pipelines are immutable once built, so a panic in another thread
         // mid-insert cannot have corrupted anything: recover the guard. The
         // guard is dropped before compilation so concurrent batches are not
         // blocked behind shader work.
-        let cached = lock_recovered(&self.pipelines).get(&MODULUS).cloned();
+        let key = (MODULUS, tile);
+        let cached = lock_recovered(&self.pipelines).get(&key).cloned();
         if let Some(pipeline) = cached {
-            return pipeline;
+            return Ok(pipeline);
         }
-        let pipeline = Self::build_pipeline::<MODULUS>(&self.device);
-        lock_recovered(&self.pipelines).insert(MODULUS, pipeline.clone());
-        pipeline
+        let pipeline = Self::build_pipeline::<MODULUS>(&self.device, tile)?;
+        lock_recovered(&self.pipelines).insert(key, pipeline.clone());
+        Ok(pipeline)
     }
 
-    /// Compiles [`ANSWER_WGSL`] with this modulus's Montgomery constants.
-    fn build_pipeline<const MODULUS: u32>(device: &wgpu::Device) -> wgpu::ComputePipeline {
+    /// Compiles [`ANSWER_WGSL`] with this modulus's Montgomery constants,
+    /// entering at the entry point `tile` selects: the single-query `main`
+    /// or the four-query tiled `main_q4` (see [`queries_per_tile`]).
+    fn build_pipeline<const MODULUS: u32>(
+        device: &wgpu::Device,
+        tile: u32,
+    ) -> Result<wgpu::ComputePipeline, GpuError> {
+        if tile != 1 && tile != 4 {
+            return Err(GpuError::UnsupportedTile { tile });
+        }
+        let entry_point = if tile == 4 { "main_q4" } else { "main" };
         let field = PrimeField::<MODULUS>::new();
         let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("emvp-answer.wgsl"),
@@ -905,19 +955,23 @@ impl GpuAnswerer {
         let constants = [
             ("MODULUS", f64::from(MODULUS)),
             ("NEG_INV", f64::from(field.montgomery_neg_inv())),
+            ("R1", f64::from(field.montgomery_r())),
             ("R2", f64::from(field.montgomery_r2())),
+            ("WORKGROUP_SIZE", f64::from(WORKGROUP_SIZE)),
         ];
-        device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-            label: Some("emvp-answer-pipeline"),
-            layout: Some(&pipeline_layout),
-            module: &module,
-            entry_point: Some("main"),
-            compilation_options: wgpu::PipelineCompilationOptions {
-                constants: &constants,
-                zero_initialize_workgroup_memory: true,
-            },
-            cache: None,
-        })
+        Ok(
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("emvp-answer-pipeline"),
+                layout: Some(&pipeline_layout),
+                module: &module,
+                entry_point: Some(entry_point),
+                compilation_options: wgpu::PipelineCompilationOptions {
+                    constants: &constants,
+                    zero_initialize_workgroup_memory: true,
+                },
+                cache: None,
+            }),
+        )
     }
 
     /// Rejects a buffer of `words` u32 words that exceeds the device's
@@ -1495,12 +1549,17 @@ pub(crate) fn dispatch_grid(answer_words: usize) -> Result<(u32, u32), GpuError>
 }
 
 /// Encodes the `Dims` uniform: `n`, `b`, `s`, `rows`, `batch`,
-/// `workgroups_x`, then two padding words.
+/// `workgroups_x`, the final-fold path flag, and one padding word.
+///
+/// `modulus` selects the kernel's final-fold path: when
+/// [`fold_fast_path`] holds for the call's block size, the direct `S1`
+/// reduction flag is set (see the answer shader's "Final fold" section).
 ///
 /// Callers must have validated the usize dimensions against the kernel's
 /// u32 index bounds before calling; the narrowings here fail closed with
 /// [`GpuError::DimensionOverflow`].
 pub(crate) fn dims_uniform_bytes(
+    modulus: u32,
     n: usize,
     b: usize,
     s: usize,
@@ -1517,7 +1576,61 @@ pub(crate) fn dims_uniform_bytes(
         let word = u32::try_from(dimension).map_err(|_conversion| GpuError::DimensionOverflow)?;
         slot.copy_from_slice(&word.to_le_bytes());
     }
+    let flag = fold_fast_path(modulus, b);
+    bytes[DIMS_FLAG_OFFSET..DIMS_FLAG_OFFSET + WORD_BYTES].copy_from_slice(&flag.to_le_bytes());
     Ok(bytes)
+}
+
+/// Byte offset of the kernel's `Dims.fast_fold` flag inside the uniform.
+const DIMS_FLAG_OFFSET: usize = 6 * WORD_BYTES;
+
+/// Smallest batch the four-query tiled kernel serves; below it the tile's
+/// clamped idle lanes cost more than the saved matrix traffic.
+const QUERIES_PER_TILE_MIN: usize = 4;
+
+/// Narrow-modulus predicate mirroring the shader's hot-loop gate: only a
+/// `MODULUS < 2^30` makes every canonical residue fit the 15-bit Karatsuba
+/// split, and only those moduli get the narrow kernels at all.
+pub(crate) const fn narrow_modulus(modulus: u32) -> bool {
+    modulus < 1_u32 << 30
+}
+
+/// The query tile size for one batch: four queries per invocation when the
+/// modulus supports the narrow kernel and the batch fills a tile, otherwise
+/// the single-query kernel. The tiled kernel's clamped tail lanes make any
+/// `batch >= 4` correct (and its stores guarded), so this is purely a
+/// performance choice; protocol outputs are identical either way.
+pub(crate) const fn queries_per_tile(modulus: u32, batch: usize) -> u32 {
+    if narrow_modulus(modulus) && batch >= QUERIES_PER_TILE_MIN {
+        4
+    } else {
+        1
+    }
+}
+
+/// Decides whether the answer kernel's direct final-fold reduction of `S1`
+/// is exact for a batch of block size `b` over `modulus`.
+///
+/// The shader's first fold step produces `S1 = s1_low + s1_high * 2^32`
+/// with the exact worst case
+///
+/// ```text
+/// s1_high <= ((b * (p-1)^2) + (2^32 - 1) * p) / 2^64
+/// ```
+///
+/// (`b` products of canonical residues, plus the fold's `m * p` term whose
+/// multiplier fills a u32). The direct path replaces the second REDC step
+/// and the `R2` fixup with a cascade multiplying by `R1 = 2^32 mod p`,
+/// which is exact iff the first pass's product `s1_high * R1` stays below
+/// `2^32`; every later pass carries `s1_high <= 1` and shrinks strictly,
+/// so the first bound is the only one that matters. Evaluated in `u128`,
+/// which holds every intermediate (`b <= 2^32`, `p < 2^31`).
+fn fold_fast_path(modulus: u32, b: usize) -> u32 {
+    let p = u128::from(modulus);
+    let products = u128::from(b as u64) * (p - 1) * (p - 1);
+    let s1_high_max = (products + u128::from(u32::MAX) * p) >> 64;
+    let r1 = (1_u128 << 32) % p;
+    u32::from(s1_high_max * r1 <= u128::from(u32::MAX))
 }
 
 /// Rejects moduli the WGSL arithmetic cannot support: the REDC bound
@@ -1563,6 +1676,98 @@ mod tests {
         )
         .validate(&module)
         .expect("the answer shader must validate");
+    }
+
+    /// The shader's `WORKGROUP_SIZE` must stay a pipeline-overridable
+    /// constant whose default matches the host's [`WORKGROUP_SIZE`], so the
+    /// host's dispatch arithmetic and the kernel's index reconstruction
+    /// always describe the same geometry.
+    #[test]
+    fn shader_workgroup_size_default_matches_the_host() {
+        use super::WORKGROUP_SIZE;
+        let module =
+            naga::front::wgsl::parse_str(ANSWER_WGSL).expect("the answer shader must parse");
+        let default = module.overrides.iter().find_map(|(_handle, constant)| {
+            let is_workgroup_size = constant.name.as_deref() == Some("WORKGROUP_SIZE");
+            is_workgroup_size.then_some(constant.init)
+        });
+        let Some(Some(init)) = default else {
+            panic!("WORKGROUP_SIZE must be a module-scope override with a default");
+        };
+        let literal = &module.global_expressions[init];
+        let naga::Expression::Literal(naga::Literal::U32(value)) = literal else {
+            panic!("WORKGROUP_SIZE must default to a u32 literal");
+        };
+        assert_eq!(*value, WORKGROUP_SIZE);
+    }
+
+    /// The direct final-fold flag must be set exactly when the block size's
+    /// worst-case `s1_high` satisfies `s1_high * (2^32 mod p) < 2^32` — the
+    /// first cascade pass's exactness condition — and clear one block size
+    /// past the boundary. The boundary values below were derived by direct
+    /// maximization of the shader's fold bounds (`s1_high <=
+    /// ((b * (p-1)^2) + (2^32-1) * p) / 2^64`), independently of this
+    /// implementation.
+    #[test]
+    fn fold_fast_path_flag_tracks_the_exact_s1_high_bound() {
+        let cases: &[(u32, usize, usize, &str)] = &[
+            // Deployment prime: R1 = 301989884, s1_high cap 14 -> b <= 273.
+            (998_244_353, 273, 274, "998244353"),
+            // NTT prime: R1 = 1048572, s1_high cap 4095 -> b <= 65580.
+            (1_073_479_681, 65_580, 65_581, "1073479681"),
+            // Widest supported prime: R1 = 2, every representable b passes.
+            (
+                2_147_483_647,
+                u32::MAX as usize,
+                u32::MAX as usize,
+                "2147483647",
+            ),
+        ];
+        for &(modulus, last_fast, first_slow, why) in cases {
+            if last_fast > 0 {
+                assert_eq!(
+                    super::fold_fast_path(modulus, last_fast),
+                    1,
+                    "b = {last_fast} must take the fast fold for p = {why}"
+                );
+            }
+            if first_slow != last_fast {
+                assert_eq!(
+                    super::fold_fast_path(modulus, first_slow),
+                    0,
+                    "b = {first_slow} must take the generic fold for p = {why}"
+                );
+            }
+        }
+        // The trivial block size is fast everywhere (s1_high <= 1).
+        for &modulus in &[998_244_353_u32, 1_073_479_681, 2_147_483_647] {
+            assert_eq!(super::fold_fast_path(modulus, 2), 1);
+        }
+    }
+
+    /// The `Dims` uniform must carry the final-fold flag in the shader's
+    /// `fast_fold` slot (seventh u32), leaving the final padding word zero.
+    #[test]
+    fn dims_uniform_encodes_the_fast_fold_flag_in_slot_seven() {
+        let uniform = super::dims_uniform_bytes(998_244_353, 64, 4, 16, 8, 3, 7)
+            .expect("valid dimensions must encode");
+        let words: Vec<u32> = uniform
+            .chunks_exact(4)
+            .map(|word| u32::from_le_bytes([word[0], word[1], word[2], word[3]]))
+            .collect();
+        assert_eq!(&words[..6], &[64, 4, 16, 8, 3, 7]);
+        assert_eq!(words[6], 1, "b = 4 is inside the deployment prime's bound");
+        assert_eq!(words[7], 0, "the padding word stays zero");
+        let generic = super::dims_uniform_bytes(998_244_353, 64, 512, 1, 8, 3, 7)
+            .expect("valid dimensions must encode");
+        let generic_words: Vec<u32> = generic
+            .chunks_exact(4)
+            .map(|word| u32::from_le_bytes([word[0], word[1], word[2], word[3]]))
+            .collect();
+        assert_eq!(
+            generic_words[6], 0,
+            "b = 512 exceeds the deployment prime's fast-fold bound"
+        );
     }
 
     /// The validated shape of the two-query host-reconstruction fixture:

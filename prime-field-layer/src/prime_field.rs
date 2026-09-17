@@ -254,4 +254,17 @@ impl<const MODULUS: u32> PrimeField<MODULUS> {
     pub const fn montgomery_r2(&self) -> u32 {
         Self::MONTGOMERY_R2
     }
+
+    /// Returns the Montgomery radix `R = 2^32 mod MODULUS`.
+    ///
+    /// This is the value every stored Montgomery word carries as its
+    /// representation factor: a canonical residue `a` is stored as
+    /// `a * R mod MODULUS`. External accelerators that reduce a two-word
+    /// value `low + high * 2^32` directly to `mod MODULUS` fold the high
+    /// word through this constant, exactly as [`Self::montgomery_neg_inv`]
+    /// and [`Self::montgomery_r2`] let them replicate the crate's REDC.
+    #[must_use]
+    pub const fn montgomery_r(&self) -> u32 {
+        Self::MONTGOMERY_ONE
+    }
 }
