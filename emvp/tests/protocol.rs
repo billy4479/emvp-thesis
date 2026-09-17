@@ -6,8 +6,8 @@
 use emvp::{
     AnswerBackend, AnswerPlan, AnswerRef, AnswerWorkspace, DecodingKey, DerivedState, EmvpParams,
     EncryptedMatrix, EncryptedQuery, MaskContextId, ProtocolError, SecretKey, TdmMask, answer_into,
-    decode_into, encrypt, execute_answer_batch, purpose, query, query_batch, query_with_scratch,
-    search,
+    decode_batch_into, decode_into, encrypt, execute_answer_batch, purpose, query, query_batch,
+    query_with_scratch, search,
 };
 use prime_field_layer::{FieldElement, PrimeField};
 use proptest::prelude::*;
@@ -169,6 +169,13 @@ fn decode_answer(
     let mut output = vec![field().element_u32(0); answer.rows()];
     decode_into(answer, key, &mut output).unwrap();
     output
+}
+
+/// One mutable output slice per batch entry, as [`decode_batch_into`]
+/// expects. Each call reborrows the caller's buffers, so consecutive
+/// batch calls can reuse the same standing storage.
+fn output_slices(outputs: &mut [Vec<FieldElement<MODULUS>>]) -> Vec<&mut [FieldElement<MODULUS>]> {
+    outputs.iter_mut().map(Vec::as_mut_slice).collect()
 }
 
 fn run_protocol<M: TdmMask<MODULUS>>(
@@ -1178,6 +1185,83 @@ fn query_batch_rejects_malformed_batches_without_consuming_ids() {
     assert_eq!(batch[1].0.query_id(), 1);
 }
 
+#[test]
+fn decode_batch_rejects_malformed_batches_without_touching_outputs() {
+    let mut rng = ChaCha20Rng::seed_from_u64(0x8b00);
+    let (rows, ell) = (5_usize, 8_usize);
+    let params = test_params(ell);
+    let mut state = derive_toeplitz(rows, ell, 0x8b);
+    let matrix = random_vector(rows * ell, &mut rng);
+    let q = random_vector(ell, &mut rng);
+    let encrypted = encrypt(&mut state, &matrix).unwrap();
+
+    let (first_query, first_key) = query(&mut state, &q).unwrap();
+    let (second_query, second_key) = query(&mut state, &q).unwrap();
+    let first_values = answer_values(&params, &encrypted, &first_query);
+    let second_values = answer_values(&params, &encrypted, &second_query);
+    let first_answer = answer_ref(&params, &encrypted, &first_query, &first_values);
+    let second_answer = answer_ref(&params, &encrypted, &second_query, &second_values);
+
+    let zero = field().element_u32(0);
+    let mut outputs: Vec<Vec<FieldElement<MODULUS>>> = (0..2).map(|_| vec![zero; rows]).collect();
+    let untouched = outputs.clone();
+
+    assert!(matches!(
+        decode_batch_into::<MODULUS, AnswerRef<'_, MODULUS>>(&[], &[], &mut []),
+        Err(ProtocolError::LengthMismatch {
+            name: "answers",
+            expected: 1,
+            actual: 0,
+        })
+    ));
+    {
+        let mut slices = output_slices(&mut outputs);
+        assert_eq!(
+            decode_batch_into(&[first_answer], &[], &mut slices),
+            Err(ProtocolError::LengthMismatch {
+                name: "decoding keys",
+                expected: 1,
+                actual: 0,
+            })
+        );
+    }
+    // A valid first pair followed by a cross-pair mismatch: validation must
+    // reject the whole batch before any output is touched.
+    {
+        let mut slices = output_slices(&mut outputs);
+        assert_eq!(
+            decode_batch_into(
+                &[first_answer, second_answer],
+                &[first_key.clone(), first_key.clone()],
+                &mut slices
+            ),
+            Err(ProtocolError::QueryMismatch {
+                name: "decoding key",
+                expected: second_query.query_id(),
+                actual: first_query.query_id(),
+            })
+        );
+    }
+    {
+        let mut short_outputs: Vec<Vec<FieldElement<MODULUS>>> =
+            (0..2).map(|_| vec![zero; rows - 1]).collect();
+        let mut short_slices = output_slices(&mut short_outputs);
+        assert_eq!(
+            decode_batch_into(
+                &[first_answer, second_answer],
+                &[first_key, second_key],
+                &mut short_slices
+            ),
+            Err(ProtocolError::LengthMismatch {
+                name: "decoding output",
+                expected: rows,
+                actual: rows - 1,
+            })
+        );
+    }
+    assert_eq!(outputs, untouched, "no output may be touched on error");
+}
+
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(16))]
 
@@ -1220,6 +1304,61 @@ proptest! {
         for (batched_artifacts, serial_artifacts) in batched.into_iter().zip(serial) {
             prop_assert_eq!(batched_artifacts.0, serial_artifacts.0);
             prop_assert_eq!(batched_artifacts.1, serial_artifacts.1);
+        }
+    }
+
+    #[test]
+    fn decode_batch_matches_sequential_single_decodes(
+        ell in 1_usize..=8_usize,
+        rows in 1_usize..=24_usize,
+        batch in 1_usize..=4_usize,
+    ) {
+        let params = test_params(ell);
+        let mut rng = ChaCha20Rng::seed_from_u64(0x8c00);
+        let matrix = random_vector(rows * ell, &mut rng);
+        let q = random_vector(ell, &mut rng);
+        let mut state = derive_toeplitz(rows, ell, 0x8c);
+        let encrypted = encrypt(&mut state, &matrix).unwrap();
+
+        // The reference oracle: per-query `decode_into` into fresh vectors.
+        let mut queries = Vec::new();
+        let mut keys = Vec::new();
+        let mut serial = Vec::new();
+        for _ in 0..batch {
+            let (encrypted_query, decoding_key) = query(&mut state, &q).unwrap();
+            let values = answer_values(&params, &encrypted, &encrypted_query);
+            let answer = answer_ref(&params, &encrypted, &encrypted_query, &values);
+            serial.extend(decode_answer(&answer, &decoding_key));
+            queries.push(encrypted_query);
+            keys.push(decoding_key);
+        }
+
+        let values_batch: Vec<Vec<FieldElement<MODULUS>>> = queries
+            .iter()
+            .map(|query| answer_values(&params, &encrypted, query))
+            .collect();
+        let answers: Vec<AnswerRef<MODULUS>> = queries
+            .iter()
+            .zip(&values_batch)
+            .map(|(query, values)| answer_ref(&params, &encrypted, query, values))
+            .collect();
+        let zero = field().element_u32(0);
+        let mut outputs: Vec<Vec<FieldElement<MODULUS>>> =
+            (0..batch).map(|_| vec![zero; rows]).collect();
+
+        // Both dispatch tiers: a one-thread pool keeps the batch and every
+        // answer's rows serial, a four-thread pool parallelizes the batch
+        // and the rows of answers that clear the shared policy. Neither may
+        // change the decoded values; each call fully overwrites its output,
+        // so the second tier reuses the standing buffers as-is.
+        for threads in [1_usize, 4] {
+            let mut slices = output_slices(&mut outputs);
+            pool(threads).install(|| {
+                decode_batch_into(&answers, &keys, &mut slices).unwrap();
+            });
+            let decoded_flat: Vec<FieldElement<MODULUS>> =
+                outputs.iter().flatten().copied().collect();
+            prop_assert_eq!(&decoded_flat, &serial);
         }
     }
 

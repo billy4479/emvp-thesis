@@ -83,8 +83,8 @@ pub use params::{
 pub use prf::{Prf, PrfError, purpose};
 pub use protocol::{
     DecodingKey, DerivedState, EncryptedMatrix, EncryptedQuery, MaskContextId, ProtocolError,
-    QueryReservation, QueryReservations, QueryScratch, SecretKey, answer_into, decode_into,
-    encrypt, query, query_batch, query_with_scratch,
+    QueryReservation, QueryReservations, QueryScratch, SecretKey, answer_into, decode_batch_into,
+    decode_into, encrypt, query, query_batch, query_with_scratch,
 };
 pub use trapdoor_matrices::{RowStackMask, TdmMask};
 pub use view::{

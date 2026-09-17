@@ -1448,6 +1448,68 @@ pub fn decode_into<const MODULUS: u32, A: AnswerValues<MODULUS> + Sync>(
     Ok(())
 }
 
+/// Decodes a batch of answers into caller-owned storage.
+///
+/// Answer `i` is decoded with `keys[i]` into `outputs[i]`, exactly as
+/// [`decode_into`] decodes it alone, so every decoded value is bit-identical
+/// to the single-answer call. The batch distributes across rayon workers,
+/// and each answer's rows additionally spread across the pool under the
+/// shared dispatch policy ([`fill_decoded`]), so large batches of wide
+/// answers saturate the pool at both granularities; the output is identical
+/// to the serial loop.
+///
+/// # Errors
+///
+/// Validation is all-or-nothing and happens before any output is mutated:
+/// the three slices must share one nonzero length, every (answer, key) pair
+/// must validate as in [`decode_into`], and every output must hold exactly
+/// `answer.rows()` elements.
+pub fn decode_batch_into<const MODULUS: u32, A: AnswerValues<MODULUS> + Sync>(
+    answers: &[A],
+    keys: &[DecodingKey<MODULUS>],
+    outputs: &mut [&mut [FieldElement<MODULUS>]],
+) -> Result<(), ProtocolError> {
+    if answers.is_empty() {
+        return Err(ProtocolError::LengthMismatch {
+            name: "answers",
+            expected: 1,
+            actual: 0,
+        });
+    }
+    check_len("decoding keys", answers.len(), keys.len())?;
+    check_len("decoding outputs", answers.len(), outputs.len())?;
+    let shapes: Vec<(usize, usize)> = answers
+        .iter()
+        .zip(keys)
+        .map(|(answer, key)| validate_decode(answer, key))
+        .collect::<Result<_, _>>()?;
+    for ((rows, _blocks), output) in shapes.iter().zip(outputs.iter()) {
+        check_len("decoding output", *rows, output.len())?;
+    }
+
+    let threads = rayon::current_num_threads();
+    let total_rows: usize = shapes.iter().map(|(rows, _blocks)| *rows).sum();
+    let total_work: usize = shapes
+        .iter()
+        .zip(outputs.iter())
+        .map(|((_rows, blocks), output)| blocks.saturating_mul(output.len()))
+        .sum();
+    if crate::dispatch::is_parallel_work(total_work, total_rows, threads) {
+        outputs
+            .par_iter_mut()
+            .zip(answers)
+            .zip(keys)
+            .for_each(|((output, answer), key)| {
+                fill_decoded(answer, key, output, answer.blocks());
+            });
+    } else {
+        for ((output, answer), key) in outputs.iter_mut().zip(answers).zip(keys) {
+            fill_decoded(answer, key, output, answer.blocks());
+        }
+    }
+    Ok(())
+}
+
 fn validate_decode<const MODULUS: u32, A: AnswerValues<MODULUS>>(
     answer: &A,
     key: &DecodingKey<MODULUS>,
