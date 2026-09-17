@@ -68,3 +68,8 @@ required-features = ["gpu"]
 name = "gpu_phase_sweep"
 harness = false
 required-features = ["gpu"]
+
+[[bench]]
+name = "gpu_online"
+harness = false
+required-features = ["gpu"]
