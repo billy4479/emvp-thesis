@@ -543,13 +543,16 @@ fn quick_tdms<const MODULUS: u32>(c: &mut Criterion) {
 
 // Construction (from parts), apply, and sensitivity groups at the
 // LLM-scale block dimensions (the protocol's mask blocks at the LLM record
-// lengths have n = 8192/16384).
+// lengths have n = 8192/16384), with 2048/4096 as intermediate sweep
+// points between the quick sizes and the record lengths.
 fn default_tdms<const MODULUS: u32>(c: &mut Criterion) {
     bench_group!(
         c,
         "ring_lpn",
         "full_sampling",
         ring_full_sampling_for,
+        2_048,
+        4_096,
         8_192,
         16_384
     );
@@ -558,6 +561,8 @@ fn default_tdms<const MODULUS: u32>(c: &mut Criterion) {
         "toeplitz",
         "full_sampling",
         toeplitz_full_sampling_for,
+        2_048,
+        4_096,
         8_192,
         16_384
     );
@@ -566,6 +571,8 @@ fn default_tdms<const MODULUS: u32>(c: &mut Criterion) {
         "raa",
         "full_sampling",
         raa_full_sampling_for,
+        2_048,
+        4_096,
         8_192,
         16_384
     );
@@ -575,6 +582,8 @@ fn default_tdms<const MODULUS: u32>(c: &mut Criterion) {
         "ring_lpn",
         "from_parts",
         ring_from_parts_for,
+        2_048,
+        4_096,
         8_192,
         16_384
     );
@@ -583,14 +592,16 @@ fn default_tdms<const MODULUS: u32>(c: &mut Criterion) {
         "toeplitz",
         "from_parts",
         toeplitz_from_parts_for,
+        2_048,
+        4_096,
         8_192,
         16_384
     );
-    bench_group!(c, "raa", "from_parts", raa_from_parts_for, 8_192, 16_384);
+    bench_group!(c, "raa", "from_parts", raa_from_parts_for, 2_048, 4_096, 8_192, 16_384);
 
-    bench_group!(c, "ring_lpn", "apply", ring_apply_for, 8_192, 16_384);
-    bench_group!(c, "toeplitz", "apply", toeplitz_apply_for, 8_192, 16_384);
-    bench_group!(c, "raa", "apply", raa_apply_for, 8_192, 16_384);
+    bench_group!(c, "ring_lpn", "apply", ring_apply_for, 2_048, 4_096, 8_192, 16_384);
+    bench_group!(c, "toeplitz", "apply", toeplitz_apply_for, 2_048, 4_096, 8_192, 16_384);
+    bench_group!(c, "raa", "apply", raa_apply_for, 2_048, 4_096, 8_192, 16_384);
 
     bench_group!(
         c,
