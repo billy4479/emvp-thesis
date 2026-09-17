@@ -7,23 +7,25 @@
     reason = "the adapter probe wraps an unexpected error in `Err` so the single `unwrap` path fails the bench loudly; static analysis flags the literal even though the error is dynamic"
 )]
 
-//! GPU online-phase throughput: the EMVP online round trip against
-//! cleartext baselines on the same device.
+//! GPU answer-phase throughput: the EMVP server answer against cleartext
+//! baselines on the same device.
 //!
 //! # Cases
 //!
 //! For `rows in {4096, 16384}` and `batch in {1, 8, 64, 256}` at
-//! `ell = 4096` (the 7B-class record length), under the `gpu_online_v1`
-//! group:
+//! `ell = 4096` (the 7B-class record length), under the
+//! `gpu_answer_cost_v1` group:
 //!
-//! - `emvp/batchB-rowsR`: the full online round trip per iteration —
-//!   `query_batch` generates `B` fresh queries on the CPU, the server
-//!   answers them on the GPU in one `execute_answer_batch_into` call
-//!   against the device-resident encrypted matrix, and the client decodes
-//!   every borrowed answer view. The workspace is planned and reserved once
-//!   per case, so steady-state iterations follow the library's
-//!   plan-reserve-execute contract. This is the number a deployment pays
-//!   per encrypted batch.
+//! - `emvp/batchB-rowsR`: one [`GpuAnswerer::execute_answer_batch_into`]
+//!   call per iteration — the server answer phase alone against the
+//!   device-resident encrypted matrix, covering query upload, dispatch,
+//!   readback, and host reconstruction. The batch's queries are generated
+//!   once per case outside timing, and the workspace is planned and
+//!   reserved once per case, so steady-state iterations follow the
+//!   library's plan-reserve-execute contract. This is the number a
+//!   deployment pays per encrypted batch on the server; the client-side
+//!   query and decode costs are the CPU suites' subject (`online`,
+//!   `client_throughput`).
 //! - `field/batchB-rowsR`: a cleartext field-element matvec of the same
 //!   logical `rows x ell` problem, served by *the same WGSL answer kernel*
 //!   the EMVP server runs, driven by bench-local wgpu plumbing with the
@@ -39,23 +41,24 @@
 //!
 //! - Same logical problem: every case reports
 //!   `Throughput::Elements(rows * ell)`, so criterion's elem/s column and
-//!   every plaintext-to-protocol ratio compare directly across cases.
+//!   every plaintext-to-protocol ratio compare directly across cases, and
+//!   with the `gpu` suite's batch grid.
 //! - Same device discipline: EMVP and the field baseline run the identical
 //!   kernel and pipeline constants; all three paths reuse their device
 //!   buffers and output storage across iterations exactly like the
 //!   `GpuAnswerer` scratch pool and `AnswerWorkspace` arena, create bind
 //!   groups per dispatch like the library path, and upload fresh query data
 //!   per batch like queries arriving over the network.
-//! - No pinned pools: the round trip's client-side query and decode work
-//!   runs on rayon's global pool at its default width, so client numbers
-//!   reflect the benchmark machine. Deliberately different from the
+//! - No pinned pools: the bench-side query generation runs on rayon's
+//!   global pool at its default width, strictly outside timing, so it never
+//!   lands in a measured iteration. Deliberately different from the
 //!   `online` suite's single-core contract and the `gpu` suite's
 //!   eight-thread pool.
-//! - Real protocol costs: the round trip includes per-iteration query
-//!   generation (the client state advances across iterations, mirroring
-//!   repeated queries with fresh randomness) and per-answer decoding from
-//!   the borrowed views.
-//! - One mask construction: the round trip runs the toeplitz suite only;
+//! - Answer phase only: the measured emvp iteration is exactly the server
+//!   answer call; the same queries are answered every iteration (field
+//!   arithmetic performance is data-independent, so re-answering them
+//!   measures the same work fresh queries would).
+//! - One mask construction: the suite runs the toeplitz suite only;
 //!   client query cost varies slightly by construction and the `online`
 //!   suite already covers that spread on the CPU.
 //!
@@ -85,7 +88,7 @@ use criterion::{
 use emvp::gpu::{WORKGROUP_SIZE, fold_fast_path, permuted_matrix_source, queries_per_tile};
 use emvp::{
     AnswerPlan, AnswerWorkspace, DerivedState, EmvpParams, EncryptedMatrix, GpuAnswerer,
-    GpuEncryptedMatrix, GpuError, decode_into, encrypt, query_batch, search,
+    GpuEncryptedMatrix, GpuError, encrypt, query_batch, search,
 };
 use prime_field_layer::arithmetic_kernels::dot_product;
 use prime_field_layer::{FieldElement, PrimeField};
@@ -752,9 +755,9 @@ fn check_f32_tiled_parity(
 }
 
 /// One protocol instance shared by every batch case of one row count.
-struct RoundTripFixtures<'a> {
-    /// The advancing client state; query generation consumes it per
-    /// iteration the way a real deployment consumes its query stream.
+struct AnswerFixtures<'a> {
+    /// The advancing client state; the case's query batch is generated
+    /// from it once, strictly outside timing.
     state: &'a mut DerivedState<MODULUS, ToeplitzFastProduct<MODULUS>>,
     encrypted: &'a EncryptedMatrix<MODULUS>,
     gpu_matrix: &'a GpuEncryptedMatrix<MODULUS>,
@@ -765,22 +768,19 @@ struct RoundTripFixtures<'a> {
     rows: usize,
 }
 
-/// Registers the EMVP round-trip case for one (rows, batch): per iteration
-/// the client generates `batch` fresh queries, the server answers them on
-/// the GPU in one `execute_answer_batch_into` call into the case's
-/// once-reserved workspace, and the client decodes every borrowed answer
-/// view into a reused buffer. The workspace reservation follows the
-/// library's plan-reserve-execute contract: planned from a fixture batch
-/// whose shape the per-iteration batches share, so steady-state iterations
-/// never grow it.
+/// Registers the EMVP answer-phase case for one (rows, batch): the batch's
+/// queries are generated once and the workspace planned and reserved once,
+/// both strictly outside timing, then every measured iteration is exactly
+/// one [`GpuAnswerer::execute_answer_batch_into`] call into the once-
+/// reserved workspace. No client work lands in the timed iteration.
 fn bench_emvp_case(
     group: &mut BenchmarkGroup<'_, WallTime>,
     tag: &str,
     params: EmvpParams,
-    fixtures: RoundTripFixtures<'_>,
+    fixtures: AnswerFixtures<'_>,
     answerer: &GpuAnswerer,
 ) {
-    let RoundTripFixtures {
+    let AnswerFixtures {
         state,
         encrypted,
         gpu_matrix,
@@ -788,33 +788,26 @@ fn bench_emvp_case(
         ell,
         rows,
     } = fixtures;
-    // Plan and reserve from a fixture batch: the shape arithmetic only
-    // depends on (rows, blocks, batch, instance), which every per-iteration
-    // batch shares.
-    let fixture_pairs = query_batch(state, record_slices).unwrap();
-    let (fixture_queries, _fixture_keys): (Vec<_>, Vec<_>) = fixture_pairs.into_iter().unzip();
-    let host_plan = AnswerPlan::plan(&params, encrypted, &fixture_queries).unwrap();
+    // The case's query batch, generated once outside timing.
+    let pairs = query_batch(state, record_slices).unwrap();
+    let (queries, _decoding_keys): (Vec<_>, Vec<_>) = pairs.into_iter().unzip();
+    // Plan and reserve once: the shape arithmetic only depends on (rows,
+    // blocks, batch, instance), which every iteration shares.
+    let host_plan = AnswerPlan::plan(&params, encrypted, &queries).unwrap();
     let gpu_shape = answerer
-        .answer_batch_plan(gpu_matrix, &fixture_queries)
+        .answer_batch_plan(gpu_matrix, &queries)
         .unwrap();
     assert_eq!(gpu_shape, host_plan.shape(), "tier shapes must agree");
     let mut workspace = AnswerWorkspace::<MODULUS>::new();
     workspace.reserve(&host_plan).unwrap();
 
-    let zero = PrimeField::<MODULUS>::new().element_u32(0);
-    let mut decoded = vec![zero; rows];
     group.throughput(elements(rows * ell));
     group.bench_function(BenchmarkId::new("emvp", tag.to_owned()), |b| {
         b.iter(|| {
-            let pairs = query_batch(state, record_slices).unwrap();
-            let (queries, keys): (Vec<_>, Vec<_>) = pairs.into_iter().unzip();
             let (answers, _timings) = answerer
                 .execute_answer_batch_into(gpu_matrix, &queries, &mut workspace)
                 .unwrap();
-            for (answer, key) in answers.iter(&queries).unwrap().zip(keys.iter()) {
-                decode_into(&answer, key, &mut decoded).unwrap();
-            }
-            black_box(&decoded);
+            black_box(&answers);
         });
     });
 }
@@ -985,7 +978,7 @@ fn bench_row_count(
             group,
             &tag,
             params,
-            RoundTripFixtures {
+            AnswerFixtures {
                 state: &mut state,
                 encrypted: &encrypted,
                 gpu_matrix: &gpu_matrix,
@@ -1066,7 +1059,7 @@ fn gpu_online_benches(criterion: &mut Criterion) {
         params.lambda
     );
 
-    let mut group = criterion.benchmark_group("gpu_online_v1");
+    let mut group = criterion.benchmark_group("gpu_answer_cost_v1");
     // LLM-scale iterations cost tens to hundreds of milliseconds; fewer
     // samples keep the run bounded, matching the gpu suite.
     group.sample_size(10);

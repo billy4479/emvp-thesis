@@ -10,7 +10,7 @@
 //!
 //! One fixed LLM-scale shape (4096-element records against 4096 matrix
 //! rows, the plaintext-equivalent of one 7B-class attention projection, and
-//! the same shape the `answer_throughput` suite pins for the server side)
+//! the smallest shape the `gpu` suite pins for the server side)
 //! runs with the shared `search(4096, 128)` protocol parameters. Every
 //! measured iteration executes on the fixed eight-thread rayon pool
 //! ([`benchmark_pool`]), so the parallel decisions inside the library and
@@ -93,7 +93,7 @@ use common::{
     benchmark_pool, derive_with, elements, field_values, raa_block, ring_block, toeplitz_block,
 };
 
-// One 4096 x 4096 attention projection: the shape the `answer_throughput`
+// One 4096 x 4096 attention projection: the smallest shape the `gpu`
 // suite pins for the server side, so client and server numbers refer to the
 // same protocol instance.
 const LLM_RECORD_LENGTH: usize = 4096;
