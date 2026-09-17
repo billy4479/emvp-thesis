@@ -3,7 +3,7 @@
 #import "lib/utils.typ": *
 
 #show: template.with(
-  dedication: "Dedication or acknowledgements",
+  dedication: "To those who are home",
   // font: "New Computer Modern",
   font: "",
 )
@@ -22,7 +22,7 @@ While self-hosting open-weight models is always a possibility, individuals and c
 have the required compute capabilities.
 Usually entities which don't own their own hardware resort to inference providers (either the
 provider of the model themselves or a third party one).
-This however could become an issue because classical inference requires the users to sent plain text
+This however could become an issue because classical inference requires the users to sent clear text
 to the inference provider, which then will come to know all the possibly private information which
 users ask in their queries.
 
@@ -239,10 +239,6 @@ trapdoored matrices requires a prime field.
   Operands small enough that the $O(N log N)$ transformation is not worth it fall back to schoolbook
   multiplication below a crossover point measured with the benchmark suite.
 
-  For negacyclic products modulo $x^N + 1$ (which is implemented in this crate even if the protocol
-  does not currently need it), the inputs are additionally twisted by powers of a $2N$-th root of
-  unity before the transforms and untwisted afterwards #cite(<longa2016>).
-
   Even if this NTT implementation was independently written I compared it to other state of the art
   libraries which implement the same algorithms #cite(<concrete-ntt>, <fasterntt>).
   While most of these libraries use handwritten SIMD intrinsics and there are good resources online
@@ -276,16 +272,16 @@ benefit from parallel computation.
 
   The downside is that $M_g$ is a $k times k$ matrix and vectors should fit in the systematic
   portion of $D$, giving the constraint $k >= ell$. This in turns means that the server overhead
-  factor $f >= 2$
+  factor $f >= 2$.
   #footnote[
     There are other possibilities to generate $C$ and $D$ so that encoding stays quasilinear.
     I consider this out of scope for my thesis, see @sec:limit.
   ]
-.
 
 / Answer phase:
   This is the hottest code path: it will be executed many times and will is quite expensive to run,
   however it is also easily optimizable.
+
   The answer phase is basically just a chunked matrix-vector multiplication over a finite field,
   a task which can be easily parallelized.
   We could use rayon again, but by our assumptions (@sec:assumptions), the server has a GPU, which
@@ -293,10 +289,27 @@ benefit from parallel computation.
   I chose to use WGPU #cite(<wgpu>, <wgsl>), instead of more popular alternatives like CUDA, as it
   is open-source, cross-vendor, integrates well with Rust, and the performance loss is negligible
   for the scope of this project.
+
   Device buffers hold raw Montgomery residues, so no conversion happens on upload or download.
+  Moreover, for appropriate primes $p < 2^30$, we can exploit Karatsuba algorithm
+  #cite(<karatsuba1963>) to furthers speed up multiplication.
+
   Compute shares are also compiled on the flight for a specialized prime modulus, while the
   dimensions of each batch travel in a small uniform buffer, so changing protocol parameters never
-  triggers a recompilation.
+  triggers a recompilation
+  #footnote[
+    This is a trade-off: a constant block size $b$ would help the kernel compiler to unroll more
+    loops and may lead to better performance.
+    This theory was not tested, as I wanted to avoid kernel recompilation on clients' requests.
+  ]
+  .
+
+/ Batched computation and zero-allocation:
+  Much of the performance comes from being able to sent multiple vectors through each phase at the
+  time, while the caller has already preallocated the output buffer. This allows the library to
+  fully parallelize across vectors while allocating nothing.
+  The choice to implement allocation-free methods came from encountering measurable performance dips
+  due to `glibc` allocation strategy.
 
 / Measured crossover:
   Using the GPU is sometimes not necessary, as sending data through PCIe is often expensive. For
@@ -307,54 +320,102 @@ benefit from parallel computation.
 == Client-Server architecture
 
 The `client` and `server` crates provide an actually runnable binary to run inference on the
-selected model.
-These binaries are model-agnostic: they just need the right manifest to tell the client what layers
-can be delegated to the servers and which ones cannot, but they should work for models different
-than GPT-2.
+selected model. The `client` crate can also be compiled as a library so that other applications can
+delegate computation to a server without having to reimplement the networking protocol.
 
-The client connects to the server via TCP and uploads all the encrypted matrices. The server
-generates, for each client connection, an unique identifier for each uploaded matrix.
-The client then sends to the server queries in the for `Vec<(matrix_id, Vec<encrypted_vector>)>` so
-that the server can compute all those products in parallel, reducing the number of roundtrips
-needed.
+These crates implement a prove of concept on how a client-server architecture would work. Clients
+encrypt their matrices and send them to the server in one single message, and the server returns an
+id for each of them. Subsequent messages are basically a `HashMap<MatrixID, Vec<EncryptedVector>>`,
+so that the server can chose how to schedule the products in the most efficient way.
+
+This implementation is a PoC and, as such, is not particularly polished: the server requires no
+authentication and assumes the clients are "good", therefore no limit on the connection duration or
+the matrix size is imposed (the server will only reject when is out of memory).
+An application which wraps the `client` crate, when properly equipped with a library to parse
+model's weights from disk and a proper quantization strategy is perfectly sufficient to run an LLM.
 
 = Results
 
 All benchmarks are run on a desktop PC with a AMD Ryzen 2600X (6 cores, 12 threads, AVX2), 32GB of
 RAM, and a GTX 1060 6GB when the machine was at idle using the Criterion library
-#cite(<criterion>).
+#cite(<criterion>). The results are given with a 95% confidence interval, thanks to Criterion's
+measurements.
 
 == TDMs
 
-While Ring-LPN offers the most stable cryptographic foundation it is also the slowest one compared
-to the other two. In general RAA style TDMs are much faster than all the others during `Apply`.
+While Ring-LPN offers the most stable cryptographic foundation we pay for it in compute: it is the
+slowest of the three in all phases. In general RAA style TDMs are much faster than all the others
+during `Apply`, which makes them perfect for a fast client phase.
 
 #figure(
-  image("assets/apply.svg", width: 70%),
+  image("assets/apply.svg", width: 80%),
   caption: [Timings for `Apply`. This is the hot path which the client will run on each EMVP,
     therefore it is the most important operation to do quickly.],
 )
-#figure(
-  image("assets/construction.svg", width: 70%),
-  caption: [ Timings for `Construction`. This happens just once during encryption. ],
-)
-#figure(
-  image("assets/materialize.svg", width: 70%),
-  caption: [ Timings for `Materialize` in logarithmic scale.
-    This happens just once during construction.
-    (This benchmark uses a different smaller matrices than the two figures above as materializing
-    matrices takes a lot of RAM, making the benchmarks suite too heavy to run on some less powerful
-    machines.)
-  ],
-)
+
+I did not include plots for `Construction` and `Materialize` since they don't bring much information
+to the table as they are both offline-only methods so the client needs to run them just once when
+they encrypt the matrices.
+`Construction` is three orders of magnitude slower on Ring-LPN compared to the other two
+implementations, which are within noise range from each other; while in `Materialize` Ring-LPN is
+still the slowest, but just one order of magnitude, while Toeplitz surpasses slightly RAA.
 
 == EMVP Protocol
 
-TODO
+The EMVP online path requires three procedures: `Query` and `Decrypt`, which are client-side; and
+`Answer`, which is server-side.
+
+In my benchmarks I optimize for throughout: the question I ask is "How many vectors can I pass
+through each phase in a given amount of time?", rather than "How fast can I pass a
+single vector through a given phase?".
+
+
+=== Client phases
+
+#figure(
+  image("assets/client_batch.svg", width: 100%),
+  caption: [
+    Throughput of the client phases against the batch size (higher is better).
+    On the left the `Query` phase, in logarithmic scale (for Ring-LPN $t = 192$, for RAA $c = 3$).
+    On the right the `Decrypt` phase, which is TDM-agnostic.
+  ],
+)
+
+
+=== Server phase
+
+First, to validate my kernel scaled properly, I measured how the throughput changes when changing
+the 1D-SLSN block size $b$.
+
+#figure(
+  image("assets/block-sweep.svg", width: 100%),
+  caption: [
+    Time an throughput for `Answer` on GPU on a fixed batch size.
+    It scales almost perfectly inversely linearly.
+    $b = 256$ is the largest $b$ supported by this parameters.
+  ],
+)
+
+Interestingly, we can see the regime transition at $b = 128$. This is due to the fact that
+$s prop frac(1, b, style: "horizontal")$, and the bandwidth is linear in $s$. At small
+$b$ the cost of performing the actual computation is overshadowed by the big GPU transfer, while as
+$b$ grows, less data has to flow out of the GPU, until, around $b = 128$ the bottleneck becomes the
+computation itself.
+
+Next I compared how my implementation scales across different EMVP parameters and how it compares to
+both clear text products over the field and standard `float32` products.
+
+TODO: add figures here
 
 = Conclusions
 
-TODO.
+I believe this work can really be useful in real world applications: once there is the
+cryptoanalysis foundation to support better overhead factors more efficiently (@sec:overf), the
+overhead from using EMVP over standard matrix-vector products shrinks considerably.
+
+Using a TEE also solves the latency issues of having to go to the network layer for each non-linear
+operation. This in theory makes the whole protocol much more valuable for real world applications.
+
 
 == Limitations and Further Work <sec:limit>
 
@@ -367,7 +428,21 @@ simulated.
 I did not explore 64 bits wide prime fields, I believe this would lead to a tradeoff between speed
 against quantization precision and complexity.
 
-=== Bringing down the server overhead factor
+=== Further GPU Kernel optimization
+
+The GPU kernel for the `Answer` phase can be further improved.
+
+One first experiment would be to rewrite it in CUDA (which should be a relatively easy task with the
+help of an AI assistant). I chose to skip this part both for a lack of proper hardware to test it on
+and because linking CUDA against Rust is not as straight forward, so I decided to keep the easier
+path for this work.
+
+Another thing which can be spotted by looking at the throughput benchmarks (TODO: add reference to
+figure) is that, while the `float32` kernel is memory bound, therefore we cannot do any better on
+this card, the clear-text-field one has still lower throughput. This means that, in theory, the
+kernel code could be optimized further before hitting the memory bandwidth bottleneck.
+
+=== Bringing down the server overhead factor <sec:overf>
 
 In my work, I chose to implement the code construction suggested in #citesec(<emvp2025>, "3.1")
 without deviating from it. This, as discussed in @sec:emvp-prot, implies $f >= 2$.
@@ -386,12 +461,15 @@ I suggest some possible ways to reduce $f$ while keeping encoding through $C$ an
 
 === Reducing the download size
 
-In the 1D-SLSN construction, each vector is split into $s$ blocks. While this has no performance
-impact on the computation itself, it increases download size by a factor of $s$, which combined with
-the server overhead factor $f$ can be substantial.
+In the 1D-SLSN construction, each vector is split into $s$ blocks. While this has almost n
+performance impact on the computation itself, it increases download size by a factor of $s$, which
+combined with the server overhead factor $f$ can be substantial.
 
 The paper suggests #citesec(<emvp2025>, "4.1") that this can be mitigated by using a rate-1 additive
 homographic encryption mechanism to the protocol. This suggestion was not investigated in my work.
+The main reason is that this only matters if the encrypted result has to travel to a remote client,
+if we assume that the client is a TEE on the same machine the AHE only adds overhead for no real
+benefit.
 
 === Quantization
 
@@ -403,6 +481,16 @@ Luckily, every cloud has a silver lining: since we need to perform a roundtrip t
 at every non-linearity or attention block, the client can de-quantize the vector, perform
 computation with regular floating point arithmetic, and re-quantize the result using a different
 scale. This in theory should allow for sufficient precision even for a 32-bit field like mine.
+
+=== TEE Client
+
+Another research area would be to implement the client in the same machine as the server, in a TEE.
+This is important since it would allow to measure the latency of going in and out of the trusted
+environment, and assess actual feasibility of the protocol for real world use.
+
+An actual user would, for example, send it's initial prompt to the LLM provider's TEE, which would
+encrypt it, run private auto-regression, and give back to the user the whole response without having
+the user's hardware do any work.
 
 = AI Disclosure
 

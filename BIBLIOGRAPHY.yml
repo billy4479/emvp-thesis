@@ -1004,7 +1004,7 @@ glibcmalloc:
 wgpu:
   type: Misc
   title: "wgpu: A cross-platform, safe, Rust graphics WebGPU implementation"
-  author: "The wgpu contributors"
+  author: "wgpu contributors"
   organization: gfx-rs
   date: 2026
   url:
