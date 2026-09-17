@@ -36,9 +36,11 @@
 // loose tolerance instead. This kernel is a performance baseline only - no
 // cryptographic or constant-time property is claimed.
 
-// Must match the host WORKGROUP_SIZE. A module const (not an override) keeps
-// the workgroup size a compile-time constant as required.
-const WORKGROUP_SIZE: u32 = 256u;
+// Threads per workgroup. An override, not a const: the WGSL spec allows a
+// pipeline-overridable constant in `@workgroup_size`, and the bench
+// supplies its `F32_WORKGROUP_SIZE` here, so sweeping workgroup sizes is a
+// host-side constant change with no shader edit.
+override WORKGROUP_SIZE: u32 = 256u;
 
 // Per-call dimensions, little-endian u32 words in a 16-byte uniform buffer.
 struct Dims {
@@ -53,8 +55,12 @@ struct Dims {
 @group(0) @binding(2) var<storage, read_write> output_words: array<f32>;
 @group(0) @binding(3) var<uniform> dims: Dims;
 
-// Per-thread partials reduced across the workgroup after the load loop.
+// Per-thread partials reduced across the workgroup after the load loop:
+// the scalar array serves `main`, the vec4 array serves `main_q4` (one
+// reduction pass serves all four outputs of a tile). Each entry point
+// only pays the workgroup memory it references.
 var<workgroup> partials: array<f32, WORKGROUP_SIZE>;
+var<workgroup> partials4: array<vec4<f32>, WORKGROUP_SIZE>;
 
 @compute
 @workgroup_size(WORKGROUP_SIZE)
@@ -121,5 +127,112 @@ fn main(
     }
     if (local_id.x == 0u) {
         output_words[pair] = partials[0];
+    }
+}
+
+// Four-query tiled variant of `main`: one workgroup computes the same row's
+// output for a tile of four consecutive queries, so every matrix word load
+// feeds four accumulators and the matrix is streamed `ceil(batch / 4)`
+// times instead of once per query. The loads per step are one matrix
+// chunk per thread (shared) plus four query chunks (one per accumulator);
+// the shared-memory tree reduction runs on `vec4` lanes, so one reduction
+// pass serves all four outputs. Tail queries are clamped to the last
+// query and their stores are individually guarded, mirroring the EMVP
+// answer kernel's tiled entry point.
+@compute
+@workgroup_size(WORKGROUP_SIZE)
+fn main_q4(
+    @builtin(local_invocation_id) local_id: vec3<u32>,
+    @builtin(workgroup_id) workgroup: vec3<u32>,
+) {
+    let index = (workgroup.y * dims.workgroups_x) + workgroup.x;
+    let total = ((dims.batch + 3u) / 4u) * dims.rows;
+    if (index >= total) {
+        return;
+    }
+    let row = index % dims.rows;
+    let first_query = (index / dims.rows) * 4u;
+    let last = dims.batch - 1u;
+    let query0 = min(first_query, last);
+    let query1 = min(first_query + 1u, last);
+    let query2 = min(first_query + 2u, last);
+    let query3 = min(first_query + 3u, last);
+
+    let matrix_base = row * dims.ell;
+    let query_base0 = query0 * dims.ell;
+    let query_base1 = query1 * dims.ell;
+    let query_base2 = query2 * dims.ell;
+    let query_base3 = query3 * dims.ell;
+
+    var acc = vec4<f32>(0.0, 0.0, 0.0, 0.0);
+    let chunk_span = 4u * WORKGROUP_SIZE;
+    let chunk_end = dims.ell - (dims.ell % chunk_span);
+    var base = 0u;
+    while (base < chunk_end) {
+        let index = base + local_id.x * 4u;
+        let m0 = matrix_words[matrix_base + index];
+        let m1 = matrix_words[matrix_base + index + 1u];
+        let m2 = matrix_words[matrix_base + index + 2u];
+        let m3 = matrix_words[matrix_base + index + 3u];
+        acc.x = acc.x
+            + ((m0 * query_words[query_base0 + index]
+                + m1 * query_words[query_base0 + index + 1u])
+                + (m2 * query_words[query_base0 + index + 2u]
+                    + m3 * query_words[query_base0 + index + 3u]));
+        acc.y = acc.y
+            + ((m0 * query_words[query_base1 + index]
+                + m1 * query_words[query_base1 + index + 1u])
+                + (m2 * query_words[query_base1 + index + 2u]
+                    + m3 * query_words[query_base1 + index + 3u]));
+        acc.z = acc.z
+            + ((m0 * query_words[query_base2 + index]
+                + m1 * query_words[query_base2 + index + 1u])
+                + (m2 * query_words[query_base2 + index + 2u]
+                    + m3 * query_words[query_base2 + index + 3u]));
+        acc.w = acc.w
+            + ((m0 * query_words[query_base3 + index]
+                + m1 * query_words[query_base3 + index + 1u])
+                + (m2 * query_words[query_base3 + index + 2u]
+                    + m3 * query_words[query_base3 + index + 3u]));
+        base = base + chunk_span;
+    }
+    // Scalar tail for `ell mod (4 * WORKGROUP_SIZE)` elements, strided by
+    // the workgroup so the remaining loads stay coalesced.
+    var tail = chunk_end + local_id.x;
+    while (tail < dims.ell) {
+        let m = matrix_words[matrix_base + tail];
+        acc = acc + vec4<f32>(
+            m * query_words[query_base0 + tail],
+            m * query_words[query_base1 + tail],
+            m * query_words[query_base2 + tail],
+            m * query_words[query_base3 + tail],
+        );
+        tail = tail + WORKGROUP_SIZE;
+    }
+
+    // One vec4 tree reduction serves all four outputs.
+    partials4[local_id.x] = acc;
+    workgroupBarrier();
+    var span = WORKGROUP_SIZE / 2u;
+    while (span > 0u) {
+        if (local_id.x < span) {
+            partials4[local_id.x] = partials4[local_id.x] + partials4[local_id.x + span];
+        }
+        workgroupBarrier();
+        span = span / 2u;
+    }
+    if (local_id.x == 0u) {
+        let sums = partials4[0];
+        // The workgroup's tile group exists, so query0 is in range.
+        output_words[first_query * dims.rows + row] = sums.x;
+        if (first_query + 1u < dims.batch) {
+            output_words[(first_query + 1u) * dims.rows + row] = sums.y;
+        }
+        if (first_query + 2u < dims.batch) {
+            output_words[(first_query + 2u) * dims.rows + row] = sums.z;
+        }
+        if (first_query + 3u < dims.batch) {
+            output_words[(first_query + 3u) * dims.rows + row] = sums.w;
+        }
     }
 }

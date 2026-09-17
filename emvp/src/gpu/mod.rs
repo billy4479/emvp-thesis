@@ -135,11 +135,14 @@ pub(crate) mod packed;
 /// The answer compute kernel, compiled once per modulus.
 const ANSWER_WGSL: &str = include_str!("answer.wgsl");
 
-/// Threads per workgroup. Passed into the shader as the pipeline
-/// constant the `@workgroup_size(WORKGROUP_SIZE)` override consumes, so
-/// host and device share this one definition; sweeping the size is a
-/// one-line change here.
-const WORKGROUP_SIZE: u32 = 256;
+/// Threads per workgroup.
+///
+/// Passed into the shader as the pipeline constant the
+/// `@workgroup_size(WORKGROUP_SIZE)` override consumes, so host and device
+/// share this one definition; sweeping the size is a one-line change here.
+/// Public because bench-local drivers of [`ANSWER_WGSL`] (the `gpu_online`
+/// suite's field baseline) must grid their dispatches with the same value.
+pub const WORKGROUP_SIZE: u32 = 256;
 
 /// [`WORKGROUP_SIZE`] as a host word count.
 const WORKGROUP_SIZE_USIZE: usize = WORKGROUP_SIZE as usize;
@@ -1418,7 +1421,10 @@ fn staged_write_view(
 /// and `destination % rows` the row, so the source word is
 /// `(destination % rows) * n + destination / rows`. Pure host arithmetic,
 /// unit-tested for bijectivity below; [`fill_matrix_view`] applies it.
-const fn permuted_matrix_source(destination: usize, rows: usize, n: usize) -> usize {
+/// Public for the `gpu_online` suite's field baseline, which uploads the
+/// same permuted device layout through its own plumbing.
+#[must_use]
+pub const fn permuted_matrix_source(destination: usize, rows: usize, n: usize) -> usize {
     (destination % rows) * n + destination / rows
 }
 
@@ -1618,15 +1624,20 @@ pub(crate) const fn narrow_modulus(modulus: u32) -> bool {
     modulus < 1_u32 << 30
 }
 
-/// The query tile size for one batch: four queries per invocation when the
-/// modulus supports the narrow kernel and the batch fills a tile, otherwise
-/// the single-query kernel. The tiled kernel's clamped tail lanes make any
-/// `batch >= 4` correct (and its stores guarded), so this is purely a
-/// performance choice; protocol outputs are identical either way. An
-/// eight-query tile was measured slower than four at every batch size on
-/// the reference GTX 1060 — the doubled register state costs more than the
-/// halved matrix stream — so four is the only tiled size.
-pub(crate) const fn queries_per_tile(modulus: u32, batch: usize) -> u32 {
+/// The query tile size for one batch.
+///
+/// Four queries per invocation when the modulus supports the narrow kernel
+/// and the batch fills a tile, otherwise the single-query kernel. The tiled
+/// kernel's clamped tail lanes make any `batch >= 4` correct (and its
+/// stores guarded), so this is purely a performance choice; protocol
+/// outputs are identical either way. An eight-query tile was measured
+/// slower than four at every batch size on the reference GTX 1060 — the
+/// doubled register state costs more than the halved matrix stream — so
+/// four is the only tiled size. Public for the `gpu_online` suite's
+/// bench-local field baseline, which grids [`ANSWER_WGSL`]'s dispatch
+/// itself.
+#[must_use]
+pub const fn queries_per_tile(modulus: u32, batch: usize) -> u32 {
     if narrow_modulus(modulus) && batch >= QUERIES_PER_TILE_MIN {
         4
     } else {
@@ -1636,6 +1647,10 @@ pub(crate) const fn queries_per_tile(modulus: u32, batch: usize) -> u32 {
 
 /// Decides whether the answer kernel's direct final-fold reduction of `S1`
 /// is exact for a batch of block size `b` over `modulus`.
+///
+/// Public for the `gpu_online` suite's bench-local field baseline, which
+/// drives [`ANSWER_WGSL`] with its own wgpu plumbing and must encode the
+/// same flag.
 ///
 /// The shader's first fold step produces `S1 = s1_low + s1_high * 2^32`
 /// with the exact worst case
@@ -1651,7 +1666,8 @@ pub(crate) const fn queries_per_tile(modulus: u32, batch: usize) -> u32 {
 /// `2^32`; every later pass carries `s1_high <= 1` and shrinks strictly,
 /// so the first bound is the only one that matters. Evaluated in `u128`,
 /// which holds every intermediate (`b <= 2^32`, `p < 2^31`).
-fn fold_fast_path(modulus: u32, b: usize) -> u32 {
+#[must_use]
+pub fn fold_fast_path(modulus: u32, b: usize) -> u32 {
     let p = u128::from(modulus);
     let products = u128::from(b as u64) * (p - 1) * (p - 1);
     let s1_high_max = (products + u128::from(u32::MAX) * p) >> 64;
