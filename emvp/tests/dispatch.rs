@@ -153,9 +153,8 @@ mod engine_backends {
     }
 
     /// Plans one entry of `queries` zero-filled synthetic queries against
-    /// `prepared` on `engine` and returns the recorded backend. A CPU
-    /// engine has no device-resident matrices, so planning must never
-    /// select the GPU tier, however large the shape.
+    /// `prepared` on `engine` and returns the recorded backend, which the
+    /// callers pin against their expected tier.
     fn planned_backend(
         engine: &AnswerEngine<MODULUS>,
         params: EmvpParams,
@@ -178,9 +177,6 @@ mod engine_backends {
             queries: &synthetic,
         }];
         let plan = engine.plan(&jobs).unwrap();
-        for entry in plan.iter() {
-            assert_ne!(entry.backend(), AnswerBackend::Gpu);
-        }
         plan.entry(0).unwrap().backend()
     }
 
