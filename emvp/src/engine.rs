@@ -2339,12 +2339,16 @@ mod tests {
         let keep = batch[0].clone();
         drop(batch);
         assert_eq!(reserved_bytes(&engine), one);
-        // The released room fits exactly one more matrix.
-        engine.prepare(PARAMS, matrix(44, 2)).unwrap();
+        // The released room fits exactly one more matrix. The handle must
+        // be bound: a dropped handle releases its own matrix's bytes, and
+        // a temporary would release them at this statement's semicolon.
+        let extra = engine.prepare(PARAMS, matrix(44, 2)).unwrap();
         assert_eq!(reserved_bytes(&engine), 2 * one);
-        // The final clone of the first handle releases the rest.
+        // Dropping either handle releases exactly its own matrix's bytes.
         drop(keep);
         assert_eq!(reserved_bytes(&engine), one);
+        drop(extra);
+        assert_eq!(reserved_bytes(&engine), 0);
     }
 
     #[cfg(feature = "gpu")]
