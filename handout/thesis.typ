@@ -308,7 +308,7 @@ show benefit from parallel computation.
   with the output buffer already preallocated by the caller. This allows the library to fully
   parallelize across vectors while allocating nothing.
   I chose to implement allocation-free methods after observing measurable performance dips caused by
-  the `glibc` allocation strategy.
+  `glibc`'s allocation strategy.
 
 / Measured crossover:
   Using the GPU is not always necessary, as sending data through PCIe is often expensive. For
@@ -335,10 +335,11 @@ model's weights from disk and an appropriate quantization strategy, is sufficien
 
 = Results
 
-All benchmarks are run on a desktop PC with an AMD Ryzen 2600X (6 cores, 12 threads, AVX2), 32GB of
-RAM, and a GTX 1060 6GB. The machine was idle during the benchmarks, which were run using the
-Criterion library #cite(<criterion>). The results are given with a 95% confidence interval based on
-Criterion's measurements.
+All benchmarks are run on a desktop PC running Linux 7.1.8 with an AMD Ryzen 2600X (6 cores, 12
+threads, AVX2), 32GB of RAM, and a GTX 1060 6GB.
+The machine was idle during the benchmarks, which were run using the Criterion library
+#cite(<criterion>). The results are given with a 95% confidence interval based on Criterion's
+measurements.
 
 == TDMs
 
