@@ -403,15 +403,46 @@ less data has to flow out of the GPU until, around $b = 128$, the computation it
 bottleneck.
 
 Next I compared how my implementation scales across different EMVP parameters and how it compares to
-both plaintext products over the field and standard `float32` products.
+both clear-text products over the field and standard `float32` products.
 
-TODO: add figures here
+#figure(
+  image("assets/gpu_online_thrpt.svg", width: 100%),
+  caption: [
+    Throughput for the `Answer` phase, against a clear-text matrix-vector multiplication and a
+    clear-text `float32` multiplication both of the same size.
+  ],
+)
+
+From this benchmark we can observe that, even at batch size 256, the work is scaling almost linearly
+with the batch size. This is a symptom that the GPU would allow for even bigger batches in theory;
+in practice, we are bound by memory access.
+
+As we are able to see more clearly from @fig:ratios, EMVP multiplication is much slower than
+standard `float32` and even the field equivalent.
+The overhead comes from multiple factors. First of all, we can note that even the clear-text field
+loses against `float32`: this is because we need to deal with all the moduli inside the kernel,
+which inherently consume more compute.
+The second inefficiency is due to the EMVP protocol itself, which requires a server overhead factor
+$f > 1$, in this implementation $f = 2$, which is almost exactly what we see comparing clear-text
+field to EMVP. We see a performance dip of around 3x, which is a bit more than the theoretical 2x: I
+suspect this comes from the GPU kernel better handling a single block, rather than having to
+parallelize on multiple ones, and less copying in and out of the GPU memory itself.
+
+#figure(
+  image("assets/gpu_online_ratios.svg", width: 100%),
+  caption: [
+    Time-ratios of for the `Answer` phase against a clear-text matrix-vector multiplication and a
+    clear-text float32 multiplication both of the same size.
+  ],
+)<fig:ratios>
+
 
 = Conclusions
 
-I believe this work can really be useful in real-world applications. Once there is a cryptanalytic
-foundation for supporting better overhead factors efficiently (@sec:overf), the overhead of using
-EMVP instead of standard matrix-vector products shrinks considerably.
+I believe this work, once properly refined, can really be useful in real-world applications.
+Once there is a cryptanalytic foundation for supporting better overhead factors efficiently
+(@sec:overf), the overhead of using EMVP instead of standard matrix-vector products shrinks
+considerably.
 
 Using a TEE also solves the latency issues of having to go to the network layer for each non-linear
 operation. In theory, this makes the whole protocol much more valuable for real-world applications.
@@ -437,10 +468,9 @@ with the help of an AI assistant. I chose to skip this part because I lacked sui
 which to test it and because linking CUDA with Rust is not as straightforward, so I kept to the
 simpler approach for this work.
 
-The throughput benchmarks also show (TODO: add reference to figure) that the `float32` kernel is
-memory-bound, so we cannot do any better on this card, whereas the clear-text field kernel still has
-lower throughput. This means that, in theory, the kernel code could be optimized further before
-hitting the memory bandwidth bottleneck.
+I also believe the kernels can be optimized further by using more advanced techniques, especially
+for moving data in and out of the card memory. However, in this moment, I don't have the technical
+skills to do any better than this, I believe however that a better result is achievable in practice.
 
 === Bringing down the server overhead factor <sec:overf>
 
