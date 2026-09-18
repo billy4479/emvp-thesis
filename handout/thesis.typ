@@ -21,11 +21,15 @@ intellectual property and, as such, should remain private.
 While self-hosting open-weight models is always a possibility, individuals and companies often do not
 have the required compute capabilities. Entities that do not own suitable hardware usually resort to
 inference providers, either the model provider itself or a third party. This can become an issue
-because classical inference requires users to send plaintext to the inference provider, which can
+because classical inference requires users to send clear-text to the inference provider, which can
 therefore access any potentially private information included in their queries.
 
-In this work, we study an inference model based on Encrypted Matrix-Vector Products (EMVP for short)
-#cite(<emvp2025>), which enables efficient private computation of linear operations.
+In this work, I study an inference model based on Encrypted Matrix-Vector Products (EMVP for short)
+#cite(<emvp2025>), which in theory enables efficient private computation of linear operations.
+I study in particular a practical implementation of this protocol, uncovering the performance
+penalties it introduces over clear-text products.
+
+_The whole code for this project is available at https://github.com/billy4479/emvp-thesis\._
 
 = Theory
 
@@ -43,7 +47,7 @@ construction (typically $s << ell$), and sends it back to the client. The client
 $a = M' p' - r'$ from $(M', q')$, where $q' = (p', r')$ is its decoding key.
 
 This protocol turns out to be particularly inexpensive to run. The original paper reports a slowdown
-of only around $50%$ compared with plaintext computation, but this will be verified independently.
+of only around $50%$ compared with clear-text computation, but this will be verified independently.
 
 == Protocol description <sec:emvp-desc>
 
@@ -162,8 +166,6 @@ machine: the entire client code could run inside a Trusted Execution Environment
 provide better performance and lower latency than requiring a network round trip.
 
 = Development
-
-_The whole code for this project is available at https://github.com/billy4479/emvp-thesis\._
 
 I implemented the EMVP protocol in the Rust programming language #cite(<rust>), which provides
 memory safety and the low-level primitives needed for fast execution.
